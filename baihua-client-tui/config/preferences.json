@@ -1,0 +1,8 @@
+{
+  "language": "en-US",
+  "muted_rooms": [],
+  "server_address": "http://localhost:2424",
+  "show_uid": false,
+  "sound_enabled": true,
+  "time_with_date": true
+}
