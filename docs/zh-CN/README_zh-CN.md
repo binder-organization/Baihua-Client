@@ -7,6 +7,8 @@
 [![作者: ChepleBob](https://img.shields.io/badge/作者-ChepleBob-00B4D8)](https://github.com/ChepleBob30)
 [![语言: Rust](https://img.shields.io/badge/语言-Rust-5F4C49)](https://www.rust-lang.org/)
 [![许可证: Apache v2](https://img.shields.io/badge/许可证-Apache%20v2-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
+[![TUI版本](https://img.shields.io/badge/TUI版本-v0.1.0--alpha.2-3D35DB)](https://github.com/binder-organization/Baihua-Client/releases)
+[![Core版本](https://img.shields.io/badge/Core版本-v0.2.0-EB9317)](https://github.com/binder-organization/Baihua-Client/tree/main/baihua-core)
 
 [English](../../README.md) | 简体中文
 
@@ -14,12 +16,43 @@
 
 ## 目录
 
+- [版本信息](#版本信息)
 - [总览](#总览)
 - [快速开始](#快速开始)
 - [特别致谢](#特别致谢)
 - [贡献者](#贡献者)
 - [许可证](#许可证)
 - [尾声](#尾声)
+
+---
+
+## 版本信息
+
+### 最新版本
+
+- TUI 0.1.0-alpha.2
+- Core 0.2.0
+
+### 更新日志 - TUI
+
+#### 添加
+
+- 群聊中有人在打字时，会提示其他人；
+- 使用`/info`可以查看群聊成员在线情况；
+- 输入`#`可以开启消息搜索模式，按下enter或启用快速搜索模式即可搜索当前群聊的匹配文本；
+- 使用`/appearance`或在设置中选择`外观`可以修改界面颜色，目前外观配置文件存储于config/themes目录下，自带默认/高对比度/亮色三种外观配置；
+- 支持选中绝大多数文本。
+
+#### 更改
+
+- 移除了`/list_member`，其功能已被整合到`/info`中；
+- 不再提示tab/esc/enter相关的操作；
+- 在设置里唤出的叠加层关闭时统一回到设置页面，而不是直接关闭叠加层。
+
+#### 修复
+
+- 在部分情况下退出登录再重新登录回无法实时收到消息。
+
 
 ---
 
@@ -32,7 +65,7 @@
 ### 特色
 
 白桦客户端采用TUI和GUI(暂未完工)两种模式，TUI版本可在终端内快速完成所有操作，使用逻辑类似于`opencode`，适用于开发者快速适应并积极沟通。
-借由强大的服务端，客户端支持端对端加密与jwt自动登录，兼具安全与便利。还支持查看已读/未读与他人是否在打字(未来添加)。
+借由强大的服务端，客户端支持端对端加密与jwt自动登录，兼具安全与便利。还支持查看已读/未读(未来添加)与他人是否在打字。
 目前客户端处于测试阶段，我们将不断为客户端添加新的功能。
 
 ### 创建白桦的目的
@@ -48,7 +81,6 @@
 - 测试版目前只能在release中下载压缩包并解压，然后在TUI根目录下运行`cargo run`来启动客户端。
 - 客户端会在未来支持在一些包管理器中安装，并添加GUI版本。
 - 启动后，使用/server_address或在设置中选择“自定义服务器地址”来配置你的白桦服务器地址，然后调用/register或在设置中选择“注册”来注册账号，最后使用/login或在设置中选择“登录”以开始聊天。
-- 请注意，由于服务端逻辑问题，有时候客户端可能会出现无法实时收到消息的问题，此时等待60秒即可缓解。我们会在服务端更新后立刻跟进新版本。
 
 ---
 

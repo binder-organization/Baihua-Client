@@ -1,5 +1,5 @@
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -684,8 +684,18 @@ pub enum PollingEvent {
     EncryptedMessageSent(String),
     /// 加密会话结束（房间 ID, 结束原因）
     EncryptSessionEnded((String, String)),
-    /// 私聊对端完全离线（用户 ID）
-    PartnerOffline(String),
+    /// 某成员正在输入（房间 ID, 用户 ID, 用户名）。服务端只有 typing 为真一种帧、
+    /// 没有"停止输入"信号，接收方需按本地超时窗口衰减
+    MemberTyping((String, String, String)),
+    /// 成员在线状态跳变（用户 ID, 用户名, 是否在线）。服务端仅在连接数 0↔1 跳变时广播，
+    /// 且建立连接时不下发当前在线名单基线，客户端只能累积跳变结果
+    PresenceChanged((String, String, bool)),
+    /// 本端 WebSocket 自身的状态变化（文案键名）。它不是服务端错误，
+    /// 必须与 Error 分开：Error 分支会拿本地化后的文本去匹配服务端的英文错误串，
+    /// 本地化串永远匹配不上，于是每次瞬时的连接抖动都会弹一个错误框再自愈（表现为"莫名报错后自己好了"）。
+    /// 键名 error_ws_disconnected_reconnect / error_ws_connect_failed 属可自愈抖动，只记调试日志；
+    /// 键名 error_ws_send_failed 说明确有一条报文没发出去，需要提示用户。
+    WebSocketState(String),
     /// WebSocket 连接就绪：服务器已完成房间订阅，可以安全发送握手与消息
     WebSocketConnected,
     /// 退出清理流程在后台执行完毕，可以安全退出应用
@@ -753,10 +763,15 @@ pub fn parse_websocket_event(text: &str, tr: &dyn Fn(&str) -> String) -> Option<
         }
         // 连接回执：服务器在此之后才会把后续广播投递给本连接
         "connected" => Some(PollingEvent::WebSocketConnected),
-        // 对端最后一个连接关闭，其所在房间会收到此广播
-        "user_offline" => Some(PollingEvent::PartnerOffline(
+        // 成员在线状态跳变：服务端只在该用户连接数 0↔1 时各广播一次
+        "user_online" => parse_presence(data, true),
+        "user_offline" => parse_presence(data, false),
+        // 输入状态：服务端只广播 typing 为真的帧，接收端按本地窗口衰减
+        "typing" => Some(PollingEvent::MemberTyping((
+            data.get("room_id")?.as_str()?.to_string(),
             data.get("user_id")?.as_str()?.to_string(),
-        )),
+            data.get("username")?.as_str()?.to_string(),
+        ))),
         "encrypt_session_expired" => Some(PollingEvent::Error(tr("warning_session_expired"))),
         "error" => {
             let server_message = data
@@ -769,6 +784,19 @@ pub fn parse_websocket_event(text: &str, tr: &dyn Fn(&str) -> String) -> Option<
         }
         _ => None,
     }
+}
+
+/// 解析在线状态跳变广播（user_online / user_offline）。
+/// user_id 必需；username 为可选字段，缺失时以空串兜底，绝不因单个可选字段丢弃整条状态变更。
+fn parse_presence(data: &serde_json::Value, is_online: bool) -> Option<PollingEvent> {
+    Some(PollingEvent::PresenceChanged((
+        data.get("user_id")?.as_str()?.to_string(),
+        data.get("username")
+            .and_then(|username| username.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        is_online,
+    )))
 }
 
 /// 从 JSON 数据中解析加密握手数据；peer_id_field 为对端用户 ID 所在字段名
@@ -812,6 +840,11 @@ pub enum WsCommand<'a> {
         room_id: &'a str,
         content: &'a str,
     },
+    /// 输入状态上报。服务端 typing 分支读取的是报文**顶层**的 room_id（不从 data 取），
+    /// 因此本命令的出站报文不带 data 包裹层，见 outbound_ws_payload 的说明
+    SendTyping {
+        room_id: &'a str,
+    },
     EncryptMessage {
         room_id: &'a str,
         ciphertext: &'a str,
@@ -839,6 +872,7 @@ pub enum WsCommand<'a> {
 /// 上行命令的逻辑类别，用于按版本查线上 type 字符串
 enum OutboundKind {
     SendMessage,
+    SendTyping,
     EncryptMessage,
     EncryptRequest,
     EncryptAccept,
@@ -852,6 +886,7 @@ impl ApiVersion {
     fn outbound_type(self, kind: OutboundKind) -> &'static str {
         match kind {
             OutboundKind::SendMessage => "send_message",
+            OutboundKind::SendTyping => "typing",
             OutboundKind::EncryptMessage => "encrypt_message",
             OutboundKind::EncryptRequest => "encrypt_request",
             OutboundKind::EncryptAccept => "encrypt_accept",
@@ -867,6 +902,12 @@ pub fn outbound_ws_payload(version: ApiVersion, command: WsCommand) -> serde_jso
         WsCommand::SendMessage { room_id, content } => serde_json::json!({
             "type": version.outbound_type(OutboundKind::SendMessage),
             "data": { "room_id": room_id, "content": content },
+        }),
+        // typing 是唯一不带 data 包裹层的上行命令：服务端 handle_incoming 的 typing 分支
+        // 直接读报文顶层的 room_id，放进 data 会被判为缺字段而回 error
+        WsCommand::SendTyping { room_id } => serde_json::json!({
+            "type": version.outbound_type(OutboundKind::SendTyping),
+            "room_id": room_id,
         }),
         WsCommand::EncryptMessage {
             room_id,
@@ -959,6 +1000,18 @@ impl ApiVersion {
         std::time::Duration::from_secs(5)
     }
 
+    /// 输入状态上报的最小间隔。服务端对入站报文限流 30 条/30 秒，且 typing 只有"正在输入"
+    /// 一种帧，故按 1.5 秒节流：既小于接收端 2 秒衰减窗口（持续输入时指示不闪断），
+    /// 又给正常消息留出足够配额。
+    pub fn typing_send_interval(self) -> std::time::Duration {
+        std::time::Duration::from_millis(1500)
+    }
+
+    /// 接收端判定"某成员已停止输入"的本地衰减窗口（TODO 约定：2 秒内视作处于打字状态）
+    pub fn typing_display_window(self) -> std::time::Duration {
+        std::time::Duration::from_secs(2)
+    }
+
     /// 服务端"会话结束" reason（线上串）对应的本地化文案键名，集中映射便于按版本调整
     pub fn session_end_reason_key(self, reason: &str) -> &'static str {
         match reason {
@@ -1026,8 +1079,8 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
-    use tungstenite::client::IntoClientRequest;
     use tungstenite::Message as WebSocketMessage;
+    use tungstenite::client::IntoClientRequest;
 
     #[test]
     fn test_connector_creation() {
@@ -1063,8 +1116,8 @@ mod tests {
     #[test]
     #[ignore]
     fn live_test_encrypted_handshake_flow() {
-        use base64::engine::general_purpose::STANDARD as BASE64;
         use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
 
         // —— 准备：注册两账号并建立加密私聊房间（复用请求流程）——
         let mut connector = Connector::new("http://localhost:2424");

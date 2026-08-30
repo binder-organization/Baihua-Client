@@ -1,6 +1,7 @@
 {
+  "appearance": "default",
   "language": "en-US",
-  "muted_rooms": [],
+  "quick_search": false,
   "server_address": "http://localhost:2424",
   "show_uid": false,
   "sound_enabled": true,

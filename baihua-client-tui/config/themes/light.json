@@ -1,0 +1,20 @@
+{
+  "app_background": "#efebe2",
+  "message_border": "#8a7f6d",
+  "room_border": "#8a7f6d",
+  "message_text": "#2b2b2b",
+  "selected_text": "#b3541e",
+  "other_username_text": "#1f6f8b",
+  "own_username_text": "#2e7d32",
+  "time_text": "#8d8d8d",
+  "hint_text": "#8d8d8d",
+  "notice_hint_border": "#1565c0",
+  "notice_error_border": "#c62828",
+  "input_border": "#8a7f6d",
+  "input_text": "#2b2b2b",
+  "command_border": "#b3541e",
+  "search_border": "#c62828",
+  "selection_background": "#ffd54f",
+  "search_match_background": "#ef9a9a",
+  "read_state_text": "#1565c0"
+}

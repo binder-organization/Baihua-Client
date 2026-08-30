@@ -1,0 +1,20 @@
+{
+  "app_background": "black",
+  "message_border": "white",
+  "room_border": "white",
+  "message_text": "white",
+  "selected_text": "light_yellow",
+  "other_username_text": "light_cyan",
+  "own_username_text": "light_green",
+  "time_text": "white",
+  "hint_text": "light_yellow",
+  "notice_hint_border": "light_blue",
+  "notice_error_border": "light_red",
+  "input_border": "white",
+  "input_text": "white",
+  "command_border": "light_yellow",
+  "search_border": "light_red",
+  "selection_background": "light_blue",
+  "search_match_background": "light_yellow",
+  "read_state_text": "light_magenta"
+}

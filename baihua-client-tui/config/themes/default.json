@@ -1,0 +1,20 @@
+{
+  "app_background": "default",
+  "message_border": "cyan",
+  "room_border": "cyan",
+  "message_text": "white",
+  "selected_text": "yellow",
+  "other_username_text": "cyan",
+  "own_username_text": "green",
+  "time_text": "dark_gray",
+  "hint_text": "dark_gray",
+  "notice_hint_border": "blue",
+  "notice_error_border": "red",
+  "input_border": "cyan",
+  "input_text": "white",
+  "command_border": "yellow",
+  "search_border": "red",
+  "selection_background": "yellow",
+  "search_match_background": "red",
+  "read_state_text": "blue"
+}

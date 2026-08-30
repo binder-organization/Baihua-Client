@@ -1,8 +1,8 @@
 pub mod app;
 use crate::app::App;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use std::io::{self, stdout};
@@ -31,6 +31,11 @@ fn main() -> io::Result<()> {
     // 否则终端会把滚轮转义为方向键导致误触群聊切换。跨终端通用，单独启用。
     execute!(stdout(), EnableMouseCapture)?;
 
+    // 启用括号粘贴模式：粘贴内容作为单个 Event::Paste 整段送达，而不是被拆成逐字符按键事件。
+    // 不启用时粘贴文本里的换行会被当成按 Enter，多行粘贴因此会连着发出多条消息。
+    // 终端不支持时非致命跳过（行为退回原样）。
+    let bracketed_paste_enabled = execute!(stdout(), EnableBracketedPaste).is_ok();
+
     // 键盘增强标志：仅 kitty/SGR 等新型协议终端支持，用于上报 Shift/Ctrl+Enter 等组合键修饰符。
     // 传统 Windows 控制台（conhost）不支持，PushKeyboardEnhancementFlags 会返回
     // "Keyboard progressive enhancement not implemented for the legacy Windows API."。
@@ -45,6 +50,11 @@ fn main() -> io::Result<()> {
 
     let run_result = ratatui::run(|terminal| {
         loop {
+            // 应用请求整屏重绘：先 clear 让 ratatui 丢弃增量基线，下一帧全量重画，
+            // 用于修复终端侧偶发自动滚动造成的屏幕与缓冲区错位
+            if app.take_full_repaint_request() {
+                terminal.clear()?;
+            }
             terminal.draw(|frame| app.ui(frame))?;
 
             if event::poll(Duration::from_millis(100))? && app.handle_event(&event::read()?) {
@@ -69,6 +79,9 @@ fn main() -> io::Result<()> {
     // 鼠标捕获始终关闭。均用 is_ok/非致命处理，避免收尾阶段再次因不支持而中断。
     if keyboard_enhancement_pushed {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
+    if bracketed_paste_enabled {
+        let _ = execute!(stdout(), DisableBracketedPaste);
     }
     let _ = execute!(stdout(), DisableMouseCapture);
     run_result
