@@ -1,0 +1,11 @@
+[package]
+name = "baihua-client-gui"
+version = "0.1.0-alpha.1"
+edition = "2024"
+
+[[bin]]
+name = "baihua_client_gui"
+path = "src/main.rs"
+
+[dependencies]
+baihua-core = { path = "../baihua-core" }

@@ -1,0 +1,72 @@
+{
+  "name": {
+    "zh-CN": "浅色",
+    "en-US": "Light"
+  },
+  "text_color": [
+    51,
+    54,
+    61
+  ],
+  "text_alpha": 255,
+  "background_color": [
+    246,
+    247,
+    250
+  ],
+  "background_alpha": 255,
+  "rect_color": [
+    208,
+    215,
+    227
+  ],
+  "rect_alpha": 255,
+  "notice_overlay_color": [
+    15,
+    18,
+    25
+  ],
+  "notice_overlay_alpha": 130,
+  "notice_panel_color": [
+    252,
+    253,
+    255
+  ],
+  "notice_panel_alpha": 255,
+  "notice_title_color": [
+    33,
+    37,
+    46
+  ],
+  "notice_title_alpha": 255,
+  "notice_text_color": [
+    72,
+    78,
+    90
+  ],
+  "notice_text_alpha": 255,
+  "sidebar_color": [
+    233,
+    236,
+    242
+  ],
+  "sidebar_alpha": 255,
+  "top_bar_color": [
+    224,
+    229,
+    237
+  ],
+  "top_bar_alpha": 255,
+  "member_bg_color": [
+    241,
+    243,
+    247
+  ],
+  "member_bg_alpha": 255,
+  "header_color": [
+    226,
+    231,
+    239
+  ],
+  "header_alpha": 255
+}

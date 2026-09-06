@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "baihua-client-tui",
+    "baihua-client-gui",
+    "baihua-core",
+]
+resolver = "3"
