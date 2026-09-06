@@ -194,8 +194,8 @@ jobs:
           ARCHIVE="baihua-${VERSION}-${TARGET}.tar.gz"
           STAGING="staging-${TARGET}"
 
-          mkdir -p "${STAGING}/bin" "${STAGING}/config"
-          cp "target/${TARGET}/release/baihua" "${STAGING}/bin/"
+          mkdir -p "${STAGING}/config"
+          cp "target/${TARGET}/release/baihua" "${STAGING}/"
           cp -R baihua-client-tui/config/. "${STAGING}/config/"
 
           tar -czf "${ARCHIVE}" -C "${STAGING}" .
@@ -214,10 +214,9 @@ jobs:
           $archive = "baihua-${version}-${target}.zip"
           $staging = "staging-${target}"
 
-          New-Item -ItemType Directory -Force "${staging}\bin" | Out-Null
           New-Item -ItemType Directory -Force "${staging}\config" | Out-Null
 
-          Copy-Item "target\${target}\release\baihua.exe" "${staging}\bin\"
+          Copy-Item "target\${target}\release\baihua.exe" "${staging}\"
           Copy-Item -Recurse baihua-client-tui\config\* "${staging}\config\"
 
           Compress-Archive -Path "${staging}\*" -DestinationPath $archive

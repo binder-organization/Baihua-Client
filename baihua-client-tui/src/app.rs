@@ -47,18 +47,26 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use x25519_dalek::EphemeralSecret;
 
-/// 安全写入文件：创建文件时使用 0600 权限（仅所有者可读写），
+/// 安全写入文件：在 Unix 系统上创建文件时使用 0600 权限（仅所有者可读写），
 /// 防止敏感配置（如 preferences.json）被其他用户读取。
+/// Windows 系统没有等效的文件权限机制，直接使用标准写入。
 fn secure_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(content.as_bytes())
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)
+    }
 }
 
 /// 调试诊断。
