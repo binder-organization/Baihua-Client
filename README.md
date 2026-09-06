@@ -86,7 +86,6 @@ For a long time, developers have had to switch between different software, consu
 
 ### TUI
 
-- For the beta version, you can only download the compressed package from the releases and extract it, then run `cargo run` in the TUI root directory to start the client.
 - In the future, the client will support installation via some package managers, and a GUI version will be added.
 - After startup, use `/server_address` or select "Custom Server Address" in the settings to configure your Baihua server address, then call `/register` or select "Register" in the settings to register an account, and finally use `/login` or select "Login" in the settings to start chatting.
 
