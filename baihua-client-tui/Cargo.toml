@@ -1,10 +1,10 @@
 [package]
 name = "baihua-client-tui"
-version = "0.1.0-alpha.2"
+version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "baihua_client_tui"
+name = "baihua"
 path = "src/main.rs"
 
 [dependencies]
@@ -22,3 +22,5 @@ base64 = "0.23"
 chrono = { version = "0.4.45", features = ["clock"] }
 arboard = "3"
 notify-rust = "4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+reqwest = { version = "0.13", features = ["blocking"] }

@@ -1,6 +1,9 @@
 {
   "appearance": "default",
+  "email": "",
   "language": "en-US",
+  "muted_rooms": [],
+  "phone_number": "",
   "quick_search": false,
   "server_address": "http://localhost:2424",
   "show_uid": false,

@@ -1,11 +1,15 @@
+use crate::avatar::{AvatarPixels, build_avatar_pixels, placeholder_color, placeholder_initial};
 use baihua_core::{
     api::{
         ApiVersion, Connector, CreateRoomRequest, EncryptHandshakeData, EncryptedMessageInfo,
-        LoginRequest, MessageInfo, PollingEvent, RegisterRequest, RoomInfo, RoomRequestInfo,
-        ServerSignal, WsCommand, authorization_value, outbound_ws_payload, parse_websocket_event,
+        LoginRequest, MessageInfo, PollingEvent, ProfileUpdatePayload, PublicProfile,
+        RegisterRequest, RoomInfo, RoomRequestInfo, ServerSignal, UserInfo, UserSearchResult,
+        WsCommand, authorization_value, outbound_ws_payload, parse_websocket_event,
         websocket_auth_sentinel,
     },
-    crypto,
+    chat_cache::ChatCache,
+    crypto, paths,
+    update::{UpdateCheck, check_for_update, download_package},
 };
 use chrono::{DateTime, Local};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -19,7 +23,7 @@ use rat_text::text_input;
 use rat_text::text_input::{TextInput, TextInputState};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -31,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -42,13 +47,28 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use x25519_dalek::EphemeralSecret;
 
+/// 安全写入文件：创建文件时使用 0600 权限（仅所有者可读写），
+/// 防止敏感配置（如 preferences.json）被其他用户读取。
+fn secure_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(content.as_bytes())
+}
+
 /// 调试诊断。
+#[cfg(debug_assertions)]
 fn debug_log(message: &str) {
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/baihua_client_debug.log")
+        .open(std::env::temp_dir().join("baihua_client_debug.log"))
     {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -58,14 +78,9 @@ fn debug_log(message: &str) {
     }
 }
 
-/// 当前页面。
-#[derive(Default, Debug, Clone, PartialEq)]
-pub enum CurrentPage {
-    #[default]
-    Login,
-    Register,
-    Chat,
-}
+/// 调试诊断（发布版为空操作）。
+#[cfg(not(debug_assertions))]
+fn debug_log(_message: &str) {}
 
 /// 正在显示的叠加层。
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +98,54 @@ pub enum DisplayingOverlay {
     Register,
     /// 设置页或 /appearance 无参打开的外观选择浮层
     AppearanceSelect,
+    /// 个人资料卡片（/profile 打开）：显示用户名、UID、昵称、简介与头像
+    ProfileCard,
+    /// 通用表单浮层（设置个人资料、修改密码、修改头像、注销账户）：
+    /// 具体字段与提交动作在 App::active_form 里，本变体只表示"当前显示的是表单"
+    Form,
+    /// 本地头像选择浮层：列出 `<客户端目录>/config/avatars` 里的图片文件，
+    /// 回车直接用该文件上传头像；浮层里按 Ctrl+U 才转到填网络链接的修改头像表单
+    AvatarSelect,
+}
+
+/// 表单浮层里的一个输入项。
+#[derive(Debug, Clone)]
+struct FormField {
+    /// 标签文案键（表单浮层逐行显示在输入框左侧）
+    label_key: String,
+    state: TextInputState,
+    /// 密码类输入：显示为遮蔽字符，且不会被整屏框选复制走内容
+    secret: bool,
+}
+
+impl FormField {
+    fn new(label_key: &str, prefilled: &str, secret: bool) -> Self {
+        let mut state = TextInputState::default();
+        state.set_text(prefilled);
+        Self {
+            label_key: label_key.to_string(),
+            state,
+            secret,
+        }
+    }
+
+    /// 输入框当前文本（去首尾空白）
+    fn text(&self) -> String {
+        self.state.value.text().string().trim().to_string()
+    }
+}
+
+/// 表单浮层要执行的动作。字段值按表单声明顺序从 active_form 取出。
+#[derive(Debug, Clone, PartialEq)]
+enum FormAction {
+    /// 设置个人资料：昵称、手机号、简介
+    UpdateProfile,
+    /// 修改密码：旧密码、新密码、新密码确认
+    ChangePassword,
+    /// 修改头像：本地图片路径或服务端可访问的完整链接
+    ChangeAvatar,
+    /// 注销账户：再输入一次密码
+    DeleteAccount,
 }
 
 /// 加密会话所处阶段
@@ -157,8 +220,10 @@ struct Appearance {
     app_background: Color,
     /// 消息显示区边框颜色
     message_border: Color,
-    /// 群聊列表边框颜色（列表/选择类弹窗同样沿用）
+    /// 群聊列表边框颜色
     room_border: Color,
+    /// 所有叠加层窗口的边框颜色（浮层风格统一靠这一个槽位，主题里可单独调）
+    overlay_border: Color,
     /// 消息正文文本颜色
     message_text: Color,
     /// 被选中文本颜色（群聊项、设置菜单项、指令自动补全项）
@@ -187,6 +252,8 @@ struct Appearance {
     selection_background: Color,
     /// 搜索模式命中片段的背景颜色
     search_match_background: Color,
+    /// 搜索模式中"当前定位到的那一个匹配项"的背景颜色（与其余命中区分）
+    search_current_match_background: Color,
     /// 消息下方已读/未读状态文本颜色
     read_state_text: Color,
 }
@@ -290,6 +357,7 @@ impl Appearance {
             app_background: Color::Reset,
             message_border: Color::Cyan,
             room_border: Color::Cyan,
+            overlay_border: Color::Cyan,
             message_text: Color::White,
             selected_text: Color::Yellow,
             other_username_text: Color::Cyan,
@@ -304,17 +372,18 @@ impl Appearance {
             search_border: Color::Red,
             selection_background: Color::Yellow,
             search_match_background: Color::Red,
+            search_current_match_background: Color::LightYellow,
             read_state_text: Color::Blue,
         }
     }
 
-    /// 读取 config/themes/{name}.json，一次性返回完整外观结构体。
+    /// 读取 `<配置目录>/themes/{name}.json`，一次性返回完整外观结构体。
     /// 元组第二项为"字段不完整"标记：只要存在缺失槽位即为真，按主题规范不列出具体缺哪个字段；
     /// 第三项为主题文件里多出来的未知字段名列表。
     /// 文件不可读或不是合法 JSON 时返回内置默认外观，并把字段不完整标记置为真。
     fn load(name: &str) -> (Self, bool, Vec<String>) {
         let mut appearance = Self::built_in();
-        let path = format!("config/themes/{name}.json");
+        let path = paths::config_path(&format!("themes/{name}.json"));
         let Ok(content) = fs::read_to_string(&path) else {
             return (appearance, true, Vec::new());
         };
@@ -325,6 +394,7 @@ impl Appearance {
             ("app_background", &mut appearance.app_background),
             ("message_border", &mut appearance.message_border),
             ("room_border", &mut appearance.room_border),
+            ("overlay_border", &mut appearance.overlay_border),
             ("message_text", &mut appearance.message_text),
             ("selected_text", &mut appearance.selected_text),
             ("other_username_text", &mut appearance.other_username_text),
@@ -341,6 +411,10 @@ impl Appearance {
             (
                 "search_match_background",
                 &mut appearance.search_match_background,
+            ),
+            (
+                "search_current_match_background",
+                &mut appearance.search_current_match_background,
             ),
             ("read_state_text", &mut appearance.read_state_text),
         ];
@@ -365,9 +439,24 @@ impl Appearance {
         (appearance, has_missing_field, extra_fields)
     }
 
+    /// 表单浮层（改密码、改头像、设置资料、删除账户）里方框输入框的边框色：
+    /// 恒取未选中色，当前项靠标题加粗与箭头行的 > 标记指示，避免浮层一打开满眼选中色。
+    fn form_field_border(&self) -> Color {
+        self.input_border
+    }
+
+    /// 登录浮层方框输入框的边框色：聚焦项用选中色，该浮层保留原有的强指示风格。
+    fn login_field_border(&self, focused: bool) -> Color {
+        if focused {
+            self.selected_text
+        } else {
+            self.input_border
+        }
+    }
+
     /// 列出 config/themes 目录下所有可用外观名称（去掉 .json 后缀），按名称字典序排列
     fn available_names() -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir("config/themes")
+        let mut names: Vec<String> = fs::read_dir(paths::config_directory().join("themes"))
             .into_iter()
             .flatten()
             .filter_map(|entry| entry.ok())
@@ -394,7 +483,6 @@ impl Appearance {
 #[derive(Debug)]
 pub struct App {
     // ==================== 上层：用户可控配置（来自 preferences.json 或界面/指令设置）====================
-    pub current_page: CurrentPage,
     pub input_collector: InputCollector,
     pub connector: Connector,
     /// 当前加载的语言字符串映射（key → 本地化文本）
@@ -476,6 +564,8 @@ pub struct App {
     language_list_state: ListState,
     /// 外观选择列表当前的选中项
     appearance_list_state: ListState,
+    /// 本地头像选择列表当前的选中项
+    avatar_list_state: ListState,
     /// 搜索模式结果：(已执行搜索的关键词, 命中消息的 ID 列表, 当前匹配项序号)。
     /// None 表示本轮搜索模式尚未执行过搜索（输入框标题仅显示"搜索模式"）。
     search_result: Option<(String, Vec<String>, usize)>,
@@ -503,12 +593,50 @@ pub struct App {
     /// 该区域内的拖拽仍交给输入控件自己处理（保留控件内的选区与光标语义），
     /// 区域外的拖拽才启动整屏框选，两种框选不会同时生效。
     message_input_area: Rect,
+    /// 服务端实时连接状态：None 表示还没探测过（顶栏不显示标记，避免启动瞬间误报离线），
+    /// Some(true/false) 才会画出在线或离线标记。顶栏标记与"连不上服务器只提示一次"共用它。
+    connection_ready: Option<bool>,
+    /// 当前登录用户名（顶栏"当前用户"显示；未登录时为空串）
+    current_username: String,
+    /// /profile 浮层当前展示的用户资料
+    profile_view: Option<PublicProfile>,
+    /// 通用表单浮层的动作与字段（仅 displaying_overlay == Form 时有值）
+    active_form: Option<(FormAction, Vec<FormField>)>,
+    /// 自己的邮箱与手机号。服务端只在注册、登录、资料与头像接口的完整响应里给这两项，
+    /// 公开资料接口刻意不含它们，因此看别人时卡片上这两行显示"无"。
+    own_contact: Option<(String, String)>,
+    /// 自己发出的聊天请求列表（私聊管理浮层与收到的请求一起展示）
+    sent_requests: Vec<RoomRequestInfo>,
+    /// 注册用户目录缓存（服务端全量用户列表）。None 表示还没拉过，Some 即使为空也算拉过，
+    /// 不再重复请求。/profile 的自动补全每帧都读它，所以拉取只能由按键触发、在后台线程完成，
+    /// 绝不能出现在渲染路径里
+    registered_users: Option<Vec<UserSearchResult>>,
+    /// 消息本地缓存（只缓存未加密房间）。按当前登录用户 ID 建立目录，未登录时为 None
+    chat_cache: Option<ChatCache>,
+    /// 头像原始字节：用户 ID → 图片字节，None 表示"已确认没有头像或取回失败"。
+    /// 条目存在即不再重复请求，避免每帧为同一个用户反复联网；字节由后台线程取回后经
+    /// PollingEvent::AvatarLoaded 交回主线程，渲染期只做一次解码（见 avatar_pixels）。
+    avatar_images: HashMap<String, Option<Vec<u8>>>,
+    /// 按显示尺寸解码好的头像像素块：键为 (用户 ID, 列数, 行数)。
+    /// 同一尺寸只解码一次（消息列表用小块，个人资料卡片用大块），之后每帧直接查表。
+    avatar_pixels: HashMap<(String, usize, usize), AvatarPixels>,
+    /// 已下载并通过校验的新版本：(新版本号, 本地包路径)。/update 与设置项"更新客户端"消费它
+    pending_update: Option<(String, PathBuf)>,
+    /// /update 已安排后台安装进程等待本进程退出，主循环检测到该标记后立即退出
+    update_handoff_requested: bool,
+    /// 后台版本检查与下载是否正在进行，避免重复派生下载线程
+    update_check_running: Option<Arc<AtomicBool>>,
+    /// 常驻可达性探测线程的运行标志（换服务器地址时停旧起新）
+    reachability_running: Option<Arc<AtomicBool>>,
+    /// 消息缓存待落盘的起始时刻：Some 表示"当前房间消息列表比磁盘新"。
+    /// 消息逐条到达时只置位不写盘，handle_tick 攒够批量窗口后一次性整房写入，
+    /// 避免活跃群里每条消息都触发一次整文件重写
+    cache_pending_flush_since: Option<Instant>,
 }
 
 impl Default for App {
     fn default() -> Self {
         Self {
-            current_page: CurrentPage::Chat,
             input_collector: InputCollector::default(),
             connector: Connector::default(),
             language_strings: HashMap::new(),
@@ -550,6 +678,7 @@ impl Default for App {
             quit_ready: false,
             language_list_state: ListState::default(),
             appearance_list_state: ListState::default(),
+            avatar_list_state: ListState::default(),
             search_result: None,
             pending_scroll_message_id: None,
             typing_members: Vec::new(),
@@ -558,6 +687,21 @@ impl Default for App {
             screen_text_rows: Vec::new(),
             message_input_area: Rect::default(),
             full_repaint_requested: false,
+            connection_ready: None,
+            current_username: String::new(),
+            profile_view: None,
+            active_form: None,
+            own_contact: None,
+            sent_requests: Vec::new(),
+            registered_users: None,
+            chat_cache: None,
+            avatar_images: HashMap::new(),
+            avatar_pixels: HashMap::new(),
+            pending_update: None,
+            update_handoff_requested: false,
+            update_check_running: None,
+            reachability_running: None,
+            cache_pending_flush_since: None,
         }
     }
 }
@@ -704,7 +848,8 @@ fn is_content_character(character: char) -> bool {
     !character.is_whitespace() && !is_decoration_character(character)
 }
 
-/// 界面装饰字符集合：制表框线、选中箭头、在线状态圆点、项目点等。
+/// 界面装饰字符集合：制表框线、选中箭头、在线状态圆点、项目点、头像半块等。
+/// 框选复制与高亮都按这份名单剔除，避免把界面图形当成聊天内容复制走。
 fn is_decoration_character(character: char) -> bool {
     matches!(
         character,
@@ -740,6 +885,8 @@ fn is_decoration_character(character: char) -> bool {
             | '●'
             | '○'
             | '·'
+            | '▀'
+            | '▄'
     )
 }
 
@@ -786,7 +933,9 @@ impl App {
         self.polling_sender = sender;
     }
 
-    /// 启动后台轮询线程，定期从服务器获取房间列表与待处理聊天请求
+    /// 启动后台轮询线程，定期从服务器获取房间列表、待处理与已发送的聊天请求。
+    /// 取数失败时按错误类别分流：连不上服务端只报可达性跳变（界面据此提示一次并标记顶栏），
+    /// 服务端明确返回的业务错误仍按 Error 弹出。
     pub fn start_polling_thread(&mut self) {
         let Some(sender) = self.polling_sender.clone() else {
             return;
@@ -809,13 +958,22 @@ impl App {
                     .cloned()
                     .unwrap_or_else(|| key.to_string())
             };
+            let report_failure = |error: baihua_core::api::ConnectorError, label_key: &str| {
+                if error.is_connection_failure() {
+                    let _ = sender.send(PollingEvent::ReachabilityChanged(false));
+                } else {
+                    let _ = sender.send(PollingEvent::Error(format!("{}: {error}", tr(label_key))));
+                }
+            };
             let mut last_rooms: Vec<RoomInfo> = Vec::new();
             let mut last_requests: Vec<RoomRequestInfo> = Vec::new();
+            let mut last_sent_requests: Vec<RoomRequestInfo> = Vec::new();
             let mut room_poll_counter: u32 = 0;
             let mut request_poll_counter: u32 = 0;
 
             while running_flag.load(Ordering::Relaxed) {
-                // 每 2 秒轮询房间列表
+                // 每 2 秒轮询房间列表。连不上服务端由常驻探测线程统一报告，
+                // 这里不把传输层失败当业务错误抛出，否则一次网络抖动就是一串报错框
                 if room_poll_counter.is_multiple_of(20) {
                     match connector.list_rooms() {
                         Ok(rooms) => {
@@ -824,16 +982,20 @@ impl App {
                                 let _ = sender.send(PollingEvent::RoomsUpdated(rooms));
                             }
                         }
-                        Err(e) => {
+                        Err(error) if error.is_connection_failure() => {
+                            debug_log(&format!("轮询房间列表时连不上服务端: {error}"));
+                        }
+                        Err(error) => {
                             let _ = sender.send(PollingEvent::Error(format!(
-                                "{}: {e}",
+                                "{}: {error}",
                                 tr("error_poll_rooms")
                             )));
                         }
                     }
                 }
 
-                // 每 3 秒轮询待处理聊天请求
+                // 每 3 秒轮询收到的与已发出的聊天请求；请求接口失败不改变可达性结论，
+                // 房间列表已经承担同样的连通性判断，这里只把业务错误报出去
                 if request_poll_counter.is_multiple_of(30) {
                     match connector.list_pending_requests() {
                         Ok(requests) => {
@@ -842,12 +1004,16 @@ impl App {
                                 let _ = sender.send(PollingEvent::PendingRequestsUpdated(requests));
                             }
                         }
-                        Err(e) => {
-                            let _ = sender.send(PollingEvent::Error(format!(
-                                "{}: {e}",
-                                tr("error_poll_requests")
-                            )));
+                        Err(error) => report_failure(error, "error_poll_requests"),
+                    }
+                    match connector.list_sent_requests() {
+                        Ok(requests) => {
+                            if requests != last_sent_requests {
+                                last_sent_requests = requests.clone();
+                                let _ = sender.send(PollingEvent::SentRequestsUpdated(requests));
+                            }
                         }
+                        Err(error) => report_failure(error, "error_poll_requests"),
                     }
                 }
 
@@ -1069,7 +1235,29 @@ impl App {
             PollingEvent::RoomsUpdated(rooms) => {
                 self.apply_room_snapshot(rooms);
             }
+            PollingEvent::SentRequestsUpdated(requests) => {
+                self.announce_declined_invitations(&requests);
+                self.sent_requests = requests;
+            }
+            PollingEvent::ReachabilityChanged(online) => {
+                self.update_connection_state(online);
+            }
+            PollingEvent::AvatarLoaded((user_id, image_bytes)) => {
+                self.avatar_images.insert(user_id, image_bytes);
+            }
+            PollingEvent::RegisteredUsersUpdated(users) => {
+                self.registered_users = Some(users);
+            }
+            PollingEvent::UpdateReady((version, archive_path)) => {
+                self.pending_update = Some((version.clone(), archive_path));
+                self.push_notification(
+                    self.t("update_ready")
+                        .replace("{version}", &version)
+                        .to_string(),
+                );
+            }
             PollingEvent::WebSocketConnected => {
+                self.update_connection_state(true);
                 // 连接（或重连）就绪：对所有未激活握手按既有密钥材料原样重发。
                 // 旧邀请可能在无人订阅期间广播丢失；无未激活会话时为空操作
                 let stale_room_ids: Vec<String> = self
@@ -1091,6 +1279,7 @@ impl App {
                     .any(|existing| existing.id == message.id)
                 {
                     self.messages.push(message);
+                    self.mark_messages_dirty();
                 }
             }
             PollingEvent::IncomingMessage(message) => {
@@ -1113,11 +1302,7 @@ impl App {
                 // 只要是他人的消息就触发系统通知（含提示音），无论是否在当前查看的房间；
                 // 该房间开启免打扰时抑制通知（未读数仍累加）
                 if !is_own_message && !self.muted_room_ids.contains(&message.room_id) {
-                    let sender_name = self
-                        .sender_names
-                        .get(&message.sender_id)
-                        .cloned()
-                        .unwrap_or_else(|| message.sender_id.clone());
+                    let sender_name = self.sender_display_name(&message.sender_id);
                     self.send_system_notification(
                         &self.t("notification_new_message"),
                         &format!("{}: {}", sender_name, message.content),
@@ -1140,7 +1325,7 @@ impl App {
                     ));
                     // 实时收到某人消息，说明他此刻确有连接：以此修正在线状态，
                     // 避免因错过 user_online 跳变而长期误显示为离线
-                    if !is_own_message {
+                    if !is_own_message && !message.sender_id.is_empty() {
                         self.presence_by_user
                             .insert(message.sender_id.clone(), true);
                     }
@@ -1149,6 +1334,7 @@ impl App {
                             !find_keyword_positions(&message.content, keyword).is_empty()
                         });
                     self.messages.push(message);
+                    self.mark_messages_dirty();
                     if is_match {
                         // 搜索进行中来了新的命中消息：重扫命中列表让"第 i/n"随之更新，
                         // 但不抢占视图位置（用户可能正在读当前匹配项附近的内容）
@@ -1199,7 +1385,7 @@ impl App {
                         );
                     }
                 }
-                self.pending_requests = requests;
+                self.apply_received_requests(requests);
                 if self.request_list_state.selected().is_none() && !self.pending_requests.is_empty()
                 {
                     self.request_list_state.select(Some(0));
@@ -1253,8 +1439,14 @@ impl App {
                 // 本端 WebSocket 抖动会自愈（自动重连 + 定期刷新订阅），默认不打扰用户；
                 // 只有确实发不出去的报文才提示，避免"突然报错又自己好了"的噪声
                 debug_log(&format!("WebSocket 状态事件: {message_key}"));
-                if message_key == "error_ws_send_failed" {
-                    self.push_error(self.t(&message_key));
+                match message_key.as_str() {
+                    "error_ws_send_failed" => self.push_error(self.t(&message_key)),
+                    // 连不上服务端：交给顶栏标记，同一故障持续期间只在这一帧弹一次错误
+                    "error_ws_connect_failed" => {
+                        // 版本串清空即可；连接标记交给常驻探测线程，它比单条链路的抖动可靠
+                        self.connector.clear_server_version();
+                    }
+                    _ => {}
                 }
             }
             PollingEvent::MemberTyping((room_id, user_id, username)) => {
@@ -1295,7 +1487,6 @@ impl App {
                     debug_log("WebSocket 认证失败，清除保存的会话并回到未登录聊天页");
                     Self::clear_saved_session();
                     self.current_user_id = None;
-                    self.current_page = CurrentPage::Chat;
                     self.focus_index = 0;
                     self.rooms.clear();
                     self.rooms_state = ListState::default();
@@ -1561,11 +1752,7 @@ impl App {
             // 该房间开启免打扰（或自己发出的回声）时抑制通知
             *self.unread_counts.entry(info.room_id.clone()).or_insert(0) += 1;
             if !is_own && !self.muted_room_ids.contains(&info.room_id) {
-                let sender_name = self
-                    .sender_names
-                    .get(&info.sender_id)
-                    .cloned()
-                    .unwrap_or_else(|| info.sender_id.clone());
+                let sender_name = self.sender_display_name(&info.sender_id);
                 let preview = plaintext.unwrap_or_else(|| self.t("encrypted_mark"));
                 self.send_system_notification(
                     &self.t("notification_new_message"),
@@ -1579,6 +1766,8 @@ impl App {
         match plaintext {
             Some(plaintext) => {
                 if !self.messages.iter().any(|existing| existing.id == info.id) {
+                    // 加密房间不落盘，这里只标脏也无害：落盘前还会按房间加密标志再挡一次
+                    self.mark_messages_dirty();
                     self.messages.push(MessageInfo {
                         id: info.id,
                         room_id: info.room_id,
@@ -1760,10 +1949,42 @@ impl App {
             self.resend_handshake_if_needed(&room_id);
         }
 
+        // 攒够批量窗口的消息变更一次性落盘（消息逐条到达时只置脏标记）
+        self.flush_pending_message_cache();
+
         // 服务端不广播"停止输入"，超时即视为已停止：定期摘掉过期记录，防止列表无限增长
         let display_window = version.typing_display_window();
         self.typing_members
             .retain(|(_, _, seen_at)| seen_at.elapsed() < display_window);
+    }
+
+    /// 消息输入框内容发生变化的统一入口（普通按键、Ctrl+J、Ctrl+U、粘贴四处都经这里）：
+    /// 上报输入状态，并让与当前输入不符的旧搜索结果立即失效。
+    /// 快速搜索模式下随输入就地重扫已加载消息；普通搜索模式下关键词一改（含用退格删掉一段、
+    /// 或删掉井号前缀退出搜索模式），上次结果就不再成立，匹配列表、当前序号与定位一起清掉，
+    /// 标题随即回到"未执行搜索"，上下键也不再跳转旧结果。
+    fn handle_message_input_changed(&mut self) {
+        self.notify_typing_if_needed();
+        // 打出 "/profile " 这一刻把服务端全部用户捞回来，补全面板随后几帧就有内容
+        if self
+            .input_collector
+            .message_input_state
+            .text()
+            .starts_with("/profile ")
+        {
+            self.ensure_registered_users_loaded();
+        }
+        if !self.in_search_mode() {
+            self.search_result = None;
+            self.pending_scroll_message_id = None;
+            return;
+        }
+        if self.quick_search {
+            self.apply_quick_search();
+        } else if self.active_search_keyword().is_none() {
+            self.search_result = None;
+            self.pending_scroll_message_id = None;
+        }
     }
 
     /// 输入框文本变化后上报输入状态（增删均算，符合"2 秒内视作处于打字状态"的判定）。
@@ -1828,18 +2049,26 @@ impl App {
 impl App {
     /// 从 config/languages/{lang}.json 加载语言字符串到 language_strings
     pub fn load_language(&mut self, lang: &str) {
-        let path = format!("config/languages/{lang}.json");
+        let path = paths::config_path(&format!("languages/{lang}.json"));
         match fs::read_to_string(&path) {
             Ok(content) => match serde_json::from_str::<HashMap<String, String>>(&content) {
                 Ok(map) => {
                     self.language_strings = map;
                 }
                 Err(_) => {
-                    self.push_error(format!("{}: {path}", self.t("error_lang_file_format")));
+                    self.push_error(format!(
+                        "{path}: {message}",
+                        path = path.display(),
+                        message = self.t("error_lang_file_format"),
+                    ));
                 }
             },
             Err(_) => {
-                self.push_error(format!("{}: {path}", self.t("error_lang_file_read")));
+                self.push_error(format!(
+                    "{path}: {message}",
+                    path = path.display(),
+                    message = self.t("error_lang_file_read"),
+                ));
             }
         }
     }
@@ -1853,7 +2082,7 @@ impl App {
     }
     /// 返回 config/languages/ 下所有可用的语言代码（去 .json 后缀）
     fn get_available_languages() -> Vec<String> {
-        let dir = "config/languages";
+        let dir = paths::config_directory().join("languages");
         fs::read_dir(dir)
             .into_iter()
             .flatten()
@@ -1877,8 +2106,8 @@ impl App {
 
     /// 获取当前语言代码（从 preferences.json 读取）
     pub fn current_language() -> String {
-        let prefs_path = "config/preferences.json";
-        fs::read_to_string(prefs_path)
+        let prefs_path = paths::readable_config_path("preferences.json");
+        fs::read_to_string(&prefs_path)
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
             .and_then(|v| v.get("language")?.as_str().map(|s| s.to_string()))
@@ -1887,21 +2116,21 @@ impl App {
 
     /// 保存语言设置到 preferences.json
     fn save_language_preference(lang: &str) {
-        let prefs_path = "config/preferences.json";
-        let content = fs::read_to_string(prefs_path).unwrap_or_default();
+        let prefs_path = paths::writable_config_path("preferences.json");
+        let content = fs::read_to_string(&prefs_path).unwrap_or_default();
         let mut prefs: serde_json::Value =
             serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
         prefs["language"] = serde_json::json!(lang);
         if let Ok(pretty) = serde_json::to_string_pretty(&prefs) {
-            let _ = fs::write(prefs_path, pretty);
+            let _ = secure_write(&prefs_path, &pretty);
         }
     }
 
     /// 从 preferences.json 读取显示偏好（show_uid / time_with_date / server_address / sound_enabled /
     /// appearance / read_state_manual），读不到时保持默认
     pub fn load_display_preferences(&mut self) {
-        let prefs_path = "config/preferences.json";
-        if let Some(v) = fs::read_to_string(prefs_path)
+        let prefs_path = paths::readable_config_path("preferences.json");
+        if let Some(v) = fs::read_to_string(&prefs_path)
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
         {
@@ -1983,20 +2212,22 @@ impl App {
 
     /// 将外观名称写入 preferences.json（配置项，与显示偏好同一文件同一写法）
     fn save_appearance_preference(&self) {
-        let prefs_path = "config/preferences.json";
-        let content = fs::read_to_string(prefs_path).unwrap_or_default();
+        let prefs_path = paths::writable_config_path("preferences.json");
+        let read_path = paths::readable_config_path("preferences.json");
+        let content = fs::read_to_string(&read_path).unwrap_or_default();
         let mut prefs: serde_json::Value =
             serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
         prefs["appearance"] = serde_json::json!(self.appearance_name);
         if let Ok(pretty) = serde_json::to_string_pretty(&prefs) {
-            let _ = fs::write(prefs_path, pretty);
+            let _ = secure_write(&prefs_path, &pretty);
         }
     }
 
-    /// 将 show_uid 与 time_with_date 显示偏好写入 preferences.json
+    /// 将全部界面显示偏好写入 preferences.json（新增显示类开关只改这一处即可）
     fn save_display_preferences(&self) {
-        let prefs_path = "config/preferences.json";
-        let content = fs::read_to_string(prefs_path).unwrap_or_default();
+        let prefs_path = paths::writable_config_path("preferences.json");
+        let read_path = paths::readable_config_path("preferences.json");
+        let content = fs::read_to_string(&read_path).unwrap_or_default();
         let mut prefs: serde_json::Value =
             serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
         prefs["show_uid"] = serde_json::json!(self.show_uid);
@@ -2006,19 +2237,20 @@ impl App {
         prefs["muted_rooms"] =
             serde_json::json!(self.muted_room_ids.iter().cloned().collect::<Vec<String>>());
         if let Ok(pretty) = serde_json::to_string_pretty(&prefs) {
-            let _ = fs::write(prefs_path, pretty);
+            let _ = secure_write(&prefs_path, &pretty);
         }
     }
 
     /// 将自定义服务器地址写入 preferences.json
     fn save_server_address(&self) {
-        let prefs_path = "config/preferences.json";
-        let content = fs::read_to_string(prefs_path).unwrap_or_default();
+        let prefs_path = paths::writable_config_path("preferences.json");
+        let read_path = paths::readable_config_path("preferences.json");
+        let content = fs::read_to_string(&read_path).unwrap_or_default();
         let mut prefs: serde_json::Value =
             serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
         prefs["server_address"] = serde_json::json!(self.connector.base_url());
         if let Ok(pretty) = serde_json::to_string_pretty(&prefs) {
-            let _ = fs::write(prefs_path, pretty);
+            let _ = secure_write(&prefs_path, &pretty);
         }
     }
 
@@ -2113,22 +2345,45 @@ impl App {
 
     /// 将登录会话（JWT 与企业用户 ID）写入 preferences.json，供下次启动自动登录。
     /// 令牌经静态加密后落盘，不保存明文密码或用户名。
-    fn save_session_preferences(token: &str, user_id: &str) {
-        let prefs_path = "config/preferences.json";
-        let content = fs::read_to_string(prefs_path).unwrap_or_default();
+    fn save_session_preferences(token: &str, user_id: &str, contact: Option<&(String, String)>) {
+        let prefs_path = paths::writable_config_path("preferences.json");
+        let read_path = paths::readable_config_path("preferences.json");
+        let content = fs::read_to_string(&read_path).unwrap_or_default();
         let mut prefs: serde_json::Value =
             serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
         prefs["token"] = serde_json::json!(crypto::encrypt_at_rest(token));
         prefs["user_id"] = serde_json::json!(user_id);
-        if let Ok(pretty) = serde_json::to_string_pretty(&prefs) {
-            let _ = fs::write(prefs_path, pretty);
+        match contact {
+            Some((email, phone_number)) => {
+                prefs["email"] = serde_json::json!(crypto::encrypt_at_rest(email));
+                prefs["phone_number"] = serde_json::json!(crypto::encrypt_at_rest(phone_number));
+            }
+            None => {
+                if let Some(map) = prefs.as_object_mut() {
+                    map.remove("email");
+                    map.remove("phone_number");
+                }
+            }
         }
+        if let Ok(pretty) = serde_json::to_string_pretty(&prefs) {
+            let _ = secure_write(&prefs_path, &pretty);
+        }
+    }
+
+    /// 读取上次退出时存下的邮箱与手机号（服务端没有"查自己的联系方式"接口，
+    /// 自动登录路径拿不到登录响应，只能靠本地会话记录还原资料卡这两行）。
+    fn load_saved_contact() -> Option<(String, String)> {
+        let content = fs::read_to_string(paths::config_path("preferences.json")).ok()?;
+        let prefs: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let email = crypto::decrypt_at_rest(prefs.get("email")?.as_str()?)?;
+        let phone_number = crypto::decrypt_at_rest(prefs.get("phone_number")?.as_str()?)?;
+        Some((email, phone_number))
     }
 
     /// 读取已保存的登录会话；令牌先解密，凭证缺失或解密失败时返回 None
     fn load_saved_session() -> Option<(String, String)> {
-        let prefs_path = "config/preferences.json";
-        let content = fs::read_to_string(prefs_path).ok()?;
+        let prefs_path = paths::readable_config_path("preferences.json");
+        let content = fs::read_to_string(&prefs_path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&content).ok()?;
         let token = crypto::decrypt_at_rest(v.get("token")?.as_str()?)?;
         let user_id = v.get("user_id")?.as_str()?;
@@ -2137,16 +2392,19 @@ impl App {
 
     /// 清除已保存的登录会话（token 失效或不再需要自动登录时调用）
     fn clear_saved_session() {
-        let prefs_path = "config/preferences.json";
-        let content = fs::read_to_string(prefs_path).unwrap_or_default();
+        let prefs_path = paths::writable_config_path("preferences.json");
+        let read_path = paths::readable_config_path("preferences.json");
+        let content = fs::read_to_string(&read_path).unwrap_or_default();
         let mut prefs: serde_json::Value =
             serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
         if let Some(map) = prefs.as_object_mut() {
             map.remove("token");
             map.remove("user_id");
+            map.remove("email");
+            map.remove("phone_number");
         }
         if let Ok(pretty) = serde_json::to_string_pretty(&prefs) {
-            let _ = fs::write(prefs_path, pretty);
+            let _ = secure_write(&prefs_path, &pretty);
         }
     }
 
@@ -2168,18 +2426,21 @@ impl App {
             Self::clear_saved_session();
             return false;
         }
+        self.update_connection_state(true);
         debug_log("JWT AUTO-LOGIN: list_rooms 成功，设置用户状态");
         // 自动登录同样立即探测服务端版本（token 已 set），令后续线上决策匹配真实版本
         self.detect_and_apply_api_version();
         self.current_user_id = Some(user_id.clone());
+        // 自动登录没有登录响应，联系方式用上次退出时存下的那份
+        self.own_contact = Self::load_saved_contact();
         // 服务端不会给自己广播 user_online，本端在线状态需自行登记
         self.presence_by_user.insert(user_id, true);
-        self.current_page = CurrentPage::Chat;
         self.focus_index = 0;
         // 与普通登录保持完全一致的流程：先加载房间列表，再启动后台线程
         self.load_rooms();
         self.start_polling_thread();
         self.start_websocket_thread(&token, None);
+        self.prepare_session_state(None);
         self.push_notification(self.t("auto_login_notification"));
         debug_log("=== JWT AUTO-LOGIN COMPLETE ===");
         true
@@ -2188,14 +2449,19 @@ impl App {
 
 /// 内置聊天命令表，元素为 (命令名, 描述的语言键名)。
 /// 扩展新命令时在此追加条目，并在 App::execute_chat_command 中增加对应执行分支即可。
-fn chat_commands() -> Vec<(&'static str, &'static str)> {
+pub(crate) fn chat_commands() -> Vec<(&'static str, &'static str)> {
     vec![
         ("quit", "command_quit"),
+        ("exit", "command_quit"),
         ("quit_group", "command_quit_group"),
         ("kick", "command_kick"),
         ("info", "command_info"),
+        ("list_users", "command_list_users"),
+        ("search_users", "command_search_users"),
+        ("profile", "command_profile"),
         ("language", "command_language"),
         ("appearance", "command_appearance"),
+        ("update", "command_update"),
         ("logout", "command_logout"),
         ("server_address", "command_server_address"),
         ("add_member", "command_add_member"),
@@ -2249,6 +2515,438 @@ fn display_width(text: &str) -> u16 {
             }
         })
         .sum()
+}
+
+/// 两批消息按 ID 合并成一批：先到的（本地已有，可能是解密后的明文）优先保留，
+/// 后到的只补新条目，最后按创建时间与服务端 ID 升序排列。
+fn merge_messages_by_id(
+    existing: Vec<MessageInfo>,
+    incoming: Vec<MessageInfo>,
+) -> Vec<MessageInfo> {
+    let mut merged = existing;
+    let mut seen: HashSet<String> = merged.iter().map(|message| message.id.clone()).collect();
+    for message in incoming {
+        if seen.insert(message.id.clone()) {
+            merged.push(message);
+        }
+    }
+    merged.sort_by(|left, right| (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id)));
+    merged
+}
+
+/// 叠加层统一窗口边框：四边框加左上角标题，边框色一律取外观的 overlay_border。
+/// 所有浮层（表单、列表、卡片、输入框组）都从这里取窗口外观，
+/// 换主题或调风格只动这一处，不会再出现某个浮层跟着消息区边框色走的情况。
+fn overlay_frame_block(appearance: &Appearance, title: &str) -> Block<'static> {
+    Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(appearance.overlay_border))
+}
+
+/// 无边框输入项：箭头行形态的表单用它，正文、光标、框选配色与方框输入框同源。
+fn render_plain_field(
+    appearance: &Appearance,
+    frame: &mut Frame,
+    area: Rect,
+    secret: bool,
+    state: &mut TextInputState,
+) {
+    let mut input = TextInput::new()
+        .style(Style::default().fg(appearance.input_text))
+        .block(Block::default())
+        .cursor_style(Style::default().fg(appearance.own_username_text))
+        .select_style(
+            Style::default()
+                .fg(contrasting_foreground(appearance.selection_background))
+                .bg(appearance.selection_background),
+        );
+    if secret {
+        input = input.passwd();
+    }
+    input.render(area, frame.buffer_mut(), state);
+}
+
+/// 统一"方框输入框"：标签写在边框标题上，正文、光标、框选配色全部取自外观。
+/// 少于三个输入条目的浮层用它；三个及以上改用箭头行（见 render_form）。
+/// 取自由函数形式是为了让调用方同时持有外观的不可变借用与输入状态的可变借用。
+/// 边框色与标题样式都由调用方给出：登录/注册用聚焦态切换的选中色边框，表单浮层一律用
+/// 未选中色边框（见 Appearance::form_field_border），当前项改由标题加粗指示，
+/// 与箭头行形态的同类指示保持一致。
+fn render_box_field(
+    appearance: &Appearance,
+    frame: &mut Frame,
+    area: Rect,
+    title: Line<'static>,
+    border_color: Color,
+    secret: bool,
+    state: &mut TextInputState,
+) {
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let mut input = TextInput::new()
+        .style(Style::default().fg(appearance.input_text))
+        .block(block)
+        .cursor_style(Style::default().fg(appearance.own_username_text))
+        .select_style(
+            Style::default()
+                .fg(contrasting_foreground(appearance.selection_background))
+                .bg(appearance.selection_background),
+        );
+    if secret {
+        input = input.passwd();
+    }
+    input.render(area, frame.buffer_mut(), state);
+}
+
+/// 提示类文本的统一样式（快捷键说明、顶栏标签、表单提示行都用它）
+fn hint_style(color: Color) -> Style {
+    Style::default().fg(color)
+}
+
+/// 把资料卡片里的 "标签: 值" 行按可用宽度折行，续行缩进到值的起始列。
+/// 窄终端上 UID、邮箱、头像链接这类长单行因此是换行显示，而不是被面板右边界切掉。
+fn wrap_profile_fields(body: Text<'static>, available_width: u16) -> Text<'static> {
+    if available_width == 0 {
+        return body;
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for line in body.lines {
+        let plain = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        if (line.width() as u16) <= available_width {
+            lines.push(line);
+            continue;
+        }
+        let style = line
+            .spans
+            .last()
+            .map(|span| span.style)
+            .unwrap_or_else(Style::default);
+        let separator = match plain.find(": ") {
+            Some(position) => position,
+            // 没有"标签: "结构的行（如关闭提示）整行按宽度折，不做缩进对齐
+            None => {
+                for piece in wrap_by_display_width(&plain, available_width) {
+                    lines.push(Line::from(Span::styled(piece, style)));
+                }
+                continue;
+            }
+        };
+        // 按字节切片：": " 是两个 ASCII 字符，切点必然落在字符边界上；
+        // 标签本身可能是多字节中文，所以不能用字符数去算切点
+        let prefix = plain[..separator + 2].to_string();
+        let value = plain[separator + 2..].to_string();
+        let indent_columns = usize::from(display_width(&prefix));
+        let value_width = available_width.saturating_sub(indent_columns as u16).max(1);
+        for (index, piece) in wrap_by_display_width(&value, value_width)
+            .into_iter()
+            .enumerate()
+        {
+            let text = if index == 0 {
+                format!("{prefix}{piece}")
+            } else {
+                format!("{}{piece}", " ".repeat(indent_columns))
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+    Text::from(lines)
+}
+
+/// 头像还没取回、或该用户根本没设头像时的占位：在头像块左上角画一个按用户 ID 稳定取色的首字符。
+/// 占位与真图共用同一块区域，头像到位后只是把这块画满，文字位置不会跳动。
+fn paint_avatar_placeholder(
+    frame: &mut Frame,
+    area: Rect,
+    username: &str,
+    appearance: &Appearance,
+    user_id: &str,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            placeholder_initial(username),
+            Style::default()
+                .fg(placeholder_color(user_id))
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(appearance.app_background)),
+        Rect::new(area.x, area.y, 1, 1),
+    );
+}
+
+/// 多行文本里最宽一行的显示宽度（整段文本的总宽度不能用来定面板宽，会把多行提示算虚高）
+fn longest_line_width(text: &str) -> u16 {
+    text.lines().map(display_width).max().unwrap_or(0)
+}
+
+/// 估算文本在给定内宽下会占多少渲染行：显式换行各算一行，每行再按显示宽度向上取整折行
+fn estimated_wrapped_line_count(text: &str, inner_width: u16) -> u16 {
+    if inner_width == 0 {
+        return 1;
+    }
+    text.lines()
+        .map(|line| display_width(line).div_ceil(inner_width).max(1))
+        .sum::<u16>()
+        .max(1)
+}
+
+/// 在给定区域内算出居中的面板矩形（各浮层共用，避免每处重复写偏移）
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+/// 收到的那条请求是否仍在等自己处理。服务端 `GET /requests/pending` 只回仍是 pending 的行
+/// 且不返回状态字段，所以状态缺省即"仍在等"；本端处理过的条目会被就地写上结果状态。
+/// 自己发出的那侧服务端总给状态，按字面 `== "pending"` 判即可，不共用这个函数。
+fn received_request_is_pending(request: &RoomRequestInfo) -> bool {
+    request
+        .status
+        .as_deref()
+        .is_none_or(|status| status == "pending")
+}
+
+/// 列表类浮层（设置菜单、语言、外观、本地头像）的统一排版：
+/// 面板宽度按"最宽一条 + 边框 + 高亮符号"定，但不超出可绘制区；
+/// 返回 (面板矩形, 条目可用宽度)，条目宽度由调用方交给 `wrapped_list_item` 折行。
+fn overlay_list_panel(labels: &[String], area: Rect) -> (Rect, u16) {
+    let longest = labels
+        .iter()
+        .map(|label| display_width(label))
+        .max()
+        .unwrap_or(0);
+    // 边框 2 列 + 高亮符号 2 列 + 左右各 1 列余量；面板本身按内容定宽，
+    // 但既不留成一条窄缝也不铺满整屏，最后再让位给屏幕宽度
+    let wanted_width = (longest + 6).clamp(30, 60);
+    let width_ceiling = area.width.saturating_sub(2).max(12);
+    let panel_width = if wanted_width > width_ceiling {
+        width_ceiling
+    } else {
+        wanted_width
+    };
+    // 条目比"面板宽 − 边框 − 高亮符号"还长就折行，宁可多占一行也不在右边界切掉
+    let body_width = panel_width.saturating_sub(6).max(1);
+    let line_count: u16 = labels
+        .iter()
+        .map(|label| display_width(label).div_ceil(body_width).max(1))
+        .sum();
+    let wanted_height = line_count + 4;
+    let height_ceiling = area.height.saturating_sub(2).max(5);
+    let panel_height = if wanted_height > height_ceiling {
+        height_ceiling
+    } else {
+        wanted_height
+    };
+    (centered_rect(panel_width, panel_height, area), body_width)
+}
+
+/// 补全面板一条候选的行集合：说明与命令名同排放得下就同排，放不下时说明另起一行，
+/// 两截都按面板内宽折行。返回行数供调用方算面板高度。
+fn completion_lines(
+    label: &str,
+    description: &str,
+    label_style: Style,
+    description_style: Style,
+    body_width: u16,
+) -> Vec<Line<'static>> {
+    let same_row_fits = display_width(label) + display_width(description) + 2 <= body_width;
+    let mut lines: Vec<Line> = wrap_preserving_words(label, body_width)
+        .into_iter()
+        .map(|piece| Line::from(Span::styled(piece, label_style)))
+        .collect();
+    if description.is_empty() {
+        return lines;
+    }
+    if same_row_fits {
+        if let Some(first) = lines.first_mut() {
+            first.push_span(Span::styled(format!("  {description}"), description_style));
+        }
+        return lines;
+    }
+    lines.extend(
+        wrap_preserving_words(description, body_width.saturating_sub(2).max(1))
+            .into_iter()
+            .map(|piece| Line::from(Span::styled(format!("  {piece}"), description_style))),
+    );
+    lines
+}
+
+/// 把一段提示文本按可用宽度折成带样式的 Text。折点由本函数定死、渲染时不再让
+/// Paragraph 自己折，"预留几行"与"实际占几行"才必然一致（交给 Paragraph 按词边界折行时，
+/// 中英混排会比估算值多占一行，面板正好把尾行裁掉）。
+/// 行内优先在空格处断开，英文句子不会被从单词中间切开；纯中文按字折。
+fn wrapped_hint_text(hint: &str, style: Style, available_width: u16) -> Text<'static> {
+    Text::from(
+        wrap_preserving_words(hint, available_width)
+            .into_iter()
+            .map(|piece| Line::from(Span::styled(piece, style)))
+            .collect::<Vec<Line>>(),
+    )
+}
+
+/// 按显示宽度折行，尽量在空格处断行：先按字塞满一行，再回退到本行最后一个空格。
+/// 找不到空格（中文整句、或单个超长词）就照字面宽度硬断，保证永不死循环。
+fn wrap_preserving_words(text: &str, limit: u16) -> Vec<String> {
+    let limit = limit.max(1) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    for paragraph in text.lines() {
+        let characters: Vec<char> = paragraph.chars().collect();
+        let mut start = 0usize;
+        while start < characters.len() {
+            let mut end = start;
+            let mut width = 0usize;
+            let mut last_space: Option<usize> = None;
+            while end < characters.len() {
+                let character_width =
+                    usize::from(display_width(&characters[end].to_string()).max(1));
+                if width + character_width > limit && end > start {
+                    break;
+                }
+                if characters[end] == ' ' {
+                    last_space = Some(end);
+                }
+                width += character_width;
+                end += 1;
+            }
+            let break_at = if end < characters.len() {
+                last_space.unwrap_or(end)
+            } else {
+                end
+            };
+            let piece: String = characters[start..break_at].iter().collect();
+            lines.push(piece.trim_end().to_string());
+            start = if break_at > start { break_at } else { end };
+            // 断在空格上时把空格本身跳掉，下一行不会以空格开头
+            while start < characters.len() && characters[start] == ' ' {
+                start += 1;
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// 一条列表文案折成 ListItem：续行补两个空格，与高亮符号 "> " 的宽度对齐，
+/// 选中与未选中的正文因此都在同一列上开始。
+fn wrapped_list_item(label: &str, style: Style, body_width: u16) -> ListItem<'static> {
+    ListItem::new(
+        wrap_preserving_words(label, body_width)
+            .into_iter()
+            .enumerate()
+            .map(|(index, piece)| {
+                let text = if index == 0 {
+                    piece
+                } else {
+                    format!("  {piece}")
+                };
+                Line::from(Span::styled(text, style))
+            })
+            .collect::<Vec<Line>>(),
+    )
+}
+
+/// 表单浮层底部提示所用文案键（写明服务端对该表单的限制，避免用户提交后才吃一个 400）
+fn form_hint_key(action: &FormAction) -> String {
+    match action {
+        FormAction::UpdateProfile => "form_profile_hint".to_string(),
+        FormAction::ChangePassword => "form_password_hint".to_string(),
+        FormAction::ChangeAvatar => "form_avatar_hint".to_string(),
+        FormAction::DeleteAccount => "form_delete_hint".to_string(),
+    }
+}
+
+/// 设置菜单每一项回车后的动作。渲染与按键分派共用同一张条目表，
+/// 菜单增删项时不必再去别处同步"第几项"的数字。
+#[derive(Debug, Clone, PartialEq)]
+enum SettingsAction {
+    /// 打开既有浮层（创建群聊、创建私聊、私聊管理、语言、外观、服务器地址、登录、注册）
+    OpenOverlay(DisplayingOverlay),
+    /// 打开表单浮层（设置个人资料、修改密码、修改头像、注销账户）
+    OpenForm(FormAction),
+    /// 拨动"显示用户UID"
+    ToggleShowUid,
+    /// 拨动"时间显示含日期"
+    ToggleTimeWithDate,
+    /// 拨动"快速搜索"
+    ToggleQuickSearch,
+    /// 拨动"声音通知"
+    ToggleSound,
+    /// 立即用已下载并校验的更新包开始更新
+    UpdateClient,
+    /// 退出登录
+    Logout,
+}
+
+impl SettingsAction {
+    /// 该条目是否必须有登录态才有意义：改自己账号的四项表单、要带令牌的服务端操作
+    /// （建房、发邀请、私聊请求管理）与退出登录都算。
+    /// 未登录时选中它们只提示"未登录"，不切换浮层，避免进去之后才发现做不了。
+    fn requires_login(&self) -> bool {
+        match self {
+            SettingsAction::OpenForm(_) | SettingsAction::Logout => true,
+            SettingsAction::OpenOverlay(overlay) => matches!(
+                overlay,
+                DisplayingOverlay::CreateGroup
+                    | DisplayingOverlay::CreatePrivate
+                    | DisplayingOverlay::PendingRequests
+                    | DisplayingOverlay::AvatarSelect
+            ),
+            SettingsAction::ToggleShowUid
+            | SettingsAction::ToggleTimeWithDate
+            | SettingsAction::ToggleQuickSearch
+            | SettingsAction::ToggleSound
+            | SettingsAction::UpdateClient => false,
+        }
+    }
+}
+
+/// 表单浮层标题与输入项定义：把四类表单的文案键集中一处，
+/// 打开表单与渲染表单都从这里取，避免两处字典漂移。
+fn form_definition(action: &FormAction) -> (String, Vec<(String, bool)>) {
+    let (title_key, fields) = match action {
+        FormAction::UpdateProfile => (
+            "option_edit_profile",
+            vec![
+                ("profile_nickname_label".to_string(), false),
+                ("profile_phone_label".to_string(), false),
+                ("profile_bio_label".to_string(), false),
+            ],
+        ),
+        FormAction::ChangePassword => (
+            "option_change_password",
+            vec![
+                ("password_old_label".to_string(), true),
+                ("password_new_label".to_string(), true),
+                ("password_confirm_label".to_string(), true),
+            ],
+        ),
+        FormAction::ChangeAvatar => (
+            "option_change_avatar",
+            vec![("avatar_input_label".to_string(), false)],
+        ),
+        FormAction::DeleteAccount => (
+            "option_delete_account",
+            vec![("delete_account_password_label".to_string(), true)],
+        ),
+    };
+    (title_key.to_string(), fields)
 }
 
 /// 按显示宽度折行；至少推进一个字符避免超宽单字符导致死循环
@@ -2408,83 +3106,76 @@ fn format_message_time(created_at: &str, with_date: bool) -> Option<String> {
 
 impl App {
     fn max_focus_index(&self) -> usize {
-        match self.current_page {
-            CurrentPage::Login => 1,
-            CurrentPage::Register => 2,
-            CurrentPage::Chat => {
-                if matches!(self.displaying_overlay, DisplayingOverlay::CreateGroup)
-                    || matches!(self.displaying_overlay, DisplayingOverlay::Login)
-                {
-                    1
-                } else if matches!(self.displaying_overlay, DisplayingOverlay::Register) {
-                    2
-                } else {
-                    0
-                }
-            }
+        if matches!(self.displaying_overlay, DisplayingOverlay::Form) {
+            // 表单浮层的可聚焦项数由字段数量决定
+            self.active_form
+                .as_ref()
+                .map(|(_, fields)| fields.len().saturating_sub(1))
+                .unwrap_or(0)
+        } else if matches!(self.displaying_overlay, DisplayingOverlay::CreateGroup)
+            || matches!(self.displaying_overlay, DisplayingOverlay::Login)
+        {
+            1
+        } else if matches!(self.displaying_overlay, DisplayingOverlay::Register) {
+            2
+        } else {
+            0
         }
     }
 
     fn get_focused_state(&mut self) -> Option<&mut TextInputState> {
-        match self.current_page {
-            CurrentPage::Login => match self.focus_index {
+        if matches!(self.displaying_overlay, DisplayingOverlay::CreateGroup) {
+            match self.focus_index {
+                0 => Some(&mut self.input_collector.create_group_name_state),
+                1 => Some(&mut self.input_collector.create_group_members_state),
+                _ => None,
+            }
+        } else if matches!(self.displaying_overlay, DisplayingOverlay::CreatePrivate) {
+            match self.focus_index {
+                0 => Some(&mut self.input_collector.create_private_username_state),
+                _ => None,
+            }
+        } else if matches!(self.displaying_overlay, DisplayingOverlay::Login) {
+            match self.focus_index {
                 0 => Some(&mut self.input_collector.login_name_state),
                 1 => Some(&mut self.input_collector.login_password_state),
                 _ => None,
-            },
-            CurrentPage::Register => match self.focus_index {
+            }
+        } else if matches!(self.displaying_overlay, DisplayingOverlay::Register) {
+            match self.focus_index {
                 0 => Some(&mut self.input_collector.register_name_state),
                 1 => Some(&mut self.input_collector.register_email_state),
                 2 => Some(&mut self.input_collector.register_password_state),
                 _ => None,
-            },
-            CurrentPage::Chat => {
-                if matches!(self.displaying_overlay, DisplayingOverlay::CreateGroup) {
-                    match self.focus_index {
-                        0 => Some(&mut self.input_collector.create_group_name_state),
-                        1 => Some(&mut self.input_collector.create_group_members_state),
-                        _ => None,
-                    }
-                } else if matches!(self.displaying_overlay, DisplayingOverlay::CreatePrivate) {
-                    match self.focus_index {
-                        0 => Some(&mut self.input_collector.create_private_username_state),
-                        _ => None,
-                    }
-                } else if matches!(self.displaying_overlay, DisplayingOverlay::Login) {
-                    match self.focus_index {
-                        0 => Some(&mut self.input_collector.login_name_state),
-                        1 => Some(&mut self.input_collector.login_password_state),
-                        _ => None,
-                    }
-                } else if matches!(self.displaying_overlay, DisplayingOverlay::Register) {
-                    match self.focus_index {
-                        0 => Some(&mut self.input_collector.register_name_state),
-                        1 => Some(&mut self.input_collector.register_email_state),
-                        2 => Some(&mut self.input_collector.register_password_state),
-                        _ => None,
-                    }
-                } else if matches!(self.displaying_overlay, DisplayingOverlay::ServerAddress) {
-                    Some(&mut self.input_collector.server_address_state)
-                } else if matches!(
-                    self.displaying_overlay,
-                    DisplayingOverlay::PendingRequests | DisplayingOverlay::SettingsMenu
-                ) {
-                    // 列表与菜单类弹窗不聚焦任何输入框
-                    None
-                } else {
-                    // 聊天页无弹窗时聚焦多行消息输入框，经 dispatch_focused_input_event 单独处理
-                    None
-                }
             }
+        } else if matches!(self.displaying_overlay, DisplayingOverlay::ServerAddress) {
+            Some(&mut self.input_collector.server_address_state)
+        } else if matches!(self.displaying_overlay, DisplayingOverlay::Form) {
+            // 通用表单浮层：字段数量随表单种类而变，聚焦位置直接落在对应输入项上
+            match &mut self.active_form {
+                Some((_, fields)) => fields
+                    .get_mut(self.focus_index)
+                    .map(|field| &mut field.state),
+                None => None,
+            }
+        } else if matches!(
+            self.displaying_overlay,
+            DisplayingOverlay::PendingRequests
+                | DisplayingOverlay::SettingsMenu
+                | DisplayingOverlay::ProfileCard
+        ) {
+            // 列表、菜单与只读卡片类弹窗不聚焦任何输入框
+            None
+        } else {
+            // 聊天页无弹窗时聚焦多行消息输入框，经 dispatch_focused_input_event 单独处理
+            None
         }
     }
 
     /// 将键盘/鼠标事件分发到当前聚焦的输入框：
     /// 聊天页无弹窗时转发到多行消息输入框，其余页面/弹窗转发到单行输入框
     fn dispatch_focused_input_event(&mut self, focus: bool, event: &Event) {
-        if self.current_page == CurrentPage::Chat
-            && self.displaying_overlay == DisplayingOverlay::Nothing
-        {
+        if self.displaying_overlay == DisplayingOverlay::Nothing {
             let _ = text_area::handle_events(
                 &mut self.input_collector.message_input_state,
                 focus,
@@ -2496,16 +3187,10 @@ impl App {
     }
 
     fn get_field_areas(&self, layout: &[Rect]) -> Vec<Rect> {
-        match self.current_page {
-            CurrentPage::Login => vec![layout[2], layout[4]],
-            CurrentPage::Register => vec![layout[2], layout[4], layout[6]],
-            CurrentPage::Chat => {
-                if matches!(self.displaying_overlay, DisplayingOverlay::CreateGroup) {
-                    vec![]
-                } else {
-                    vec![layout[8]]
-                }
-            }
+        if matches!(self.displaying_overlay, DisplayingOverlay::CreateGroup) {
+            vec![]
+        } else {
+            vec![layout[8]]
         }
     }
 
@@ -2561,14 +3246,17 @@ impl App {
                 // 服务端不会给自己广播 user_online，本端在线状态需自行登记
                 self.presence_by_user.insert(data.user.id.clone(), true);
                 self.connector.set_token(&data.token);
+                let logged_username = data.user.username.clone();
                 // 登录后立即探测服务端版本，使后续所有线上决策匹配真实版本
                 self.detect_and_apply_api_version();
-                self.current_page = CurrentPage::Chat;
                 self.focus_index = 0;
                 self.displaying_overlay = DisplayingOverlay::Nothing;
                 self.load_rooms();
                 self.start_polling_thread();
                 self.start_websocket_thread(&data.token, None);
+                self.prepare_session_state(Some(logged_username));
+                // 登录响应里的完整用户对象是唯一能看到自己邮箱与手机号的地方，资料卡要用
+                self.remember_own_profile(&data.user);
                 // 清空表单，避免凭据残留在输入框
                 self.input_collector.login_name_state = TextInputState::default();
                 self.input_collector.login_password_state = TextInputState::default();
@@ -2737,8 +3425,16 @@ impl App {
     }
 
     fn load_messages_for_selected_room(&mut self) {
-        if let Some(selected) = self.rooms_state.selected()
-            && let Some(room) = self.rooms.get(selected)
+        // 先取房间快照再往下走：本方法后半段要多次可变借用 self（合并消息、写缓存），
+        // 一路持有 self.rooms 的引用会让这些写操作无法进行
+        let Some(room) = self
+            .rooms_state
+            .selected()
+            .and_then(|index| self.rooms.get(index))
+            .cloned()
+        else {
+            return;
+        };
         {
             // 整房（重新）加载一律把滚动位置拉回最底部并配合下方重写消息列表：
             // 本方法任何路径都会用最新消息整表替换 self.messages，旧的"距底部偏移"对新列表
@@ -2748,6 +3444,20 @@ impl App {
             debug_log(&format!("整房加载 room={} 滚动偏移归零", room.id));
             // 用户正在查看该房间，清零其未读消息计数
             self.unread_counts.remove(&room.id);
+            // 先把本地缓存里该房间已看过的历史铺上屏幕：服务端第一页只有 50 条，
+            // 缓存里可能有几百条，先显示缓存再合并，切房时不会看到"历史突然变短"。
+            // 端到端加密房间不缓存，取不到缓存就是空
+            let cached_messages = if room.is_encrypted {
+                None
+            } else {
+                self.chat_cache
+                    .as_ref()
+                    .and_then(|cache| cache.load_room(&room.id))
+            };
+            if let Some(cached) = cached_messages.clone() {
+                self.messages = cached.messages;
+                self.messages_older_cursor = cached.older_cursor;
+            }
             // 获取房间细节
             match self.connector.get_room(&room.id) {
                 Ok(room_detail) => {
@@ -2772,19 +3482,34 @@ impl App {
                     // 接口按最新在前返回，反转为旧消息在上、新消息在下，与实时追加方向一致
                     let mut loaded = data.messages;
                     loaded.reverse();
-                    self.messages = loaded;
-                    // 记录更早消息分页游标（服务器无更多时返回 None），供滚到顶部时自动翻页
-                    self.messages_older_cursor = data.next_cursor;
+                    // 与服务端这一页按消息 ID 合并而不是整表替换：本地缓存里可能有这一页没有的
+                    // 更早消息，替换会把它们丢掉；合并时保留本地已有条目，也顺带避免加密私聊里
+                    // 已解密的明文被服务端返回的密文占位覆盖
+                    self.messages = match cached_messages.clone() {
+                        Some(cached) => merge_messages_by_id(cached.messages, loaded),
+                        None => loaded,
+                    };
+                    // 记录更早消息分页游标（服务器无更多时返回 None），供滚到顶部时自动翻页；
+                    // 缓存里已握有更早消息时沿用缓存的游标，翻页从本地已知位置接着往回走
+                    self.messages_older_cursor = cached_messages
+                        .as_ref()
+                        .and_then(|cached| cached.older_cursor.clone())
+                        .or(data.next_cursor);
                 }
                 Err(e) => {
                     self.push_error(format!("{}: {e}", self.t("error_get_messages_failed")));
-                    self.messages.clear();
-                    self.messages_older_cursor = None;
+                    // 拉取失败时保留已有内容（缓存或内存里的），这正是本地缓存的意义：
+                    // 服务端暂时连不上也还能翻看历史
+                    if cached_messages.is_none() && self.messages.is_empty() {
+                        self.messages_older_cursor = None;
+                    }
                 }
             }
             self.messages_reloaded_at = Instant::now();
             // 整表替换后旧的命中消息 ID 可能已不在列表里，重扫保证搜索跳转有效
             self.refresh_search_matches();
+            let loaded_room_id = room.id.clone();
+            self.cache_loaded_messages(&loaded_room_id);
         }
     }
 
@@ -2818,6 +3543,8 @@ impl App {
                 ));
                 self.messages.splice(0..0, older);
                 self.messages_older_cursor = data.next_cursor;
+                let room_id = room.id.clone();
+                self.cache_loaded_messages(&room_id);
             }
             Err(e) => {
                 self.push_error(format!("{}: {e}", self.t("error_get_messages_failed")));
@@ -3020,7 +3747,7 @@ impl App {
         }
 
         // 私聊一律以加密房间建立，无需运行时开关
-        let request_message = "请求建立私密聊天".to_string();
+        let request_message = self.t("private_request_message");
         match self
             .connector
             .create_room_request(&target.id, &request_message, true)
@@ -3047,7 +3774,7 @@ impl App {
             Ok(_) => {
                 self.push_notification(self.t("notification_request_accepted"));
                 self.load_rooms();
-                self.refresh_pending_requests();
+                self.mark_pending_request_handled(&request_id, "accepted");
             }
             Err(e) => {
                 self.push_error(format!("{}: {e}", self.t("error_accept_request_failed")));
@@ -3063,7 +3790,7 @@ impl App {
         match self.connector.decline_room_request(&request_id) {
             Ok(_) => {
                 self.push_notification(self.t("notification_request_declined"));
-                self.refresh_pending_requests();
+                self.mark_pending_request_handled(&request_id, "declined");
             }
             Err(e) => {
                 self.push_error(format!("{}: {e}", self.t("error_decline_request_failed")));
@@ -3071,28 +3798,44 @@ impl App {
         }
     }
 
-    /// 重新拉取待处理聊天请求列表并修正选中项
-    fn refresh_pending_requests(&mut self) {
-        match self.connector.list_pending_requests() {
-            Ok(requests) => {
-                self.pending_requests = requests;
-                if self.pending_requests.is_empty() {
-                    self.request_list_state.select(None);
-                } else if self
-                    .request_list_state
-                    .selected()
-                    .is_none_or(|index| index >= self.pending_requests.len())
-                {
-                    self.request_list_state.select(Some(0));
-                }
-            }
-            Err(e) => {
-                self.push_error(format!("{}: {e}", self.t("error_get_request_failed")));
-            }
+    /// 本端处理完一条收到的请求后就在地把结果状态写上，条目继续留在"收到的"区里。
+    /// 不能摘掉：服务端 `GET /requests/pending` 只回仍是 pending 的行，摘掉就等于
+    /// 把这段历史永久丢了（发出侧没这问题，因为 `/requests/sent` 回全部状态）。
+    /// 也不额外发一次列表请求 —— 两处来源先后写同一个列表会互相覆盖。
+    fn mark_pending_request_handled(&mut self, request_id: &str, status: &str) {
+        if let Some(request) = self
+            .pending_requests
+            .iter_mut()
+            .find(|request| request.id == request_id)
+        {
+            request.status = Some(status.to_string());
         }
     }
 
-    /// 获取待处理请求列表当前选中项的 ID
+    /// 轮询带回的"收到的请求"与服务端对齐：服务端列表里没有已处理的行，
+    /// 因此把本端已记下结果的条目接回列表末尾，历史才不会处理一次就清空。
+    fn apply_received_requests(&mut self, polled: Vec<RoomRequestInfo>) {
+        let handled: Vec<RoomRequestInfo> = self
+            .pending_requests
+            .iter()
+            .filter(|request| !received_request_is_pending(request))
+            .filter(|kept| !polled.iter().any(|request| request.id == kept.id))
+            .cloned()
+            .collect();
+        self.pending_requests = polled.into_iter().chain(handled).collect();
+    }
+
+    /// 把发出的请求就地标成已撤回，同样等轮询确认
+    fn mark_sent_request_cancelled(&mut self, request_id: &str) {
+        if let Some(request) = self
+            .sent_requests
+            .iter_mut()
+            .find(|request| request.id == request_id)
+        {
+            request.status = Some("cancelled".to_string());
+        }
+    }
+
     fn selected_request_id(&self) -> Option<String> {
         self.request_list_state
             .selected()
@@ -3107,6 +3850,15 @@ impl App {
         // 于是"复制多行文本再粘贴"会连着发出多条单行消息。
         if let Event::Paste(pasted_text) = event {
             self.handle_pasted_text(pasted_text);
+            return false;
+        }
+
+        // 整屏框选排在浮层分派之前：浮层、通知、顶栏之上的文字同样要能被选中复制。
+        // 拖拽与松手由框选独占（返回真值表示本事件已处理完），按下只登记起点并继续
+        // 走原有的点击聚焦分发，不抢输入框自己的选区逻辑
+        if let Event::Mouse(mouse) = event
+            && self.handle_screen_selection_mouse(*mouse)
+        {
             return false;
         }
 
@@ -3179,14 +3931,17 @@ impl App {
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                 {
+                    // 收到的与已发出的请求拼成一条扁平序列，上下键跨区连续移动，
+                    // 因此环绕按条目总数而不是单一列表长度计算
+                    let entries = self.request_entries();
                     match key.code {
                         KeyCode::Esc => {
                             self.dismiss_overlay_back();
                             return false;
                         }
                         KeyCode::Up | KeyCode::Down => {
-                            if !self.pending_requests.is_empty() {
-                                let count = self.pending_requests.len();
+                            if !entries.is_empty() {
+                                let count = entries.len();
                                 let current = self.request_list_state.selected().unwrap_or(0);
                                 let next = if key.code == KeyCode::Up {
                                     (current + count - 1) % count
@@ -3198,15 +3953,40 @@ impl App {
                             return false;
                         }
                         KeyCode::Enter => {
-                            self.accept_selected_request();
-                            if self.pending_requests.is_empty() {
+                            // 接受只对仍在等的收到请求有意义：发出项与已处理过的历史都什么都不做
+                            if matches!(
+                                self.request_list_state
+                                    .selected()
+                                    .and_then(|index| entries.get(index)),
+                                Some((false, request))
+                                if received_request_is_pending(request)
+                            ) {
+                                self.accept_selected_request();
+                            }
+                            if self.pending_requests.is_empty() && self.sent_requests.is_empty() {
                                 self.dismiss_overlay_back();
                             }
                             return false;
                         }
                         KeyCode::Char('d') => {
-                            self.decline_selected_request();
-                            if self.pending_requests.is_empty() {
+                            // 同一枚按键在两个区里的语义分别是"拒绝"与"撤回"
+                            match self
+                                .request_list_state
+                                .selected()
+                                .and_then(|index| entries.get(index))
+                            {
+                                Some((false, request)) if received_request_is_pending(request) => {
+                                    self.decline_selected_request();
+                                }
+                                // 已结束的邀请撤不回，这里什么都不做（不再弹"能不能撤"的提示）
+                                Some((true, request))
+                                    if request.status.as_deref() == Some("pending") =>
+                                {
+                                    self.cancel_sent_request(&request.id);
+                                }
+                                _ => {}
+                            }
+                            if self.pending_requests.is_empty() && self.sent_requests.is_empty() {
                                 self.dismiss_overlay_back();
                             }
                             return false;
@@ -3217,18 +3997,98 @@ impl App {
                 return false;
             }
 
+            DisplayingOverlay::AvatarSelect => {
+                if let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                {
+                    // 列表只在本地目录有图片时才会打开，条目数在这里重读一次磁盘
+                    let count = local_avatar_files().len();
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.dismiss_overlay_back();
+                            return false;
+                        }
+                        KeyCode::Up | KeyCode::Down if count > 0 => {
+                            let current = self.avatar_list_state.selected().unwrap_or(0);
+                            let next = if key.code == KeyCode::Up {
+                                (current + count - 1) % count
+                            } else {
+                                (current + 1) % count
+                            };
+                            self.avatar_list_state.select(Some(next));
+                            return false;
+                        }
+                        KeyCode::Enter if count > 0 => {
+                            self.apply_local_avatar();
+                            return false;
+                        }
+                        // 只有在这个浮层里 Ctrl+U 才改作"填网络链接"，消息输入框里仍是删整行
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.open_declared_form(&FormAction::ChangeAvatar);
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+                return false;
+            }
+
+            DisplayingOverlay::Form => {
+                if let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                {
+                    // 上下键与 Tab 一样切换当前输入项：长表单里逐个 Tab 太绕
+                    if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+                        self.cycle_form_focus(key.code == KeyCode::Up);
+                        return false;
+                    }
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.active_form = None;
+                            self.focus_index = 0;
+                            self.dismiss_overlay_back();
+                            return false;
+                        }
+                        KeyCode::Tab => {
+                            let field_count = self
+                                .active_form
+                                .as_ref()
+                                .map(|(_, fields)| fields.len())
+                                .unwrap_or(1);
+                            self.focus_index = (self.focus_index + 1) % field_count.max(1);
+                            return false;
+                        }
+                        KeyCode::Enter => {
+                            self.submit_active_form();
+                            return false;
+                        }
+                        _ => {}
+                    }
+                    if let Some(state) = self.get_focused_state() {
+                        let _ = text_input::handle_events(state, true, event);
+                    }
+                }
+                return false;
+            }
+
+            DisplayingOverlay::ProfileCard => {
+                // 只读卡片：Esc 关掉回到聊天页（它由 /profile 指令打开，不属于设置菜单链路）
+                if let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                    && key.code == KeyCode::Esc
+                {
+                    self.profile_view = None;
+                    self.displaying_overlay = DisplayingOverlay::Nothing;
+                    self.restore_chat_focus();
+                }
+                return false;
+            }
+
             DisplayingOverlay::SettingsMenu => {
-                // 索引须与 render_settings_menu 的菜单顺序严格一致：
-                // 0-4 项为导航动作（与 menu_actions 索引对应），5-8 项为开关拨动项，
-                // 9 项为服务器地址，10 项为退出登录，11 项登录浮层，12 项注册浮层
-                let menu_actions = [
-                    DisplayingOverlay::CreateGroup,
-                    DisplayingOverlay::CreatePrivate,
-                    DisplayingOverlay::PendingRequests,
-                    DisplayingOverlay::LanguageSelect,
-                    DisplayingOverlay::AppearanceSelect,
-                ];
-                let menu_count = 13usize;
+                // 菜单项与动作由 settings_menu_entries 一处定义，渲染与分派读同一张表，
+                // 增删菜单项不需要再手工同步"第几项"的数字
+                let entries = self.settings_menu_entries();
+                let menu_count = entries.len().max(1);
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                 {
@@ -3249,72 +4109,45 @@ impl App {
                         }
                         KeyCode::Enter => {
                             let selected = self.menu_list_state.selected().unwrap_or(0);
-                            match selected {
-                                5 => {
+                            let Some((_, _, action)) = entries.get(selected) else {
+                                return false;
+                            };
+                            let action = action.clone();
+                            // 未登录要改账号或做服务端操作：给一条提示，浮层保持停在设置菜单
+                            if action.requires_login() && !self.require_login() {
+                                return false;
+                            }
+                            match action {
+                                SettingsAction::ToggleShowUid => {
                                     self.show_uid = !self.show_uid;
                                     self.save_display_preferences();
                                 }
-                                6 => {
+                                SettingsAction::ToggleTimeWithDate => {
                                     self.time_with_date = !self.time_with_date;
                                     self.save_display_preferences();
                                 }
-                                7 => {
+                                SettingsAction::ToggleQuickSearch => {
                                     self.quick_search = !self.quick_search;
                                     self.save_display_preferences();
                                 }
-                                8 => {
+                                SettingsAction::ToggleSound => {
                                     self.sound_enabled = !self.sound_enabled;
                                     self.save_display_preferences();
                                 }
-                                9 => {
-                                    // 服务器地址：打开输入框并预填当前地址
-                                    self.input_collector
-                                        .server_address_state
-                                        .set_text(self.connector.base_url());
-                                    self.displaying_overlay = DisplayingOverlay::ServerAddress;
-                                }
-                                10 => {
+                                SettingsAction::Logout => {
                                     self.logout();
                                     self.displaying_overlay = DisplayingOverlay::Nothing;
+                                    self.restore_chat_focus();
                                 }
-                                11 => {
-                                    self.displaying_overlay = DisplayingOverlay::Login;
-                                    self.focus_index = 0;
+                                SettingsAction::UpdateClient => {
+                                    // 更新成功会挂起安装进程并由主循环退出；失败则留在设置菜单里看提示
+                                    self.start_downloaded_update();
                                 }
-                                12 => {
-                                    self.displaying_overlay = DisplayingOverlay::Register;
-                                    self.focus_index = 0;
+                                SettingsAction::OpenForm(form_action) => {
+                                    self.open_declared_form(&form_action);
                                 }
-                                _ => {
-                                    if let Some(action) = menu_actions.get(selected) {
-                                        self.displaying_overlay = action.clone();
-                                        match action {
-                                            DisplayingOverlay::PendingRequests => {
-                                                if self.pending_requests.is_empty() {
-                                                    self.request_list_state.select(None);
-                                                } else {
-                                                    self.request_list_state.select(Some(0));
-                                                }
-                                            }
-                                            DisplayingOverlay::LanguageSelect => {
-                                                let languages = Self::get_available_languages();
-                                                let current = Self::current_language();
-                                                let idx =
-                                                    languages.iter().position(|l| l == &current);
-                                                self.language_list_state.select(idx);
-                                            }
-                                            DisplayingOverlay::AppearanceSelect => {
-                                                let names = Appearance::available_names();
-                                                let idx = names
-                                                    .iter()
-                                                    .position(|name| name == &self.appearance_name);
-                                                self.appearance_list_state.select(idx);
-                                            }
-                                            _ => {
-                                                self.focus_index = 0;
-                                            }
-                                        }
-                                    }
+                                SettingsAction::OpenOverlay(overlay) => {
+                                    self.open_overlay(overlay);
                                 }
                             }
                             return false;
@@ -3437,6 +4270,8 @@ impl App {
                                     self.save_server_address();
                                     // 切换服务器后重新探测版本，使线上决策匹配新服务端
                                     self.detect_and_apply_api_version();
+                                    // 可达性探测也要改探新地址
+                                    self.start_reachability_watch();
                                     self.push_notification(self.t("server_address_saved"));
                                     self.displaying_overlay = DisplayingOverlay::SettingsMenu;
                                 }
@@ -3505,16 +4340,13 @@ impl App {
             DisplayingOverlay::Nothing => {}
         }
 
-        let max_index = self.max_focus_index();
-
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 // 搜索模式下的上下键语义被整体接管：不再移动输入框光标、也不再切房间，
                 // 一律切换匹配项。放在修饰键分支之前并用"任意修饰键"匹配，
                 // 是因为不同终端对 Ctrl/Ctrl+Shift+方向键的上报差异极大（Terminal.app 甚至不区分），
                 // 只认某一种组合键会表现为按了完全没反应、只剩输入框光标在动。
-                if matches!(self.current_page, CurrentPage::Chat)
-                    && matches!(key.code, KeyCode::Up | KeyCode::Down)
+                if matches!(key.code, KeyCode::Up | KeyCode::Down)
                     && self.in_search_mode()
                 {
                     debug_log(&format!("搜索切换匹配项: {key:?}"));
@@ -3530,133 +4362,98 @@ impl App {
                     return false;
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    match key.code {
-                        // 聊天页 Ctrl+P 打开设置菜单（创建群聊/私聊与待处理请求入口）
-                        KeyCode::Char('p') if matches!(self.current_page, CurrentPage::Chat) => {
-                            self.displaying_overlay = DisplayingOverlay::SettingsMenu;
-                            self.menu_list_state.select(Some(0));
-                            return false;
-                        }
-                        _ => {}
+                    // 聊天页 Ctrl+P 打开设置菜单（创建群聊/私聊与待处理请求入口）
+                    if let KeyCode::Char('p') = key.code {
+                        self.displaying_overlay = DisplayingOverlay::SettingsMenu;
+                        self.menu_list_state.select(Some(0));
+                        return false;
                     }
                 }
 
-                match self.current_page {
-                    CurrentPage::Chat => match key.code {
-                        KeyCode::Up | KeyCode::Down => {
-                            let input_text = self.input_collector.message_input_state.text();
-                            if let Some(command_prefix) = input_text.strip_prefix('/') {
-                                // 补全列表开启时上下键选择命令，禁用群聊切换
-                                let candidate_count =
-                                    self.completion_candidates(command_prefix).len();
-                                if candidate_count > 0 {
-                                    let current = self.command_list_state.selected().unwrap_or(0);
-                                    let next = if key.code == KeyCode::Up {
-                                        (current + candidate_count - 1) % candidate_count
-                                    } else {
-                                        (current + 1) % candidate_count
-                                    };
-                                    self.command_list_state.select(Some(next));
-                                }
-                            } else {
-                                // 多行文本时上下键移动光标，到达首/末行才切换群聊
-                                let state = &mut self.input_collector.message_input_state;
-                                let before = state.cursor();
-                                if key.code == KeyCode::Up {
-                                    state.move_up(1, false);
+                match key.code {
+                    KeyCode::Up | KeyCode::Down => {
+                        let input_text = self.input_collector.message_input_state.text();
+                        if let Some(command_prefix) = input_text.strip_prefix('/') {
+                            // 补全列表开启时上下键选择命令，禁用群聊切换
+                            let candidate_count =
+                                self.completion_candidates(command_prefix).len();
+                            if candidate_count > 0 {
+                                let current = self.command_list_state.selected().unwrap_or(0);
+                                let next = if key.code == KeyCode::Up {
+                                    (current + candidate_count - 1) % candidate_count
                                 } else {
-                                    state.move_down(1, false);
-                                }
-                                let after = state.cursor();
-                                // 光标未移动说明已在边界，执行群聊切换；
-                                // 带 Ctrl 的组合键不用于切房，避免与搜索等组合键语义混淆
-                                if before == after
-                                    && !self.rooms.is_empty()
-                                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                                {
-                                    let selected = self.rooms_state.selected().unwrap_or(0);
-                                    if key.code == KeyCode::Up {
-                                        if selected > 0 {
-                                            self.rooms_state.select(Some(selected - 1));
-                                            self.load_messages_for_selected_room();
-                                        }
-                                    } else if selected + 1 < self.rooms.len() {
-                                        self.rooms_state.select(Some(selected + 1));
+                                    (current + 1) % candidate_count
+                                };
+                                self.command_list_state.select(Some(next));
+                            }
+                        } else {
+                            // 多行文本时上下键移动光标，到达首/末行才切换群聊
+                            let state = &mut self.input_collector.message_input_state;
+                            let before = state.cursor();
+                            if key.code == KeyCode::Up {
+                                state.move_up(1, false);
+                            } else {
+                                state.move_down(1, false);
+                            }
+                            let after = state.cursor();
+                            // 光标未移动说明已在边界，执行群聊切换；
+                            // 带 Ctrl 的组合键不用于切房，避免与搜索等组合键语义混淆
+                            if before == after
+                                && !self.rooms.is_empty()
+                                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                let selected = self.rooms_state.selected().unwrap_or(0);
+                                if key.code == KeyCode::Up {
+                                    if selected > 0 {
+                                        self.rooms_state.select(Some(selected - 1));
                                         self.load_messages_for_selected_room();
                                     }
+                                } else if selected + 1 < self.rooms.len() {
+                                    self.rooms_state.select(Some(selected + 1));
+                                    self.load_messages_for_selected_room();
                                 }
                             }
                         }
-                        KeyCode::Esc => {
-                            let input_text = self.input_collector.message_input_state.text();
-                            if input_text.starts_with('/') {
-                                // 清空前缀即退出 command 模式
-                                self.input_collector.message_input_state.set_text("");
-                                return false;
-                            }
-                            if input_text.starts_with('#') {
-                                // 搜索模式同样以前缀清空作为退出条件，并连带清掉高亮与定位
-                                self.exit_search_mode();
-                                return false;
-                            }
-                            self.dispatch_focused_input_event(true, event);
+                    }
+                    KeyCode::Esc => {
+                        let input_text = self.input_collector.message_input_state.text();
+                        if input_text.starts_with('/') {
+                            // 清空前缀即退出 command 模式
+                            self.input_collector.message_input_state.set_text("");
+                            return false;
                         }
-                        KeyCode::Enter => {
-                            // Enter 发送消息
-                            return self.handle_chat_submit();
+                        if input_text.starts_with('#') {
+                            // 搜索模式同样以前缀清空作为退出条件，并连带清掉高亮与定位
+                            self.exit_search_mode();
+                            return false;
                         }
-                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Ctrl+J 插入换行
-                            self.input_collector.message_input_state.insert_newline();
-                            self.notify_typing_if_needed();
+                        self.dispatch_focused_input_event(true, event);
+                    }
+                    KeyCode::Enter => {
+                        // Enter 发送消息
+                        return self.handle_chat_submit();
+                    }
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Ctrl+J 插入换行
+                        self.input_collector.message_input_state.insert_newline();
+                        self.handle_message_input_changed();
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Ctrl+U 删除光标所在整行
+                        self.input_collector.message_input_state.delete_line();
+                        self.handle_message_input_changed();
+                    }
+                    _ => {
+                        self.dispatch_focused_input_event(true, event);
+                        // 输入变化后命令选择回到第一项；由组件自身完成插入以保持光标位置
+                        let input_text = self.input_collector.message_input_state.text();
+                        if input_text.starts_with('/') {
+                            self.command_list_state.select(Some(0));
                         }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Ctrl+U 删除光标所在整行
-                            self.input_collector.message_input_state.delete_line();
-                            self.notify_typing_if_needed();
-                        }
-                        _ => {
-                            self.dispatch_focused_input_event(true, event);
-                            // 输入变化后命令选择回到第一项；由组件自身完成插入以保持光标位置
-                            let input_text = self.input_collector.message_input_state.text();
-                            if input_text.starts_with('/') {
-                                self.command_list_state.select(Some(0));
-                            }
-                            // 快速搜索开启时，搜索模式下随输入即时刷新命中结果
-                            let typed_after_key = self.input_collector.message_input_state.text();
-                            if self.quick_search && typed_after_key.starts_with('#') {
-                                self.apply_quick_search();
-                            }
-                            // 文本增删即视为处于打字状态，按需上报输入状态（内部已节流）
-                            self.notify_typing_if_needed();
-                        }
-                    },
-                    _ => match key.code {
-                        KeyCode::Tab => {
-                            if max_index > 0 {
-                                self.focus_index = (self.focus_index + 1) % (max_index + 1);
-                            }
-                        }
-                        KeyCode::Esc => {
-                            if max_index > 0 && self.focus_index != 0 {
-                                self.focus_index -= 1;
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if self.focus_index == max_index {
-                                match self.current_page {
-                                    CurrentPage::Login => self.do_login(),
-                                    CurrentPage::Register => self.do_register(),
-                                    _ => {}
-                                }
-                            } else if max_index > 0 {
-                                self.focus_index += 1;
-                            }
-                        }
-                        _ => {
-                            self.dispatch_focused_input_event(true, event);
-                        }
-                    },
+                        // 文本增删即视为处于打字状态，按需上报输入状态（内部已节流）；
+                        // 同时让与当前输入不符的旧搜索结果失效（快速搜索则就地重扫）
+                        self.handle_message_input_changed();
+                    }
                 }
             }
             Event::Mouse(mouse) => {
@@ -3665,9 +4462,7 @@ impl App {
                     mouse.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) {
-                    if matches!(self.current_page, CurrentPage::Chat)
-                        && self.displaying_overlay == DisplayingOverlay::Nothing
-                    {
+                    if self.displaying_overlay == DisplayingOverlay::Nothing {
                         // 整房加载（切群/同房刷新）同步阻塞主线程期间产生的滚轮事件会在
                         // 系统队列积压、加载完成后迟到补处理，把新房间视图"自动"顶上去并
                         // 可能误触顶拉取；加载完成后的静默窗口内一律丢弃滚轮事件消除这些迟到输入
@@ -3690,48 +4485,10 @@ impl App {
                     }
                     return false;
                 }
-                // 整屏框选：起点在消息输入框之外时开始记录，拖拽实时更新终点，松开即复制。
-                // 由此框选可覆盖消息区、房间列表、浮层与通知等任意位置，不再局限于输入框。
-                let pointer = (mouse.column, mouse.row);
-                match mouse.kind {
-                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                        if !self
-                            .message_input_area
-                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row)) =>
-                    {
-                        // 只记下起点，事件继续走原有的点击聚焦分发；
-                        // 起点与终点重合时尚不构成框选，松手也不会触发复制
-                        self.input_collector.selection_start = Some(pointer);
-                        self.input_collector.selection_end = Some(pointer);
-                    }
-                    MouseEventKind::Drag(crossterm::event::MouseButton::Left)
-                        if self.input_collector.selection_start.is_some() =>
-                    {
-                        self.input_collector.selection_end = Some(pointer);
-                        return false;
-                    }
-                    MouseEventKind::Up(crossterm::event::MouseButton::Left)
-                        if self.input_collector.selection_start.is_some() =>
-                    {
-                        let dragged = self
-                            .input_collector
-                            .selection_start
-                            .is_some_and(|start| start != pointer);
-                        self.input_collector.selection_end = Some(pointer);
-                        if dragged {
-                            self.copy_screen_selection();
-                        } else {
-                            // 原地按下没拖动：只清掉框选起点，不复制、不提示
-                            self.input_collector.selection_start = None;
-                            self.input_collector.selection_end = None;
-                        }
-                        return false;
-                    }
-                    _ => {}
-                }
+                // 整屏框选本身已提到 handle_event 开头（浮层之上也要能框选）；
+                // 这里只保留输入框内由控件自己维护的选区
                 // 输入框内的框选仍由控件自身维护，松开时复制控件选区文本
-                if matches!(self.current_page, CurrentPage::Chat)
-                    && self.displaying_overlay == DisplayingOverlay::Nothing
+                if self.displaying_overlay == DisplayingOverlay::Nothing
                     && mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 {
                     self.copy_message_selection();
@@ -3836,6 +4593,28 @@ impl App {
                 .map(|name| (format!("/appearance {name}"), name.clone(), String::new()))
                 .collect();
         }
+        if raw_command_after_slash.starts_with("profile ") {
+            // /profile 后打出空格即列出全部注册用户；条目文本按 "<用户名> - <UID>" 呈现，
+            // 回车补全进输入框的是用户名（服务端资料接口用户名与 UID 都认）
+            let filter_text = raw_command_after_slash
+                .strip_prefix("profile ")
+                .unwrap_or("");
+            return self
+                .registered_users
+                .iter()
+                .flatten()
+                .filter(|user| {
+                    user.username.starts_with(filter_text) || user.id.starts_with(filter_text)
+                })
+                .map(|user| {
+                    (
+                        format!("/profile {}", user.username),
+                        format!("{} - {}", user.username, user.id),
+                        user.nickname.clone().unwrap_or_default(),
+                    )
+                })
+                .collect();
+        }
         if raw_command_after_slash.starts_with("server_address ") {
             let current = self.connector.base_url();
             return vec![(
@@ -3889,11 +4668,17 @@ impl App {
         // /kick all 是内置批量操作（非成员名），不参与成员补全，直接走命令执行
         let kick_argument = trimmed.split_whitespace().nth(1).unwrap_or("");
         let is_kick_all = name == "kick" && kick_argument.eq_ignore_ascii_case("all");
-        // 命令后带空格时进入参数补全：
-        // 列出群成员或可用语言，按 Enter 将选中项补全进输入框，再次 Enter 才执行
-        if (name == "kick" || name == "language" || name == "mute" || name == "appearance")
-            && input_text.contains(' ')
-            && !is_kick_all
+        // 命令后带空格即进入参数补全：列群成员、语言、外观、服务器地址、注册用户，
+        // 按 Enter 把选中项补进输入框，再次 Enter（此时已是完整命令）才执行
+        let argument_completion_commands = [
+            "kick",
+            "language",
+            "mute",
+            "appearance",
+            "server_address",
+            "profile",
+        ];
+        if argument_completion_commands.contains(&name) && input_text.contains(' ') && !is_kick_all
         {
             let raw_prefix = input_text.strip_prefix('/').unwrap_or("");
             let candidates = self.completion_candidates(raw_prefix);
@@ -3919,6 +4704,17 @@ impl App {
                 return false;
             }
             // 如果是精确匹配，继续往下执行命令
+        }
+        // 登录与注册不接受任何形式的参数：口令不该留在命令行与屏幕回滚历史里。
+        // 这里既不执行也不清空输入框，让用户自己把参数删掉或改用浮层
+        if matches!(name, "login" | "register")
+            && !trimmed
+                .strip_prefix(&format!("/{name}"))
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        {
+            return false;
         }
         // 命令名已是完整已知命令时直接执行（含带参数的 /kick name、/language code）
         let is_known = chat_commands().iter().any(|(known, _)| *known == name);
@@ -3974,14 +4770,22 @@ impl App {
         // 未登录时仅放行登录/注册/退出/quit/语言/外观/服务器地址，其余聊天操作先弹提示拒绝
         let allowed_signed_out = matches!(
             name,
-            "login" | "register" | "logout" | "quit" | "language" | "appearance" | "server_address"
+            "login"
+                | "register"
+                | "logout"
+                | "quit"
+                | "exit"
+                | "update"
+                | "language"
+                | "appearance"
+                | "server_address"
         );
         if !allowed_signed_out && !self.is_logged_in() {
             self.push_notification(self.t("error_not_logged_in"));
             return false;
         }
         match name {
-            "quit" => {
+            "quit" | "exit" => {
                 self.begin_quit_cleanup();
                 false
             }
@@ -4171,46 +4975,46 @@ impl App {
                 self.switch_appearance(&argument);
                 false
             }
-            "login" => {
-                // /login 无参 → 打开登录浮层；/login <用户名> <密码> → 直接登录
-                let args: Vec<&str> = command_line
-                    .strip_prefix("/login")
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .collect();
-                if args.is_empty() {
-                    self.displaying_overlay = DisplayingOverlay::Login;
-                    self.focus_index = 0;
-                    return false;
-                }
-                if args.len() >= 2 && !args[0].starts_with('<') {
-                    self.perform_login(args[0].to_string(), args[1].to_string());
+            "login" | "register" => {
+                // 带参数的情况已在提交入口拦掉（见 handle_chat_submit），这里只会收到无参调用：
+                // 直接打开对应浮层填写
+                self.displaying_overlay = if name == "login" {
+                    DisplayingOverlay::Login
                 } else {
-                    self.push_notification(self.t("login_usage_hint"));
-                }
+                    DisplayingOverlay::Register
+                };
+                self.focus_index = 0;
                 false
             }
-            "register" => {
-                // /register 无参 → 打开注册浮层；/register <用户名> <密码> <邮箱> → 直接注册
-                let args: Vec<&str> = command_line
-                    .strip_prefix("/register")
+            "list_users" => {
+                self.show_registered_users();
+                false
+            }
+            "search_users" => {
+                let argument = command_line
+                    .strip_prefix("/search_users")
                     .unwrap_or("")
-                    .split_whitespace()
-                    .collect();
-                if args.is_empty() {
-                    self.displaying_overlay = DisplayingOverlay::Register;
-                    self.focus_index = 0;
-                    return false;
-                }
-                if args.len() >= 3 && !args[0].starts_with('<') {
-                    self.perform_register(
-                        args[0].to_string(),
-                        args[2].to_string(),
-                        args[1].to_string(),
-                    );
+                    .trim()
+                    .to_string();
+                self.search_registered_users(&argument);
+                false
+            }
+            "profile" => {
+                // 无参看自己，带参看指定用户；参数可以是用户名或 UID
+                let argument = command_line
+                    .strip_prefix("/profile")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                self.show_profile_card(if argument.is_empty() {
+                    None
                 } else {
-                    self.push_notification(self.t("register_usage_hint"));
-                }
+                    Some(&argument)
+                });
+                false
+            }
+            "update" => {
+                self.start_downloaded_update();
                 false
             }
             _ => false,
@@ -4227,8 +5031,24 @@ impl App {
         }
         self.websocket_sender = None;
         self.websocket_token = None;
+        // 攒着未落盘的消息先写出去，缓存按用户 ID 分目录，退出登录后仍可被下次自动登录复用
+        if let Some(room_id) = self.selected_room_id() {
+            let room_id = room_id.clone();
+            self.cache_loaded_messages(&room_id);
+        }
+        self.cache_pending_flush_since = None;
         Self::clear_saved_session();
         self.current_user_id = None;
+        self.current_username.clear();
+        self.own_contact = None;
+        self.sent_requests.clear();
+        self.registered_users = None;
+        self.profile_view = None;
+        self.active_form = None;
+        self.avatar_images.clear();
+        self.avatar_pixels.clear();
+        self.avatar_list_state = ListState::default();
+        self.chat_cache = None;
         self.rooms.clear();
         self.rooms_state = ListState::default();
         self.messages.clear();
@@ -4243,7 +5063,6 @@ impl App {
         self.pending_scroll_message_id = None;
         self.notifications.clear();
         self.displaying_overlay = DisplayingOverlay::Nothing;
-        self.current_page = CurrentPage::Chat;
         self.focus_index = 0;
         // 清空登录/注册表单，回到未登录聊天页（显示登录提示）
         self.input_collector.login_name_state = TextInputState::default();
@@ -4260,11 +5079,16 @@ impl App {
         if self.quit_ready {
             return;
         }
-        // 退出前持久化登录会话（JWT 与企业用户 ID），供下次启动自动登录
+        // 退出前把攒着未落盘的消息写进本地缓存，避免最后几秒收到的内容丢在内存里
+        if let Some(room_id) = self.selected_room_id() {
+            let room_id = room_id.clone();
+            self.cache_loaded_messages(&room_id);
+        }
+        // 退出前持久化登录会话（JWT 与企业用户 ID、自己才可见的联系方式），供下次自动登录
         if let (Some(token), Some(user_id)) =
             (self.websocket_token.clone(), self.current_user_id.clone())
         {
-            Self::save_session_preferences(&token, &user_id);
+            Self::save_session_preferences(&token, &user_id, self.own_contact.as_ref());
         }
         let private_room_ids: Vec<String> = self
             .rooms
@@ -4413,6 +5237,16 @@ impl App {
             } else {
                 DisplayingOverlay::SettingsMenu
             };
+        self.restore_chat_focus();
+    }
+
+    /// 退回聊天页时把焦点交还消息输入框。
+    /// 浮层期间 focus_index 指的是浮层里的输入项或列表位置，
+    /// 关浮层后不重置的话，键盘输入会落到一个谁都不持有的 0 号上，表现为"打字没反应"。
+    fn restore_chat_focus(&mut self) {
+        if self.displaying_overlay == DisplayingOverlay::Nothing {
+            self.focus_index = 8;
+        }
     }
 
     /// 本地软关闭一个加密私聊：仅从界面隐藏并清理会话，
@@ -4420,6 +5254,9 @@ impl App {
     fn close_local_room(&mut self, room_id: &str) {
         self.closed_room_ids.insert(room_id.to_string());
         self.crypto.sessions.remove(room_id);
+        if let Some(cache) = &self.chat_cache {
+            cache.forget_room(room_id);
+        }
         let was_selected = self.selected_room_id().as_deref() == Some(room_id);
         self.rooms.retain(|room| room.id != room_id);
         if was_selected {
@@ -4457,26 +5294,35 @@ impl App {
         // 文本与空白区域统一继承外观里的应用背景色。
         paint_background(frame, area, self.appearance.app_background);
 
+        // 顶栏固定占一行，聊天页、浮层与通知都在它下方绘制；
+        // 行文本快照仍按整屏采集，顶栏上的文字同样可以被框选复制
+        let [bar_area, body_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+        self.render_status_bar(frame, bar_area);
+
         // 应用恒为单一聊天页：登录/注册改为命令打开的浮层；未登录时聊天页居中显示登录提示。
-        self.render_chat_page(frame, area);
+        self.render_chat_page(frame, body_area);
 
         match self.displaying_overlay {
-            DisplayingOverlay::CreateGroup => self.render_create_group_modal(frame, area),
-            DisplayingOverlay::CreatePrivate => self.render_create_private_modal(frame, area),
-            DisplayingOverlay::PendingRequests => self.render_pending_requests(frame, area),
-            DisplayingOverlay::SettingsMenu => self.render_settings_menu(frame, area),
-            DisplayingOverlay::LanguageSelect => self.render_language_select(frame, area),
-            DisplayingOverlay::ServerAddress => self.render_server_address(frame, area),
-            DisplayingOverlay::Login => self.render_login_modal(frame, area),
-            DisplayingOverlay::Register => self.render_register_modal(frame, area),
-            DisplayingOverlay::AppearanceSelect => self.render_appearance_select(frame, area),
+            DisplayingOverlay::CreateGroup => self.render_create_group_modal(frame, body_area),
+            DisplayingOverlay::CreatePrivate => self.render_create_private_modal(frame, body_area),
+            DisplayingOverlay::PendingRequests => self.render_pending_requests(frame, body_area),
+            DisplayingOverlay::SettingsMenu => self.render_settings_menu(frame, body_area),
+            DisplayingOverlay::LanguageSelect => self.render_language_select(frame, body_area),
+            DisplayingOverlay::ServerAddress => self.render_server_address(frame, body_area),
+            DisplayingOverlay::Login => self.render_login_modal(frame, body_area),
+            DisplayingOverlay::Register => self.render_register_modal(frame, body_area),
+            DisplayingOverlay::AppearanceSelect => self.render_appearance_select(frame, body_area),
+            DisplayingOverlay::ProfileCard => self.render_profile_card(frame, body_area),
+            DisplayingOverlay::Form => self.render_form(frame, body_area),
+            DisplayingOverlay::AvatarSelect => self.render_avatar_select(frame, body_area),
             DisplayingOverlay::Nothing => {}
         }
 
         // 渲染前先移除已到期的通知，再在右上角显示剩余通知
         self.remove_expired_notifications();
         if !self.notifications.is_empty() {
-            self.render_notifications(frame, area);
+            self.render_notifications(frame, body_area);
         }
 
         // 在全部元素绘制完成后采集整屏行文本快照，框选松开时才能复制到任意位置的文本
@@ -4514,9 +5360,7 @@ impl App {
             )
         };
         // 聊天页无弹窗时聚焦多行消息输入框，单独经 TextAreaState 处理
-        if self.current_page == CurrentPage::Chat
-            && self.displaying_overlay == DisplayingOverlay::Nothing
-        {
+        if self.displaying_overlay == DisplayingOverlay::Nothing {
             self.input_collector.message_input_state.focus.set(true);
             if let Some((x, y)) = self.input_collector.message_input_state.screen_cursor() {
                 frame.set_cursor_position(clamp_position(Position::new(x, y)));
@@ -4558,8 +5402,7 @@ impl App {
         if pasted_text.is_empty() {
             return;
         }
-        let focus_on_message_box = self.current_page == CurrentPage::Chat
-            && self.displaying_overlay == DisplayingOverlay::Nothing;
+        let focus_on_message_box = self.displaying_overlay == DisplayingOverlay::Nothing;
         if focus_on_message_box {
             let mut lines = pasted_text.split('\n').peekable();
             while let Some(line) = lines.next() {
@@ -4568,7 +5411,7 @@ impl App {
                     self.input_collector.message_input_state.insert_newline();
                 }
             }
-            self.notify_typing_if_needed();
+            self.handle_message_input_changed();
             return;
         }
         // 单行输入框（登录、注册、建群等）不保留换行，只取粘贴内容的首行插到光标处
@@ -4582,6 +5425,51 @@ impl App {
     /// 复制整屏框选矩形内的文本到系统剪贴板并清除框选高亮。
     /// 文本取自上一帧采集的整屏行文本快照，因此浮层、通知、房间列表等任意位置都可复制；
     /// 按显示宽度切列，双宽字符整块保留，行尾空格与整行为空的首尾行会被去掉。
+    /// 整屏框选的鼠标处理：起点在消息输入框之外时开始记录，拖拽更新终点，松开即复制。
+    /// 因为本方法在浮层分派之前被调用，所以房间列表、消息区、顶栏、任何浮层与通知
+    /// 之上的文字都能框选复制；显示区的边框不算文字（见 `is_content_character`），
+    /// 既不会被高亮也不会进剪贴板。返回真值表示事件已被框选消费（拖拽与松手）。
+    fn handle_screen_selection_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        let pointer = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                if !self
+                    .message_input_area
+                    .contains(ratatui::layout::Position::new(mouse.column, mouse.row)) =>
+            {
+                // 只记下起点，事件继续走原有的点击聚焦分发；
+                // 起点与终点重合时尚不构成框选，松手也不会触发复制
+                self.input_collector.selection_start = Some(pointer);
+                self.input_collector.selection_end = Some(pointer);
+                false
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                if self.input_collector.selection_start.is_some() =>
+            {
+                self.input_collector.selection_end = Some(pointer);
+                true
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                if self.input_collector.selection_start.is_some() =>
+            {
+                let dragged = self
+                    .input_collector
+                    .selection_start
+                    .is_some_and(|start| start != pointer);
+                self.input_collector.selection_end = Some(pointer);
+                if dragged {
+                    self.copy_screen_selection();
+                } else {
+                    // 原地按下没拖动：只清掉框选起点，不复制、不提示
+                    self.input_collector.selection_start = None;
+                    self.input_collector.selection_end = None;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn copy_screen_selection(&mut self) {
         let (selection_start, selection_end) = match (
             self.input_collector.selection_start,
@@ -4616,86 +5504,440 @@ impl App {
         paint_background(frame, area, self.appearance.app_background);
     }
 
-    /// 居中渲染登录浮层：用户名与密码（星号遮蔽）两个输入框。
-    /// 浮层只保留输入框与提交，Tab/Enter/Esc 属通用键，按快捷键提示规范不再单独占一行提示。
-    fn render_login_modal(&mut self, frame: &mut Frame, area: Rect) {
-        let panel_width = 50u16.min(area.width.saturating_sub(4)).max(30);
-        let panel_height = 11u16.min(area.height.saturating_sub(4)).max(9);
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
-        self.clear_overlay_area(frame, panel_rect);
+    /// 渲染顶栏：左侧连接状态与当前用户，右侧服务端版本与客户端版本。
+    /// 连接标记同时承担"连不上服务器"的持续提示（报错只在状态跳变时弹一次），
+    /// 未登录不显示当前用户，未连上服务端不显示服务端版本。
+    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let online = self.connection_ready.unwrap_or(false);
+        let (connection_label, mark, user_text, right_text) = self.status_bar_texts();
+        // 左侧整段的纯文本先拼出来，量宽度用（下面的分栏要按两段的实际宽度决定谁让位）
+        let left_plain_text = format!("{connection_label} {mark}{user_text}");
+        // 标记紧跟"连接"二字并单独着色：用户名一长就把圆点推到行尾的话，
+        // 它就再也表示不了连接状态，所以这里固定按"标签 标记 用户段"的顺序拼
+        let left_line = Line::from(vec![
+            Span::styled(
+                format!("{connection_label} "),
+                hint_style(self.appearance.hint_text),
+            ),
+            Span::styled(
+                mark,
+                Style::default()
+                    .fg(if online {
+                        self.appearance.own_username_text
+                    } else {
+                        self.appearance.notice_error_border
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(user_text, hint_style(self.appearance.hint_text)),
+        ]);
+        let right_line = Line::from(Span::styled(
+            right_text.clone(),
+            hint_style(self.appearance.hint_text),
+        ));
+        // 一行放不下两段时优先保左侧：连接标记与"当前用户"表示的是现在能不能用、
+        // 以什么身份在用，版本信息只是参考。原先按右侧定尺会让窄终端把用户名整段挤掉。
+        let left_width = display_width(&left_plain_text);
+        let right_width = display_width(&right_text) + 1;
+        let left_reserve = if left_width + right_width <= area.width {
+            area.width.saturating_sub(right_width)
+        } else {
+            left_width.min(area.width)
+        };
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Length(left_reserve), Constraint::Fill(1)]).areas(area);
+        frame.render_widget(
+            Paragraph::new(left_line).style(Style::default().bg(self.appearance.app_background)),
+            left_area,
+        );
+        frame.render_widget(
+            Paragraph::new(right_line)
+                .alignment(Alignment::Right)
+                .style(Style::default().bg(self.appearance.app_background)),
+            right_area,
+        );
+    }
 
-        // 输入框正文文本颜色由外观给出
-        let input_text_style = Style::default().fg(self.appearance.input_text);
-        let block = Block::default()
-            .title(format!(" {} ", self.t("page_login")))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.message_border));
-        let inner = panel_rect.inner(ratatui::layout::Margin {
+    /// 顶栏四段文本：(连接标签, 连接标记, 当前用户段, 右侧版本信息)。
+    /// 拆成四段是为了把标记夹在"连接"与用户名之间并单独着色，
+    /// 也便于在没有真实服务端的情况下断言显示规则：
+    /// 未登录不显示用户名，未连上服务端不显示服务端版本，客户端版本始终显示。
+    fn status_bar_texts(&self) -> (String, String, String, String) {
+        let online = self.connection_ready.unwrap_or(false);
+        let mark = if online { "●" } else { "○" };
+        let mut user_text = String::new();
+        if self.is_logged_in() && !self.current_username.is_empty() {
+            user_text = format!(
+                "  |  {} {}",
+                self.t("bar_current_user"),
+                self.current_username
+            );
+        }
+        let server_version = self.connector.server_version_text();
+        let mut right_parts: Vec<String> = Vec::new();
+        if online && !server_version.is_empty() {
+            right_parts.push(format!(
+                "{}: {server_version}",
+                self.t("bar_server_version")
+            ));
+        }
+        right_parts.push(format!(
+            "{}: {}",
+            self.t("bar_client_version"),
+            Self::client_version()
+        ));
+        (
+            self.t("bar_connection"),
+            mark.to_string(),
+            user_text,
+            right_parts.join("  |  "),
+        )
+    }
+
+    /// 渲染通用表单浮层：标题一行一个字段，左侧标签、右侧输入框，最后一项回车提交。
+    /// 四类表单（个人资料、修改密码、修改头像、注销账户）字段数量不同，
+    /// 面板高度按字段数算，标签列宽按当前语言里最宽的标签算，避免出现横向滚动或截断。
+    /// 渲染通用表单浮层。窗口风格与其它浮层一致（同一 overlay_border）。
+    /// 输入条目不少于三个时用 `> 标签 内容` 的箭头行（昵称/手机号/简介、旧密码/新密码/确认）；
+    /// 一两个条目的（修改头像、删除账户）沿用原来的方框输入框。
+    fn render_form(&mut self, frame: &mut Frame, area: Rect) {
+        // 先把需要读 self 的内容取成自有值，渲染期要可变借用表单字段状态
+        let Some((action, fields)) = &self.active_form else {
+            return;
+        };
+        let field_count = fields.len();
+        let secret_flags: Vec<bool> = fields.iter().map(|field| field.secret).collect();
+        let labels: Vec<String> = fields
+            .iter()
+            .map(|field| self.t(&field.label_key))
+            .collect();
+        let title = self.t(&form_definition(action).0);
+        let hint = self.t(&form_hint_key(action));
+        let appearance = self.appearance.clone();
+        let focused = self.focus_index;
+        // 三个及以上条目走箭头行：一行一项，比三个方框叠起来省一半高度
+        let arrow_rows = field_count >= 3;
+        // 先把面板宽度定死（含夹到屏幕内），提示的折行与面板高度都按这个宽度算
+        let panel_width = 60u16
+            .min(area.width.saturating_sub(2))
+            .max(30)
+            .min(area.width.max(1));
+        let hint_text = wrapped_hint_text(
+            &hint,
+            hint_style(appearance.hint_text),
+            panel_width.saturating_sub(4),
+        );
+        let hint_lines = hint_text.lines.len().max(1) as u16;
+        let needed_height = if arrow_rows {
+            field_count as u16 + 3 + hint_lines
+        } else {
+            field_count as u16 * 4 + 3 + hint_lines
+        };
+        let panel_height = needed_height
+            .min(area.height.saturating_sub(2))
+            .max(if arrow_rows { 6 } else { 8 });
+        let panel_rect = centered_rect(panel_width, panel_height, area);
+        self.clear_overlay_area(frame, panel_rect);
+        frame.render_widget(overlay_frame_block(&appearance, &title), panel_rect);
+
+        let inner = panel_rect.inner(Margin {
             vertical: 1,
             horizontal: 2,
         });
-
-        let focus_style = Style::default()
-            .fg(self.appearance.selected_text)
-            .add_modifier(Modifier::BOLD);
-
-        let name_block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", self.t("label_username")))
-            .border_style(if self.focus_index == 0 {
-                focus_style
+        if arrow_rows {
+            self.render_arrow_form_rows(frame, &labels, &secret_flags, inner, hint_text);
+            return;
+        }
+        // 方框形态：每个输入框占三行，框间留一行，最后一行给提示
+        let rows = Layout::vertical(
+            (0..field_count)
+                .map(|_| Constraint::Length(3))
+                .chain(std::iter::once(Constraint::Length(hint_lines)))
+                .chain(std::iter::once(Constraint::Min(0)))
+                .collect::<Vec<Constraint>>(),
+        )
+        .split(inner);
+        for index in 0..field_count {
+            // 与箭头行形态同一口径：当前项用正文色加粗，其余用提示色，都不碰选中色
+            let field_style = if index == focused {
+                Style::default()
+                    .fg(appearance.input_text)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
-            });
-        let pwd_block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", self.t("label_password")))
-            .border_style(if self.focus_index == 1 {
-                focus_style
-            } else {
-                Style::default().fg(Color::Gray)
-            });
+                hint_style(appearance.hint_text)
+            };
+            render_box_field(
+                &appearance,
+                frame,
+                rows[index],
+                Line::from(Span::styled(format!(" {} ", labels[index]), field_style)),
+                appearance.form_field_border(),
+                secret_flags[index],
+                &mut self
+                    .active_form
+                    .as_mut()
+                    .expect("表单浮层显示期间表单必定存在")
+                    .1[index]
+                    .state,
+            );
+        }
+        if let Some(hint_row) = rows.get(field_count) {
+            frame.render_widget(
+                Paragraph::new(hint_text).style(Style::default().bg(appearance.app_background)),
+                *hint_row,
+            );
+        }
+    }
 
+    /// 箭头行形态的表单主体：左侧 `> 标签`（当前项选中色加粗，其余用提示色），
+    /// 右侧同一行是无边框输入区。上下方向键与 Tab 都用来切换当前项。
+    fn render_arrow_form_rows(
+        &mut self,
+        frame: &mut Frame,
+        labels: &[String],
+        secret_flags: &[bool],
+        inner: Rect,
+        hint: Text<'static>,
+    ) {
+        let appearance = self.appearance.clone();
+        let field_count = labels.len();
+        let hint_lines = hint.lines.len().max(1) as u16;
+        let rows = Layout::vertical(
+            (0..field_count)
+                .map(|_| Constraint::Length(1))
+                .chain(std::iter::once(Constraint::Length(hint_lines)))
+                .chain(std::iter::once(Constraint::Min(0)))
+                .collect::<Vec<Constraint>>(),
+        )
+        .split(inner);
+        let label_width = labels
+            .iter()
+            .map(|label| display_width(label))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(4)
+            .min(inner.width.saturating_sub(6))
+            .max(6);
+        for index in 0..field_count {
+            let [label_area, input_area] =
+                Layout::horizontal([Constraint::Length(label_width), Constraint::Fill(1)])
+                    .areas(rows[index]);
+            let is_focused = self.focus_index == index;
+            let marker = if is_focused { ">" } else { " " };
+            // 当前项用输入正文色加粗，其余用提示色；都不使用"选中文本色"
+            let label_style = if is_focused {
+                Style::default()
+                    .fg(appearance.input_text)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                hint_style(appearance.hint_text)
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("{marker} {}", labels[index]),
+                    label_style,
+                )))
+                .style(Style::default().bg(appearance.app_background)),
+                label_area,
+            );
+            render_plain_field(
+                &appearance,
+                frame,
+                input_area,
+                secret_flags[index],
+                &mut self
+                    .active_form
+                    .as_mut()
+                    .expect("表单浮层显示期间表单必定存在")
+                    .1[index]
+                    .state,
+            );
+        }
+        if let Some(hint_row) = rows.get(field_count) {
+            frame.render_widget(
+                Paragraph::new(hint).style(Style::default().bg(appearance.app_background)),
+                *hint_row,
+            );
+        }
+    }
+
+    /// 渲染个人资料卡片：左侧头像块（半块字符真色绘制），右侧依次是
+    /// 真名、昵称（没有就整行不显示）、UID、在线状态、邮箱、手机号、简介、头像；
+    /// 后四项没有值时显示"无"。头像若是服务端上传得到的相对路径，按规范显示成"本地"。
+    /// 邮箱与手机号只有查自己且登录响应给过时才有值 —— 别人的资料接口不返回这两项。
+    fn render_profile_card(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(profile) = self.profile_view.clone() else {
+            return;
+        };
+        let max_avatar_columns = profile_avatar_cells().0;
+        let title = self.t("profile_title");
+        let none_text = self.t("profile_none");
+        let is_self = Some(profile.id.as_str()) == self.current_user_id.as_deref();
+        let online_label = match self.presence_by_user.get(&profile.id).copied() {
+            Some(true) => self.t("presence_online"),
+            Some(false) => self.t("presence_offline"),
+            None => self.t("presence_unknown"),
+        };
+        // 邮箱与手机号只在"看自己且登录响应给过"时可得，其余一律按"无"处理
+        let (email, phone_number) = match (&self.own_contact, is_self) {
+            (Some(contact), true) => (contact.0.clone(), contact.1.clone()),
+            _ => (String::new(), String::new()),
+        };
+        let value_or_none = |value: String| {
+            if value.is_empty() {
+                none_text.clone()
+            } else {
+                value
+            }
+        };
+        let avatar_text = match profile.avatar.clone() {
+            None => none_text.clone(),
+            Some(path) if path.is_empty() => none_text.clone(),
+            // 服务端把上传的头像存成 /static/avatars/xxx.png 这类相对路径
+            Some(path) if path.starts_with('/') => self.t("profile_avatar_local"),
+            Some(path) => path,
+        };
+        let mut body_lines = vec![Line::from(Span::styled(
+            profile.username.clone(),
+            Style::default()
+                .fg(self.appearance.own_username_text)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        if let Some(nickname) = profile.nickname.clone().filter(|value| !value.is_empty()) {
+            body_lines.push(Line::from(format!(
+                "{}: {nickname}",
+                self.t("profile_nickname_label")
+            )));
+        }
+        for (label, value) in [
+            (self.t("profile_uid"), profile.id.clone()),
+            (self.t("presence_state"), online_label),
+            (self.t("profile_email_label"), value_or_none(email)),
+            (self.t("profile_phone_label"), value_or_none(phone_number)),
+            (
+                self.t("profile_bio_label"),
+                value_or_none(profile.bio.clone().unwrap_or_default()),
+            ),
+            (self.t("profile_avatar_url"), avatar_text),
+        ] {
+            body_lines.push(Line::from(format!("{label}: {value}")));
+        }
+        body_lines.push(Line::from(""));
+        body_lines.push(Line::from(Span::styled(
+            self.t("profile_close_hint"),
+            hint_style(self.appearance.hint_text),
+        )));
+        let body = Text::from(body_lines);
+
+        // 面板宽度只能压到屏幕以内，正文再按可用宽度折行：
+        // 原先固定 40 列下限且不折行，窄终端上 UID、邮箱、头像链接这类长单行会被右边界切掉
+        let appearance = self.appearance.clone();
+        let screen_width = area.width.saturating_sub(2);
+        // 面板宽度下限要能容下"满格头像 + 一栏正文"：否则昵称/简介一短，
+        // 面板就跟着变窄，头像被降档到很小的一块（正文长时不受影响）
+        let text_minimum = 24u16;
+        let width_floor = (max_avatar_columns as u16 + 5 + text_minimum + 4)
+            .min(screen_width.max(1))
+            .max(24u16.min(screen_width.max(1)));
+        let panel_width = (body.width() as u16 + 4).clamp(width_floor, screen_width.max(1));
+        // 头像列最多占面板一半，且必须"列 = 2×行"：窄面板上整体降档，不把圆脸压成竖条
+        let (avatar_columns, avatar_rows) = avatar_grid_within(
+            (panel_width / 2).max(2),
+            area.height.saturating_sub(4).max(1),
+        );
+        let avatar_columns = avatar_columns as usize;
+        let pixels = self.avatar_pixels_at(&profile.id, avatar_columns, avatar_rows as usize);
+        let body_text_width = panel_width.saturating_sub(avatar_columns as u16 + 5).max(8);
+        let body = wrap_profile_fields(body, body_text_width);
+        let body_height: u16 = body
+            .lines
+            .iter()
+            .map(|line| (line.width() as u16).div_ceil(body_text_width).max(1))
+            .sum();
+        let panel_height = (body_height.max(avatar_rows) + 4)
+            .min(area.height.saturating_sub(2))
+            .max(8);
+        let panel_rect = centered_rect(panel_width, panel_height, area);
+        self.clear_overlay_area(frame, panel_rect);
+        frame.render_widget(overlay_frame_block(&appearance, &title), panel_rect);
+        let inner = panel_rect.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
+        let [picture_area, text_area] = Layout::horizontal([
+            Constraint::Length(avatar_columns as u16 + 1),
+            Constraint::Fill(1),
+        ])
+        .areas(inner);
+        // 图片按网格自身的行数画，多余的高度留给下面（画满 inner 会把比例再拉歪一次）
+        let picture_area = Rect::new(
+            picture_area.x,
+            picture_area.y,
+            avatar_columns as u16,
+            avatar_rows,
+        );
+        // 头像占位与真图共用同一块区域：图片到位后只是把这块画满，右侧文字位置不动
+        match pixels {
+            Some(pixels) => pixels.paint(frame, picture_area, appearance.app_background),
+            None => paint_avatar_placeholder(
+                frame,
+                picture_area,
+                &profile.username,
+                &appearance,
+                &profile.id,
+            ),
+        }
+        frame.render_widget(
+            Paragraph::new(body).style(Style::default().bg(appearance.app_background)),
+            text_area,
+        );
+    }
+
+    /// 居中渲染登录浮层：用户名与密码（星号遮蔽）两个输入框。
+    /// 浮层只保留输入框与提交，Tab/Enter/Esc 属通用键，按快捷键提示规范不再单独占一行提示。
+    fn render_login_modal(&mut self, frame: &mut Frame, area: Rect) {
+        let panel_rect = centered_rect(
+            50u16.min(area.width.saturating_sub(4)).max(30),
+            11u16.min(area.height.saturating_sub(4)).max(9),
+            area,
+        );
+        self.clear_overlay_area(frame, panel_rect);
+        let inner = panel_rect.inner(Margin {
+            vertical: 1,
+            horizontal: 2,
+        });
         let name_rect = Rect::new(inner.x, inner.y, inner.width, 3);
-        let pwd_rect = Rect::new(inner.x, inner.y + 4, inner.width, 3);
-        let selection_style = Style::default()
-            .fg(contrasting_foreground(self.appearance.selection_background))
-            .bg(self.appearance.selection_background);
-        TextInput::new()
-            .style(input_text_style)
-            .block(name_block)
-            .focus_style(focus_style)
-            .select_style(selection_style)
-            .render(
-                name_rect,
-                frame.buffer_mut(),
-                &mut self.input_collector.login_name_state,
-            );
-        TextInput::new()
-            .style(input_text_style)
-            .block(pwd_block)
-            .focus_style(focus_style)
-            .select_style(selection_style)
-            .passwd()
-            .render(
-                pwd_rect,
-                frame.buffer_mut(),
-                &mut self.input_collector.login_password_state,
-            );
-
-        frame.render_widget(block, panel_rect);
+        let password_rect = Rect::new(inner.x, inner.y + 4, inner.width, 3);
+        let appearance = self.appearance.clone();
+        render_box_field(
+            &appearance,
+            frame,
+            name_rect,
+            Line::from(Span::raw(self.t("label_username"))),
+            appearance.login_field_border(self.focus_index == 0),
+            false,
+            &mut self.input_collector.login_name_state,
+        );
+        render_box_field(
+            &appearance,
+            frame,
+            password_rect,
+            Line::from(Span::raw(self.t("label_password"))),
+            appearance.login_field_border(self.focus_index == 1),
+            true,
+            &mut self.input_collector.login_password_state,
+        );
+        let title = self.t("page_login");
+        frame.render_widget(overlay_frame_block(&appearance, &title), panel_rect);
     }
 
     /// 居中渲染注册浮层：用户名、邮箱、密码（星号遮蔽）三个输入框。
     /// 同登录浮层，Tab/Enter/Esc 属通用键不再提示，故去掉底部提示行并收窄面板。
     fn render_register_modal(&mut self, frame: &mut Frame, area: Rect) {
-        let panel_width = 50u16.min(area.width.saturating_sub(4)).max(30);
-        let panel_height = 14u16.min(area.height.saturating_sub(4)).max(11);
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
+        let panel_rect = centered_rect(50, 14, area);
         self.clear_overlay_area(frame, panel_rect);
 
         // 输入框正文文本颜色由外观给出
@@ -4703,7 +5945,7 @@ impl App {
         let block = Block::default()
             .title(format!(" {} ", self.t("page_register")))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.message_border));
+            .border_style(Style::default().fg(self.appearance.overlay_border));
         let inner = panel_rect.inner(ratatui::layout::Margin {
             vertical: 1,
             horizontal: 2,
@@ -4722,7 +5964,7 @@ impl App {
             .border_style(if self.focus_index == 0 {
                 focus_style
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(self.appearance.input_border)
             });
         let email_block = Block::default()
             .borders(Borders::ALL)
@@ -4730,7 +5972,7 @@ impl App {
             .border_style(if self.focus_index == 1 {
                 focus_style
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(self.appearance.input_border)
             });
         let pwd_block = Block::default()
             .borders(Borders::ALL)
@@ -4738,7 +5980,7 @@ impl App {
             .border_style(if self.focus_index == 2 {
                 focus_style
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(self.appearance.input_border)
             });
 
         TextInput::new()
@@ -4912,32 +6154,33 @@ impl App {
         let max_height = if raw_prefix.starts_with("kick ")
             || raw_prefix.starts_with("language ")
             || raw_prefix.starts_with("appearance ")
+            || raw_prefix.starts_with("profile ")
         {
             12
         } else {
             7
         };
-        let popup_height = (candidates.len() as u16 + 2).min(max_height);
         let popup_width = input_area.width.saturating_sub(2);
+        // 边框 2 列 + 高亮符号 2 列
+        let body_width = popup_width.saturating_sub(6).max(1);
+        let candidate_lines: Vec<Vec<Line<'static>>> = candidates
+            .iter()
+            .map(|(_, label, description)| {
+                completion_lines(
+                    label,
+                    description,
+                    Style::default().fg(self.appearance.selected_text),
+                    Style::default().fg(self.appearance.hint_text),
+                    body_width,
+                )
+            })
+            .collect();
+        let total_lines: u16 = candidate_lines.iter().map(|lines| lines.len() as u16).sum();
+        let popup_height = (total_lines + 2).min(max_height);
         let popup_y = input_area.y.saturating_sub(popup_height);
         let popup_rect = Rect::new(input_area.x + 1, popup_y, popup_width, popup_height);
 
-        let items: Vec<ListItem> = candidates
-            .iter()
-            .map(|(_, label, description)| {
-                let mut spans = vec![Span::styled(
-                    label.clone(),
-                    Style::default().fg(self.appearance.selected_text),
-                )];
-                if !description.is_empty() {
-                    spans.push(Span::styled(
-                        format!("  {}", description),
-                        Style::default().fg(self.appearance.hint_text),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
+        let items: Vec<ListItem> = candidate_lines.into_iter().map(ListItem::new).collect();
 
         let title_key = if raw_prefix.starts_with("kick ") {
             "member_select_title"
@@ -4945,6 +6188,8 @@ impl App {
             "select_language_title"
         } else if raw_prefix.starts_with("appearance ") {
             "appearance_select_title"
+        } else if raw_prefix.starts_with("profile ") || raw_prefix.starts_with("search_users ") {
+            "user_select_title"
         } else {
             "command_list"
         };
@@ -5082,13 +6327,11 @@ impl App {
         }
 
         let paragraph = Paragraph::new(Text::from(lines)).scroll((scroll_y, 0));
-        frame.render_widget(
-            paragraph,
-            Rect {
-                width: inner.width.saturating_sub(1),
-                ..inner
-            },
-        );
+        let paragraph_area = Rect {
+            width: inner.width.saturating_sub(1),
+            ..inner
+        };
+        frame.render_widget(paragraph, paragraph_area);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -5108,12 +6351,23 @@ impl App {
     fn build_message_lines(&self, text_width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
         let current_user_id = self.current_user_id.as_deref().unwrap_or("");
         let keyword = self.active_search_keyword();
+        // 当前定位到的那一条匹配项：命中的那条消息用另一个背景色，与其余命中区分开
+        let current_match_message_id: Option<String> = keyword.as_ref().and_then(|_| {
+            self.search_result
+                .as_ref()
+                .and_then(|(_, matched, selected)| matched.get(*selected).cloned())
+        });
         let body_style = Style::default().fg(self.appearance.message_text);
         let match_style = Style::default()
             .fg(contrasting_foreground(
                 self.appearance.search_match_background,
             ))
             .bg(self.appearance.search_match_background);
+        let current_match_style = Style::default()
+            .fg(contrasting_foreground(
+                self.appearance.search_current_match_background,
+            ))
+            .bg(self.appearance.search_current_match_background);
         let mut lines: Vec<Line> = Vec::new();
         let mut message_first_lines: Vec<usize> = Vec::new();
         let mut last_time_key: Option<String> = None;
@@ -5135,12 +6389,10 @@ impl App {
             let sender_name = if is_own {
                 self.t("self_name").to_string()
             } else {
-                self.sender_names
-                    .get(&message.sender_id)
-                    .cloned()
-                    .unwrap_or_else(|| message.sender_id.clone())
+                self.sender_display_name(&message.sender_id)
             };
-            let display_sender = if self.show_uid {
+            // 注销过的发言人没有 ID 可展示，只留"未知用户"
+            let display_sender = if self.show_uid && !sender_name.is_empty() {
                 format!("{} ({})", sender_name, message.sender_id)
             } else {
                 sender_name
@@ -5157,14 +6409,21 @@ impl App {
             } else {
                 Alignment::Left
             };
+            // 行号向量记录的是首行正文：复制选区与搜索定位都按"正文块"划分，
+            // 把用户名行算进去会改变它们的边界
             for piece in wrap_by_display_width(&display_sender, text_width) {
                 lines.push(Line::from(Span::styled(piece, name_style)).alignment(alignment));
             }
             message_first_lines.push(lines.len());
+            let message_match_style = if Some(&message.id) == current_match_message_id.as_ref() {
+                current_match_style
+            } else {
+                match_style
+            };
             for source_line in message.content.split('\n') {
                 let segments = match keyword.as_deref() {
                     Some(keyword) => {
-                        split_line_by_keyword(source_line, keyword, body_style, match_style)
+                        split_line_by_keyword(source_line, keyword, body_style, message_match_style)
                     }
                     None => vec![(source_line.to_string(), body_style)],
                 };
@@ -5340,6 +6599,8 @@ impl App {
             self.messages.len() + fresh.len()
         ));
         self.messages.extend(fresh);
+        let merged_room_id = room.id.clone();
+        self.cache_loaded_messages(&merged_room_id);
         // RFC3339 时间戳的字典序即时间序，稳定排序保持同一时刻消息的原有相对顺序
         self.messages
             .sort_by(|left, right| left.created_at.cmp(&right.created_at));
@@ -5393,15 +6654,19 @@ impl App {
     fn message_input_title(&self) -> (Line<'static>, Color) {
         let input_text = self.input_collector.message_input_state.text();
         if self.in_search_mode() {
-            let title = match self.search_result.as_ref() {
-                None => Line::from(Span::raw(format!(" {} ", self.t("search_mode")))),
-                Some((_, matched, _)) if matched.is_empty() => Line::from(Span::styled(
+            // 输入框里的关键词与上次执行的不一致（含用退格删改），上次结果就已经不成立了：
+            // 标题回到"未执行搜索"，不再显示旧的匹配进度，避免看着有结果其实早已失效
+            let title = match (self.active_search_keyword(), self.search_result.as_ref()) {
+                (None, _) | (_, None) => {
+                    Line::from(Span::raw(format!(" {} ", self.t("search_mode"))))
+                }
+                (_, Some((_, matched, _))) if matched.is_empty() => Line::from(Span::styled(
                     format!(" {} ", self.t("search_not_found")),
                     Style::default()
                         .fg(self.appearance.notice_error_border)
                         .add_modifier(Modifier::BOLD),
                 )),
-                Some((_, matched, selected)) => Line::from(Span::raw(format!(
+                (_, Some((_, matched, selected))) => Line::from(Span::raw(format!(
                     " {} ",
                     self.t("search_progress")
                         .replace("{current}", &(selected + 1).to_string())
@@ -5453,11 +6718,8 @@ impl App {
     }
 
     fn render_create_group_modal(&mut self, frame: &mut Frame, area: Rect) {
-        let panel_width = 60;
-        let panel_height = 18;
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
+        // 面板尺寸先按内容要，再夹到可绘制区以内：窄终端上超出的部分过去会被终端整列切掉
+        let panel_rect = centered_rect(60, 18, area);
 
         // 仅清空并覆盖弹窗自身区域，避免破坏底层群聊列表与聊天记录的边框
         self.clear_overlay_area(frame, panel_rect);
@@ -5466,7 +6728,7 @@ impl App {
             .fg(self.appearance.selected_text)
             .add_modifier(Modifier::BOLD);
         let cursor_style = Style::default().fg(self.appearance.own_username_text);
-        let unfocused_style = Style::default().fg(Color::Gray);
+        let unfocused_style = Style::default().fg(self.appearance.input_border);
         let selection_style = Style::default()
             .fg(contrasting_foreground(self.appearance.selection_background))
             .bg(self.appearance.selection_background);
@@ -5476,7 +6738,7 @@ impl App {
         let block = Block::default()
             .title(format!(" {} ", self.t("create_group_title")))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.message_border));
+            .border_style(Style::default().fg(self.appearance.overlay_border));
 
         let inner = panel_rect.inner(ratatui::layout::Margin {
             vertical: 1,
@@ -5543,11 +6805,7 @@ impl App {
     }
 
     fn render_create_private_modal(&mut self, frame: &mut Frame, area: Rect) {
-        let panel_width = 50;
-        let panel_height = 14;
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
+        let panel_rect = centered_rect(50, 14, area);
 
         // 仅清空并覆盖弹窗自身区域，避免破坏底层群聊列表与聊天记录的边框
         self.clear_overlay_area(frame, panel_rect);
@@ -5556,7 +6814,7 @@ impl App {
             .fg(self.appearance.selected_text)
             .add_modifier(Modifier::BOLD);
         let cursor_style = Style::default().fg(self.appearance.own_username_text);
-        let unfocused_style = Style::default().fg(Color::Gray);
+        let unfocused_style = Style::default().fg(self.appearance.input_border);
         let selection_style = Style::default()
             .fg(contrasting_foreground(self.appearance.selection_background))
             .bg(self.appearance.selection_background);
@@ -5566,7 +6824,7 @@ impl App {
         let block = Block::default()
             .title(format!(" {} ", self.t("create_private_title")))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.message_border));
+            .border_style(Style::default().fg(self.appearance.overlay_border));
 
         let inner = panel_rect.inner(ratatui::layout::Margin {
             vertical: 1,
@@ -5716,13 +6974,18 @@ impl App {
             self.push_error(self.t("error_info_not_group"));
             return;
         }
-        let detail = match self.connector.get_room(&room.id) {
+        let room_id = room.id.clone();
+        let detail = match self.connector.get_room(&room_id) {
             Ok(detail) => detail,
             Err(error) => {
                 self.push_error(format!("{}: {error}", self.t("error_get_room_info_failed")));
                 return;
             }
         };
+        // 成员名册改走专用的成员接口：房间详情里的成员数组是附带字段，
+        // 成员接口才是服务端给出的权威名册（带 count 与完整 role/joined_at），
+        // 两者都取到才拼出完整信息；成员接口失败时退回详情里那份，不至于什么都显示不出
+        let roster = self.connector.list_members(&room_id).ok();
         let room_name = detail
             .name
             .clone()
@@ -5732,8 +6995,10 @@ impl App {
         } else {
             self.t("room_info_no")
         };
-        let members_text: Vec<String> = detail
-            .members
+        let members_text: Vec<String> = roster
+            .as_ref()
+            .map(|fetched| &fetched.members[..])
+            .unwrap_or(&detail.members)
             .iter()
             .map(|member| {
                 // 成员后跟在线标记（与服务端广播一致的 ●/○），未知状态不显示标记
@@ -5742,9 +7007,19 @@ impl App {
                     Some(false) => "○",
                     None => "",
                 };
-                format!("{} [{}]{}", member.username, member.role, presence_mark)
+                let joined_at = format_message_time(&member.joined_at, true)
+                    .map(|moment| format!(" ({moment})"))
+                    .unwrap_or_default();
+                format!(
+                    "{} [{}]{}{}",
+                    member.username, member.role, presence_mark, joined_at
+                )
             })
             .collect();
+        let member_total = roster
+            .as_ref()
+            .map(|fetched| fetched.count)
+            .unwrap_or(detail.member_count as usize);
         let online_count = detail
             .members
             .iter()
@@ -5757,51 +7032,77 @@ impl App {
             self.t("room_info_id"),
             detail.id,
             self.t("room_info_creator"),
-            detail.created_by,
+            if detail.created_by.is_empty() {
+                self.t("unknown_user")
+            } else {
+                detail.created_by.clone()
+            },
             self.t("room_info_created"),
             detail.created_at,
             self.t("room_info_encrypted"),
             encrypted_label,
             self.t("room_info_member_count"),
-            detail.member_count,
+            member_total,
             self.t("room_info_online_count"),
             online_count,
-            detail.member_count,
+            member_total,
             self.t("room_info_members"),
             members_text.join(", ")
         );
         self.push_notification(info);
     }
 
-    /// 渲染设置菜单浮层。菜单项按顺序与 handle_event 中 SettingsMenu 的索引分派一一对应：
-    /// 0-4 为导航动作，5-8 为开关拨动项，9 服务器地址，10 退出登录，11 登录浮层，12 注册浮层。
-    /// 新增/调整菜单项时必须同步改动那里的索引与 menu_count。
-    fn render_settings_menu(&mut self, frame: &mut Frame, area: Rect) {
-        let panel_width = 48u16.min(area.width.saturating_sub(4)).max(30);
-        let panel_height = 17u16.min(area.height.saturating_sub(4)).max(15);
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
+    /// 发送者的显示名：先查用户名映射，查不到退回用户 ID。
+    /// 账号注销后服务端会把 `messages.sender_id` 置为 null（`ON DELETE SET NULL`），
+    /// 接缝把 null 收敛成空串，此时既没有名字也没有 ID，统一显示"未知用户"。
+    fn sender_display_name(&self, sender_id: &str) -> String {
+        if sender_id.is_empty() {
+            return self.t("unknown_user");
+        }
+        self.sender_names
+            .get(sender_id)
+            .cloned()
+            .unwrap_or_else(|| sender_id.to_string())
+    }
 
-        self.clear_overlay_area(frame, panel_rect);
-
-        let block = Block::default()
-            .title(format!(" {} ", self.t("settings_title")))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.room_border));
-
+    /// 设置菜单条目表：(标签, 文字颜色, 回车动作)。
+    /// 浮层渲染与按键分派都读这一张表，菜单增删项只改这里一处。
+    /// 注销账户按 TODO 要求用红字标出，退出登录同样是破坏性操作故也用红字。
+    fn settings_menu_entries(&self) -> Vec<(String, Color, SettingsAction)> {
         let on_off = |enabled: bool| if enabled { "ON" } else { "OFF" };
         let plain_text = self.appearance.message_text;
-        let menu_texts: Vec<(String, Color)> = vec![
-            (format!(" {}", self.t("option_create_group")), plain_text),
-            (format!(" {}", self.t("option_create_private")), plain_text),
+        let danger_text = self.appearance.notice_error_border;
+        // 数字只提示"待处理"条数：收到的都是待处理（接口只返回 pending），
+        // 自己发出的只有还是 pending 的才算，已接受/已拒绝/已过期的旧邀请不计
+        let request_count = self
+            .pending_requests
+            .iter()
+            .filter(|request| received_request_is_pending(request))
+            .count()
+            + self
+                .sent_requests
+                .iter()
+                .filter(|request| request.status.as_deref() == Some("pending"))
+                .count();
+        let update_suffix = match self.pending_update.as_ref() {
+            Some((version, _)) => format!(" ({version})"),
+            None => String::new(),
+        };
+        vec![
             (
-                format!(
-                    " {} ({})",
-                    self.t("option_pending_requests"),
-                    self.pending_requests.len()
-                ),
+                format!(" {}", self.t("option_create_group")),
                 plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::CreateGroup),
+            ),
+            (
+                format!(" {}", self.t("option_create_private")),
+                plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::CreatePrivate),
+            ),
+            (
+                format!(" {} ({})", self.t("option_pending_requests"), request_count),
+                plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::PendingRequests),
             ),
             (
                 format!(
@@ -5810,6 +7111,7 @@ impl App {
                     Self::current_language()
                 ),
                 plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::LanguageSelect),
             ),
             (
                 format!(
@@ -5818,10 +7120,12 @@ impl App {
                     self.appearance_name
                 ),
                 plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::AppearanceSelect),
             ),
             (
                 format!(" {} [{}]", self.t("option_show_uid"), on_off(self.show_uid)),
                 plain_text,
+                SettingsAction::ToggleShowUid,
             ),
             (
                 format!(
@@ -5830,6 +7134,7 @@ impl App {
                     on_off(self.time_with_date)
                 ),
                 plain_text,
+                SettingsAction::ToggleTimeWithDate,
             ),
             (
                 format!(
@@ -5838,6 +7143,7 @@ impl App {
                     on_off(self.quick_search)
                 ),
                 plain_text,
+                SettingsAction::ToggleQuickSearch,
             ),
             (
                 format!(
@@ -5846,17 +7152,152 @@ impl App {
                     on_off(self.sound_enabled)
                 ),
                 plain_text,
+                SettingsAction::ToggleSound,
             ),
-            (format!(" {}", self.t("option_server_address")), plain_text),
-            (format!(" {}", self.t("option_logout")), Color::Red),
-            (format!(" {}", self.t("option_login")), plain_text),
-            (format!(" {}", self.t("option_register")), plain_text),
-        ];
-        let menu_items: Vec<ListItem> = menu_texts
-            .into_iter()
-            .map(|(text, color)| {
-                ListItem::new(Line::from(Span::styled(text, Style::default().fg(color))))
+            (
+                format!(" {}", self.t("option_edit_profile")),
+                plain_text,
+                SettingsAction::OpenForm(FormAction::UpdateProfile),
+            ),
+            (
+                format!(" {}", self.t("option_change_password")),
+                plain_text,
+                SettingsAction::OpenForm(FormAction::ChangePassword),
+            ),
+            (
+                format!(" {}", self.t("option_change_avatar")),
+                plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::AvatarSelect),
+            ),
+            (
+                format!(" {}", self.t("option_server_address")),
+                plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::ServerAddress),
+            ),
+            (
+                format!(" {}{update_suffix}", self.t("option_update_client")),
+                plain_text,
+                SettingsAction::UpdateClient,
+            ),
+            (
+                format!(" {}", self.t("option_delete_account")),
+                danger_text,
+                SettingsAction::OpenForm(FormAction::DeleteAccount),
+            ),
+            (
+                format!(" {}", self.t("option_logout")),
+                danger_text,
+                SettingsAction::Logout,
+            ),
+            (
+                format!(" {}", self.t("option_login")),
+                plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::Login),
+            ),
+            (
+                format!(" {}", self.t("option_register")),
+                plain_text,
+                SettingsAction::OpenOverlay(DisplayingOverlay::Register),
+            ),
+        ]
+    }
+
+    /// 打开一个既有浮层，顺带完成各自需要的初始化：列表类浮层把选中项摆到当前生效条目，
+    /// 服务器地址浮层预填现有地址，表单与输入类浮层把焦点回到第一项。
+    fn open_overlay(&mut self, overlay: DisplayingOverlay) {
+        self.focus_index = 0;
+        match overlay {
+            DisplayingOverlay::PendingRequests => {
+                self.request_list_state
+                    .select(if self.request_entries().is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    });
+            }
+            DisplayingOverlay::LanguageSelect => {
+                let languages = Self::get_available_languages();
+                let current = Self::current_language();
+                self.language_list_state
+                    .select(languages.iter().position(|language| language == &current));
+            }
+            DisplayingOverlay::AppearanceSelect => {
+                let names = Appearance::available_names();
+                self.appearance_list_state
+                    .select(names.iter().position(|name| name == &self.appearance_name));
+            }
+            DisplayingOverlay::ServerAddress => {
+                self.input_collector
+                    .server_address_state
+                    .set_text(self.connector.base_url());
+            }
+            DisplayingOverlay::AvatarSelect => {
+                ensure_avatar_source_directory();
+                if local_avatar_files().is_empty() {
+                    // 目录里还没图片：不摆空面板，直接给原来的链接输入表单
+                    self.open_declared_form(&FormAction::ChangeAvatar);
+                    return;
+                }
+                self.avatar_list_state.select(Some(0));
+            }
+            _ => {}
+        }
+        self.displaying_overlay = overlay;
+    }
+
+    /// 按表单声明打开表单浮层。个人资料表单额外按服务端当前值预填昵称与简介；
+    /// 手机号没有任何只读接口能取回（登录响应之外不给），故留空表示"不改这一项"。
+    fn open_declared_form(&mut self, action: &FormAction) {
+        let (_, declared) = form_definition(action);
+        let mut prefilled: Vec<String> = Vec::new();
+        if *action == FormAction::UpdateProfile {
+            let loaded = self
+                .current_user_id
+                .as_ref()
+                .and_then(|user_id| self.connector.get_user_profile(user_id).ok());
+            prefilled = vec![
+                loaded
+                    .as_ref()
+                    .and_then(|profile| profile.nickname.clone())
+                    .unwrap_or_default(),
+                String::new(),
+                loaded
+                    .as_ref()
+                    .and_then(|profile| profile.bio.clone())
+                    .unwrap_or_default(),
+            ];
+        }
+        let fields: Vec<FormField> = declared
+            .iter()
+            .enumerate()
+            .map(|(index, (label_key, secret))| {
+                FormField::new(
+                    label_key,
+                    prefilled.get(index).map(String::as_str).unwrap_or_default(),
+                    *secret,
+                )
             })
+            .collect();
+        self.open_form(action.clone(), fields);
+    }
+
+    /// 渲染设置菜单浮层：条目、颜色与动作全部来自 settings_menu_entries，
+    /// 面板高度按条目数算，超出屏幕时由列表自身随选中项滚动。
+    fn render_settings_menu(&mut self, frame: &mut Frame, area: Rect) {
+        let entries = self.settings_menu_entries();
+        let labels: Vec<String> = entries.iter().map(|(label, _, _)| label.clone()).collect();
+        let colors: Vec<Color> = entries.iter().map(|(_, color, _)| *color).collect();
+        let (panel_rect, body_width) = overlay_list_panel(&labels, area);
+        self.clear_overlay_area(frame, panel_rect);
+        let block = Block::default()
+            .title(format!(" {} ", self.t("settings_title")))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.appearance.overlay_border));
+
+        let menu_items: Vec<ListItem> = labels
+            .iter()
+            .zip(colors.iter())
+            .map(|(label, color)| wrapped_list_item(label, Style::default().fg(*color), body_width))
             .collect();
 
         let list = List::new(menu_items)
@@ -5873,34 +7314,33 @@ impl App {
     /// 渲染语言选择浮层：列出 config/languages 下的全部语言文件，回车切换并写回 preferences.json
     fn render_language_select(&mut self, frame: &mut Frame, area: Rect) {
         let languages = Self::get_available_languages();
-        let panel_width = 30u16.min(area.width.saturating_sub(4)).max(20);
-        let panel_height = (languages.len() as u16 + 4)
-            .min(area.height.saturating_sub(4))
-            .max(5);
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
-
+        let current = Self::current_language();
+        let labels: Vec<String> = languages
+            .iter()
+            .map(|name| {
+                if name == &current {
+                    format!(" {name} ✓")
+                } else {
+                    format!(" {name}")
+                }
+            })
+            .collect();
+        let (panel_rect, body_width) = overlay_list_panel(&labels, area);
         self.clear_overlay_area(frame, panel_rect);
 
         let block = Block::default()
             .title(format!(" {} ", self.t("select_language_title")))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.room_border));
+            .border_style(Style::default().fg(self.appearance.overlay_border));
 
-        let current = Self::current_language();
-        let items: Vec<ListItem> = languages
+        let items: Vec<ListItem> = labels
             .iter()
-            .map(|lang| {
-                let label = if lang == &current {
-                    format!(" {lang} ✓")
-                } else {
-                    format!(" {lang}")
-                };
-                ListItem::new(Line::from(Span::styled(
+            .map(|label| {
+                wrapped_list_item(
                     label,
                     Style::default().fg(self.appearance.message_text),
-                )))
+                    body_width,
+                )
             })
             .collect();
 
@@ -5919,33 +7359,32 @@ impl App {
     /// 回车即应用并写回 preferences.json 的 appearance 字段。
     fn render_appearance_select(&mut self, frame: &mut Frame, area: Rect) {
         let names = Appearance::available_names();
-        let panel_width = 46u16.min(area.width.saturating_sub(4)).max(24);
-        let panel_height = (names.len() as u16 + 4)
-            .min(area.height.saturating_sub(4))
-            .max(5);
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
-
+        let labels: Vec<String> = names
+            .iter()
+            .map(|name| {
+                if name == &self.appearance_name {
+                    format!(" {name} ✓")
+                } else {
+                    format!(" {name}")
+                }
+            })
+            .collect();
+        let (panel_rect, body_width) = overlay_list_panel(&labels, area);
         self.clear_overlay_area(frame, panel_rect);
 
         let block = Block::default()
             .title(format!(" {} ", self.t("appearance_select_title")))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.room_border));
+            .border_style(Style::default().fg(self.appearance.overlay_border));
 
-        let items: Vec<ListItem> = names
+        let items: Vec<ListItem> = labels
             .iter()
-            .map(|name| {
-                let label = if name == &self.appearance_name {
-                    format!(" {name} ✓")
-                } else {
-                    format!(" {name}")
-                };
-                ListItem::new(Line::from(Span::styled(
+            .map(|label| {
+                wrapped_list_item(
                     label,
                     Style::default().fg(self.appearance.message_text),
-                )))
+                    body_width,
+                )
             })
             .collect();
 
@@ -5960,13 +7399,97 @@ impl App {
         frame.render_stateful_widget(list, panel_rect, &mut self.appearance_list_state);
     }
 
+    /// 本地头像选择浮层：窗口、列表、高亮符号与语言/外观选择完全一致，
+    /// 条目是 `<客户端目录>/config/avatars` 里的图片文件名。
+    fn render_avatar_select(&mut self, frame: &mut Frame, area: Rect) {
+        let files = local_avatar_files();
+        let labels: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        let hint = self.t("hint_avatar_select");
+        let (base_rect, body_width) = overlay_list_panel(&labels, area);
+        // 提示按条目同一内宽折行，行数超出面板自带的两行余量时才把面板加高
+        let hint_block =
+            wrapped_hint_text(&hint, hint_style(self.appearance.hint_text), body_width);
+        let hint_rows = hint_block.lines.len().max(1) as u16;
+        let panel_rect = centered_rect(
+            base_rect.width,
+            base_rect.height + hint_rows.saturating_sub(2),
+            area,
+        );
+        self.clear_overlay_area(frame, panel_rect);
+        frame.render_widget(
+            overlay_frame_block(&self.appearance, &self.t("option_change_avatar")),
+            panel_rect,
+        );
+        let items: Vec<ListItem> = labels
+            .iter()
+            .map(|label| {
+                wrapped_list_item(
+                    label,
+                    Style::default().fg(self.appearance.message_text),
+                    body_width,
+                )
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .fg(self.appearance.selected_text)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+        let inner = panel_rect.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let [list_area, hint_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(hint_rows)]).areas(inner);
+        frame.render_stateful_widget(list, list_area, &mut self.avatar_list_state);
+        frame.render_widget(
+            Paragraph::new(hint_block).alignment(Alignment::Center),
+            hint_area,
+        );
+    }
+
+    /// 用选中的本地图片换头像：文件名来自头像目录。
+    fn apply_local_avatar(&mut self) {
+        let index = self.avatar_list_state.selected().unwrap_or(0);
+        let files = local_avatar_files();
+        let Some((_, path)) = files.get(index) else {
+            return;
+        };
+        self.upload_local_avatar(path);
+    }
+
+    /// 把一张本地图片交给服务端的 multipart 上传接口（列表选择与表单填路径两条入口共用）。
+    /// 服务端存不下文件时按它给的报错原样显示：存放目录由服务端自己在启动时建，
+    /// 客户端不去碰服务端的数据目录；要传链接版头像请用浮层里的 Ctrl+U。
+    fn upload_local_avatar(&mut self, path: &std::path::Path) {
+        let Some((file_name, content_type, bytes)) = read_local_image(path) else {
+            self.push_error(self.t("error_avatar_local_file_unusable"));
+            return;
+        };
+        match self
+            .connector
+            .upload_avatar(&file_name, &content_type, bytes)
+        {
+            Ok(user) => self.finish_avatar_change(&user),
+            Err(error) => {
+                self.push_error(format!("{}: {error}", self.t("error_avatar_update_failed")))
+            }
+        }
+    }
+
     /// 渲染服务器地址浮层：单输入框，回车测试连通性并保存。
     fn render_server_address(&mut self, frame: &mut Frame, area: Rect) {
-        let panel_width = 50u16.min(area.width.saturating_sub(4)).max(30);
-        let panel_height = 6u16.min(area.height.saturating_sub(4)).max(5);
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
+        // 提示与输入框都要放得下：面板宽度先夹到屏幕内，提示按最终内宽折行后再定高度
+        let panel_width = 50u16.min(area.width.max(1));
+        let label = wrapped_hint_text(
+            &self.t("server_address_label"),
+            Style::default().fg(self.appearance.message_text),
+            panel_width.saturating_sub(6),
+        );
+        let label_lines = label.lines.len().max(1) as u16;
+        let panel_rect = centered_rect(panel_width, 5 + label_lines, area);
 
         self.clear_overlay_area(frame, panel_rect);
 
@@ -5975,18 +7498,19 @@ impl App {
         let block = Block::default()
             .title(format!(" {} ", self.t("server_address_title")))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.message_border));
+            .border_style(Style::default().fg(self.appearance.overlay_border));
 
         let inner = panel_rect.inner(ratatui::layout::Margin {
             vertical: 1,
             horizontal: 2,
         });
 
-        let label = Paragraph::new(Text::raw(self.t("server_address_label")))
-            .style(Style::default().fg(self.appearance.message_text));
-        frame.render_widget(label, Rect::new(inner.x, inner.y, inner.width, 1));
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(self.appearance.message_text)),
+            Rect::new(inner.x, inner.y, inner.width, label_lines),
+        );
 
-        let input_rect = Rect::new(inner.x, inner.y + 1, inner.width, 3);
+        let input_rect = Rect::new(inner.x, inner.y + label_lines, inner.width, 3);
         let input_state = &mut self.input_collector.server_address_state;
         input_state.focus.set(true);
         let selection_style = Style::default()
@@ -5997,7 +7521,7 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Gray)),
+                    .border_style(Style::default().fg(self.appearance.input_border)),
             )
             .select_style(selection_style)
             .cursor_style(Style::default().fg(self.appearance.own_username_text));
@@ -6006,111 +7530,239 @@ impl App {
         frame.render_widget(block, panel_rect);
     }
 
-    /// 居中渲染待处理聊天请求列表弹窗，支持上下选择、回车接受、d 键拒绝
+    /// 渲染私聊管理浮层：上半区是别人发给自己的请求（可接受/拒绝），
+    /// 下半区是自己发出的请求（可撤回，并显示服务端回报的当前状态）。
+    /// 两个区拼成一条扁平序列用同一个选中下标导航，因此这里手工画每行、
+    /// 只给可选项计数，标题行不参与选中。
+    /// 渲染私聊管理浮层：上半区是别人发给自己的请求（可接受/拒绝），
+    /// 下半区是自己发出的请求（可撤回，并显示服务端回报的当前状态）。
+    /// 两个区拼成一条扁平序列用同一个选中下标导航，标题行不参与选中，
+    /// 因此这里手工逐行绘制并自己算滚动偏移。邀请正文按面板宽度折行完整显示，
+    /// 长度超出面板时随选中项滚动，不会像之前那样只显示一行。
     fn render_pending_requests(&mut self, frame: &mut Frame, area: Rect) {
-        let panel_width = 64u16.min(area.width.saturating_sub(4)).max(24);
-        let panel_height = 16u16.min(area.height.saturating_sub(4)).max(8);
-        let panel_x = area.x + (area.width.saturating_sub(panel_width)) / 2;
-        let panel_y = area.y + (area.height.saturating_sub(panel_height)) / 2;
-        let panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
+        let entries = self.request_entries();
+        let received_count = self.pending_requests.len();
+        let selected = self.request_list_state.selected().unwrap_or(0);
+        let panel_width = area.width.saturating_sub(4).clamp(40, 88);
+        // 正文可用宽度：减去边框、选中标记与缩进
+        let body_width = panel_width.saturating_sub(8).max(20) as usize;
+        let appearance = self.appearance.clone();
+        let empty_text = self.t("no_pending_requests");
+        let unknown_text = self.t("unknown_user");
+        let encrypted_mark = self.t("encrypted_mark");
+        let received_title = self.t("request_section_received");
+        let sent_title = self.t("request_section_sent");
+        let panel_title = self.t("pending_requests_title");
+        let hint_text = self.t("hint_pending_requests");
 
-        // 仅清空并覆盖弹窗自身区域，避免破坏底层界面边框
+        // 第一遍只算行：每个条目可能占多行（正文折行），面板高度与滚动都要用它
+        let mut rows: Vec<(Option<usize>, Line)> = Vec::new();
+        if entries.is_empty() {
+            rows.push((
+                None,
+                Line::from(Span::styled(
+                    empty_text.clone(),
+                    hint_style(appearance.hint_text),
+                ))
+                .alignment(Alignment::Center),
+            ));
+        }
+        for (index, (is_sent, request)) in entries.iter().enumerate() {
+            let starts_section = *is_sent || (received_count > 0 && index == received_count);
+            if starts_section {
+                if index > 0 {
+                    rows.push((None, Line::from("")));
+                }
+
+                rows.push((
+                    None,
+                    Line::from(Span::styled(
+                        format!(
+                            " {}",
+                            if *is_sent {
+                                &sent_title
+                            } else {
+                                &received_title
+                            }
+                        ),
+                        Style::default()
+                            .fg(appearance.time_text)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                ));
+            }
+            let peer_name = if *is_sent {
+                request.receiver.as_ref()
+            } else {
+                request.sender.as_ref()
+            }
+            .map(|peer| peer.username.clone())
+            .unwrap_or_else(|| unknown_text.clone());
+            // 发出侧服务端总给状态；收到侧只有本端处理过的那几条有状态（历史条目），
+            // 仍在等的收到条目状态缺省，不跟后缀
+            let status_suffix = match request.status.as_deref() {
+                Some(status) if *is_sent || status != "pending" => {
+                    format!(" [{}]", self.request_status_label(status))
+                }
+                _ => String::new(),
+            };
+            let encryption_mark = if request.is_encrypted {
+                encrypted_mark.clone()
+            } else {
+                String::new()
+            };
+            let is_current = index == selected;
+            let entry_color = if is_current {
+                appearance.selected_text
+            } else {
+                appearance.other_username_text
+            };
+            let body_color = if is_current {
+                appearance.selected_text
+            } else {
+                appearance.message_text
+            };
+            let message_lines = wrap_by_display_width(
+                &format!("{}{encryption_mark}", request.message),
+                body_width as u16,
+            );
+            // 人名与状态本身可能宽过正文区：放不下就让它先独占若干行，正文顺延到下一行，
+            // 否则整条邀请会被裁得看不见
+            let label_text = format!("{peer_name}{status_suffix}：");
+            let label_width = usize::from(display_width(&label_text));
+            let label_pieces: Vec<String> = if label_width > body_width {
+                wrap_by_display_width(&label_text, body_width as u16)
+            } else {
+                Vec::new()
+            };
+            for (line_index, piece) in label_pieces.iter().enumerate() {
+                rows.push((
+                    (is_current && line_index == 0).then_some(index),
+                    Line::from(vec![
+                        Span::raw(if is_current && line_index == 0 {
+                            "> "
+                        } else {
+                            "  "
+                        }),
+                        Span::styled(piece.clone(), Style::default().fg(entry_color)),
+                    ]),
+                ));
+            }
+            // 与人名同排时正文按人名宽度缩进；人名另起一行时正文顶格
+            let same_row_label = label_pieces.is_empty();
+            let indentation = if same_row_label { label_width } else { 0 };
+            for (line_index, message_line) in message_lines.iter().enumerate() {
+                rows.push((
+                    (is_current && same_row_label && line_index == 0).then_some(index),
+                    Line::from(vec![
+                        Span::raw(if is_current && same_row_label && line_index == 0 {
+                            "> "
+                        } else {
+                            "  "
+                        }),
+                        Span::styled(
+                            if line_index == 0 && same_row_label {
+                                label_text.clone()
+                            } else {
+                                " ".repeat(indentation)
+                            },
+                            Style::default().fg(entry_color),
+                        ),
+                        Span::styled(message_line.clone(), Style::default().fg(body_color)),
+                    ]),
+                ));
+            }
+        }
+
+        // 底部提示同样按面板内宽折行，并把占用的真实行数算进面板高度（英文文案比面板还宽时会被裁）
+        let hint_block = wrapped_hint_text(
+            &hint_text,
+            hint_style(appearance.hint_text),
+            panel_width.saturating_sub(4).max(1),
+        );
+        let hint_rows = hint_block.lines.len().max(1) as u16;
+        let panel_height = (rows.len() as u16 + 3 + hint_rows)
+            .min(area.height.saturating_sub(2))
+            .max(7);
+        let panel_rect = centered_rect(panel_width, panel_height, area);
         self.clear_overlay_area(frame, panel_rect);
-
-        let block = Block::default()
-            .title(format!(" {} ", self.t("pending_requests_title")))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.appearance.room_border));
-
-        let inner = panel_rect.inner(ratatui::layout::Margin {
+        frame.render_widget(overlay_frame_block(&appearance, &panel_title), panel_rect);
+        let inner = panel_rect.inner(Margin {
             vertical: 1,
             horizontal: 1,
         });
+        let [list_area, hint_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(hint_rows)]).areas(inner);
+        let visible_rows = usize::from(list_area.height.max(1));
+        // 选中条目不在可视范围时把它滚到最后一行；标题行不算条目，所以按行的条目归属查找
+        let selected_row = rows
+            .iter()
+            .position(|(entry_index, _)| *entry_index == Some(selected));
+        let scroll_offset = match selected_row {
+            Some(row) if row >= visible_rows.saturating_sub(1) => {
+                row - visible_rows.saturating_sub(1) + 1
+            }
+            _ => 0,
+        };
+        let list = Paragraph::new(Text::from(
+            rows.into_iter()
+                .map(|(_, line)| line)
+                .collect::<Vec<Line>>(),
+        ))
+        .scroll((scroll_offset as u16, 0))
+        .style(Style::default().bg(appearance.app_background));
+        frame.render_widget(list, list_area);
 
-        let layout = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(inner);
+        // 只提示 d 这个非通用键位（Enter/Esc 属通用键，按快捷键提示规范不再列出）
+        frame.render_widget(
+            Paragraph::new(hint_block).alignment(Alignment::Center),
+            hint_area,
+        );
+    }
 
-        if self.pending_requests.is_empty() {
-            let empty_hint = Paragraph::new(Text::raw(self.t("no_pending_requests")))
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(self.appearance.hint_text));
-            frame.render_widget(block, panel_rect);
-            frame.render_widget(empty_hint, layout[0]);
-        } else {
-            let items: Vec<ListItem> = self
-                .pending_requests
-                .iter()
-                .map(|request| {
-                    let sender_name = request
-                        .sender
-                        .as_ref()
-                        .map(|sender| sender.username.clone())
-                        .unwrap_or_else(|| self.t("unknown_user").to_string());
-                    let encryption_mark = if request.is_encrypted {
-                        self.t("encrypted_mark")
-                    } else {
-                        String::new()
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            sender_name.to_string(),
-                            Style::default().fg(self.appearance.other_username_text),
-                        ),
-                        Span::styled(
-                            format!("：{}{encryption_mark}", request.message),
-                            Style::default().fg(self.appearance.message_text),
-                        ),
-                    ]))
-                })
-                .collect();
-            let list = List::new(items)
-                .block(block)
-                .highlight_style(
-                    Style::default()
-                        .fg(self.appearance.selected_text)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol("► ");
-            frame.render_stateful_widget(list, layout[0], &mut self.request_list_state);
-        }
-
-        // 仅提示 d 这个非通用键位（Enter/Esc 属通用键，按快捷键提示规范不再列出）
-        let hint = Paragraph::new(Text::raw(self.t("hint_pending_requests")))
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(self.appearance.hint_text));
-        frame.render_widget(hint, layout[1]);
+    /// 请求状态的本地化文案：服务端给的是小写英文状态串，未知状态原样显示。
+    fn request_status_label(&self, status: &str) -> String {
+        let key = match status {
+            "pending" => "request_status_pending",
+            "accepted" => "request_status_accepted",
+            "declined" => "request_status_declined",
+            "expired" => "request_status_expired",
+            "cancelled" => "request_status_cancelled",
+            other => return other.to_string(),
+        };
+        self.t(key)
     }
 
     /// 在右上角渲染通知弹窗列，每条一个带边框小面板，依次向下堆叠
     fn render_notifications(&self, frame: &mut Frame, area: Rect) {
         let margin_between = 1u16;
-        // 整列统一宽度：按最长文本的显示宽度折算并套用最小宽度与半屏上限，保证各来源提示外观一致
-        let longest_length = self
+        // 列宽按"所有提示里最宽的那一行"折算：此前用的是整段文本的总宽度
+        // （多行提示会把宽度算得虚高），且上限只有半屏，结果单行长文本既撑不开面板、
+        // 又因为高度算错被整条丢弃，小屏幕上就看不到内容。
+        let longest_line = self
             .notifications
             .iter()
-            .map(|(text, _, _)| display_width(text))
+            .map(|(text, _, _)| longest_line_width(text))
             .max()
             .unwrap_or(0);
-        let max_width = (area.width / 2).max(28);
-        let lower_width = 28u16.min(max_width);
-        let column_width = (longest_length + 4).clamp(lower_width, max_width);
-        let inner_width = column_width.saturating_sub(4).max(1);
+        // 允许用到屏宽三分之二（至少 28 列），窄终端上也至少给一行的容身之处
+        let preferred_width = area.width.saturating_sub(2).clamp(28, 60);
+        let column_width = (longest_line + 4).clamp(28u16.min(preferred_width), preferred_width);
+        let inner_width = column_width.saturating_sub(2).max(1);
         let mut next_top = area.y + 1;
 
         for (text, is_error, _) in &self.notifications {
-            // 行数按 CJK 双列的显示宽度估算，与终端网格一致，避免折行文本被裁切
-            // 同时统计显式换行符，确保包含 \n 的文本（如 /list 输出）有足够面板高度
-            let text_length = display_width(text);
-            let explicit_newlines = text.chars().filter(|&c| c == '\n').count() as u16;
-            let wrapped_lines = text_length.div_ceil(inner_width).max(1);
-            let line_count = wrapped_lines.max(explicit_newlines + 1);
-            // 多行时额外预留一行：按词边界折行可能早于列宽上限换行；
-            // 单行保持三行高度维持整列观感
-            let panel_height = if line_count > 1 { line_count + 3 } else { 3 };
-
-            let panel_x = area.x + area.width.saturating_sub(column_width + 1);
-            if next_top + panel_height > area.y + area.height {
+            // 逐行按显示宽度估行：显式换行与折行都要计入，否则多行提示会被裁切
+            let line_count = estimated_wrapped_line_count(text, inner_width);
+            // 额外留一行：按词边界折行可能早于列宽上限换行
+            let needed_height = line_count + 3;
+            let available_height = (area.y + area.height).saturating_sub(next_top);
+            if available_height < 3 {
+                // 连最小的带框面板都放不下，剩下的旧提示本轮就不显示（到期会自动清除）
                 break;
             }
+            let panel_height = needed_height.min(available_height);
+            let panel_x = area.x + area.width.saturating_sub(column_width + 1);
             let panel_rect = Rect::new(panel_x, next_top, column_width, panel_height);
 
             // 错误类边框用外观的报错边框色，信息类用提示边框色；标题同步取色
@@ -6153,6 +7805,838 @@ impl App {
             next_top += panel_height + margin_between;
         }
     }
+}
+
+// ==================== 顶栏连接状态、消息缓存、头像、账户资料与更新 ====================
+
+/// 头像原始文件的本地缓存路径。图片本身可再生（服务端那份才是正本），
+/// 存在 `<客户端目录>/cache/avatar/<用户 ID>.img`，卸载时可一并清掉。
+fn avatar_cache_path(user_id: &str) -> Option<PathBuf> {
+    let safe_name: String = user_id
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => character,
+            _ => '_',
+        })
+        .collect();
+    Some(paths::avatar_directory()?.join(format!("{safe_name}.img")))
+}
+
+/// 读已缓存的头像字节
+fn load_cached_avatar(user_id: &str) -> Option<Vec<u8>> {
+    fs::read(avatar_cache_path(user_id)?).ok()
+}
+
+/// 删掉某个用户的头像字节：换头像之后旧字节就是错的，只能重新拉
+fn drop_cached_avatar(user_id: &str) {
+    if let Some(path) = avatar_cache_path(user_id) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// 写头像缓存（目录建不出来或磁盘写失败都只影响下次要多下载一次，不报错给用户）
+fn store_cached_avatar(user_id: &str, bytes: &[u8]) {
+    let Some(path) = avatar_cache_path(user_id) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, bytes);
+}
+
+/// 头像网格的最大尺寸（单元格列数、行数）。一格用半块字符 `▀` 承载上下两个像素，
+/// 而终端单元格本身约是 1:2 的宽高比，所以列数取行数两倍时画出来才是正方形：
+/// 32 列 × 16 行即 32×32 像素。卡片是专门看人的地方，尺寸要给到能辨认脸型与配色；
+/// 消息区不再画头像，因此这个尺寸只影响卡片一处。
+fn profile_avatar_cells() -> (usize, usize) {
+    (32, 16)
+}
+
+/// 在给定可用区里定头像网格：始终保证"列数 = 行数的两倍"，只整体降档不改比例。
+/// 源图先被裁成正方形再按"列 × 行×2"像素重采样，所以列数不等于行数两倍时
+/// （老做法：面板一变窄就只裁列数、行数仍按 16 走）圆脸就会被压成竖长方形。
+fn avatar_grid_within(columns_available: u16, rows_available: u16) -> (u16, u16) {
+    let (wanted_columns, wanted_rows) = profile_avatar_cells();
+    let wanted_columns = wanted_columns as u16;
+    let wanted_rows = wanted_rows as u16;
+    // 一行单元格装上下两个像素，所以"列 = 行 × 2"才对应正方形像素块：
+    // 先用可用宽度与可用高度夹出行数，列数再由行数推出，比例恒定
+    let rows = wanted_rows
+        .min(wanted_columns.min(columns_available.max(2)) / 2)
+        .min(rows_available.max(1))
+        .max(1);
+    (rows * 2, rows)
+}
+
+impl App {
+    /// 客户端版本：编译期取自本包的 Cargo.toml，顶栏与 `--version` 共用同一来源。
+    pub fn client_version() -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// 核心库版本：与客户端版本各自独立演进，顶栏与 `--version` 一并报出便于定位问题。
+    pub fn core_version() -> String {
+        baihua_core::core_version().to_string()
+    }
+
+    /// 顶栏连接标记与"连不上服务器只提示一次"共用这一处状态更新：
+    /// 跳变为断开时弹一条错误、由断到通时弹一条恢复提示，持续态只反映在顶栏上，不再重复弹框。
+    fn update_connection_state(&mut self, online: bool) {
+        let previous = self.connection_ready;
+        if previous == Some(online) {
+            return;
+        }
+        self.connection_ready = Some(online);
+        if online {
+            // 只有"此前明确断开过"才报恢复；首次探测到连通不打扰用户（登录另有提示）
+            if previous == Some(false) {
+                self.push_notification(self.t("connection_restored"));
+            }
+        } else {
+            self.push_error(self.t("error_server_unreachable"));
+        }
+    }
+
+    /// 启动时探测一次服务端：既为顶栏取到服务端版本串（未登录也要能显示），
+    /// 也为"能不能连上"给出初始标记。
+    pub fn probe_server_at_startup(&mut self) {
+        match self.connector.probe_version() {
+            Ok((version, raw_version)) => {
+                if version == ApiVersion::Unknown {
+                    self.push_notification(
+                        self.t("api_version_unknown")
+                            .replace("{version}", &raw_version),
+                    );
+                }
+                self.update_connection_state(true);
+            }
+            Err(error) => {
+                debug_log(&format!("启动探测失败: {error}"));
+                self.connector.clear_server_version();
+                self.update_connection_state(false);
+            }
+        }
+    }
+
+    /// 启动常驻的服务端可达性探测线程：与登录态无关，退出登录后照样工作，
+    /// 所以"登出就提示断开"这类误报不会再出现。
+    /// 连续两次探测失败才判离线（登录瞬间一串请求挤在一起、服务端刚重启都可能让
+    /// 单次探测超时），一次成功即恢复。
+    pub fn start_reachability_watch(&mut self) {
+        // 换服务器地址后要重新起一轮：旧线程探的是旧地址，留着就会把两条结论混着报
+        if let Some(previous) = self.reachability_running.take() {
+            previous.store(false, Ordering::Relaxed);
+        }
+        let Some(sender) = self.polling_sender.clone() else {
+            return;
+        };
+        let connector = self.connector.clone();
+        let running_flag = Arc::new(AtomicBool::new(true));
+        self.reachability_running = Some(running_flag.clone());
+        thread::spawn(move || {
+            let mut failed_in_a_row = 0usize;
+            while running_flag.load(Ordering::Relaxed) {
+                let reachable = connector.probe_reachable();
+                if reachable {
+                    failed_in_a_row = 0;
+                } else {
+                    failed_in_a_row += 1;
+                }
+                // 首次成功、以及连续第二次失败才上报，中间的单次抖动不惊动界面
+                if reachable || failed_in_a_row == 2 {
+                    debug_log(&format!("服务端可达性探测: {reachable}"));
+                    if sender
+                        .send(PollingEvent::ReachabilityChanged(reachable))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
+
+    /// 后台检查新版本：发现新版本就下载并校验，只有包真的取回本地才弹通知——
+    /// 通知一出现就意味着"现在 /update 可以立刻完成"，不会出现提示了却还要等下载。
+    /// 检查失败（无网络、发布页改版、本平台没有包）只记调试日志，不打扰用户。
+    pub fn start_update_check_thread(&mut self, current_version: String) {
+        let Some(sender) = self.polling_sender.clone() else {
+            return;
+        };
+        // 正在查就不再起第二个：/update 可以再按一次，两条线程同时下载同一个包没有意义
+        if self
+            .update_check_running
+            .as_ref()
+            .is_some_and(|running| running.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let running_flag = Arc::new(AtomicBool::new(true));
+        self.update_check_running = Some(running_flag.clone());
+        thread::spawn(move || {
+            match check_for_update(&current_version) {
+                UpdateCheck::Available(package) => {
+                    debug_log(&format!("发现新版本 {}，开始下载", package.version));
+                    match download_package(&package) {
+                        Ok(archive_path) => {
+                            let _ = sender
+                                .send(PollingEvent::UpdateReady((package.version, archive_path)));
+                        }
+                        Err(error) => debug_log(&format!("新版本下载或校验失败: {error}")),
+                    }
+                }
+                UpdateCheck::UpToDate {
+                    newest_tag,
+                    newest_assets,
+                } => debug_log(&format!(
+                    "客户端已是最新版本（发布页最新标签 {newest_tag}，附件 {newest_assets:?}）"
+                )),
+                UpdateCheck::Unavailable(reason) => debug_log(&format!("版本检查未完成: {reason}")),
+            }
+            // 检查与下载都结束了才落标志，其间重复按 /update 不会派出第二个下载线程
+            running_flag.store(false, Ordering::Relaxed);
+        });
+    }
+
+    /// 会话建立后要做的公共准备（正常登录、自动登录两条入口都走这里）：
+    /// 顶栏用户名、本地消息缓存目录、自己的头像。用户目录不在这里拉，
+    /// 它只在用户真的打出 "/profile " 时才取，登录瞬间不该为它翻页。
+    /// 用户名以登录响应为准；只有令牌没有响应的自动登录再按 UID 查一次资料。
+    fn prepare_session_state(&mut self, known_username: Option<String>) {
+        let user_id = match self.current_user_id.clone() {
+            Some(user_id) => user_id,
+            None => return,
+        };
+        self.current_username = known_username.unwrap_or_default();
+        if self.current_username.is_empty() {
+            self.current_username = self
+                .connector
+                .get_user_profile(&user_id)
+                .map(|profile| profile.username)
+                .unwrap_or_default();
+        }
+        self.ensure_chat_cache();
+        self.request_missing_avatars(std::slice::from_ref(&user_id));
+        // 预取注册用户目录：/profile 的参数补全要用它，等用户打出来再拉就总是慢一帧
+        self.ensure_registered_users_loaded();
+    }
+
+    /// 为当前登录用户建立消息缓存目录（登录成功、自动登录后调用；未登录时保持无缓存）。
+    fn ensure_chat_cache(&mut self) {
+        if self.chat_cache.is_some() {
+            return;
+        }
+        let Some(user_id) = self.current_user_id.clone() else {
+            return;
+        };
+        self.chat_cache = ChatCache::open(&user_id);
+    }
+
+    /// 取指定房间的加密标志：加密房间的消息一律不进本地缓存。
+    fn room_is_encrypted(&self, room_id: &str) -> bool {
+        self.rooms
+            .iter()
+            .any(|room| room.id == room_id && room.is_encrypted)
+    }
+
+    /// 整房写入缓存（切房加载、触顶翻页、全量搜索之后）。加密房间直接跳过。
+    fn cache_loaded_messages(&self, room_id: &str) {
+        if room_id.is_empty() || self.room_is_encrypted(room_id) {
+            return;
+        }
+        let Some(cache) = &self.chat_cache else {
+            return;
+        };
+        // 内存里的列表必须确实是这个房间的才落盘：切换房间的瞬间 messages 可能还是
+        // 上一个房间的内容，写错房间会把别人的历史混进这个文件
+        let belongs_to_room = self
+            .messages
+            .last()
+            .is_some_and(|message| message.room_id == room_id);
+        if !belongs_to_room {
+            return;
+        }
+        cache.store_room(
+            room_id,
+            &self.messages,
+            self.messages_older_cursor.as_deref(),
+            self.messages_older_cursor.is_some(),
+        );
+    }
+
+    /// 标记"当前房间消息列表比磁盘新"，交给 handle_tick 批量落盘。
+    /// 逐条到达就写一次文件会在活跃群里造成无谓的整文件重写。
+    fn mark_messages_dirty(&mut self) {
+        if self.cache_pending_flush_since.is_none() {
+            self.cache_pending_flush_since = Some(Instant::now());
+        }
+    }
+
+    /// 脏标记超过一个批量窗口后落盘（主循环每轮调用，本身不产生网络请求）。
+    fn flush_pending_message_cache(&mut self) {
+        let Some(dirty_since) = self.cache_pending_flush_since else {
+            return;
+        };
+        if dirty_since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.cache_pending_flush_since = None;
+        if let Some(room_id) = self.selected_room_id() {
+            let room_id = room_id.clone();
+            self.cache_loaded_messages(&room_id);
+        }
+    }
+
+    /// 为这批用户补齐头像：本地已有结论（包括"确实没有头像"）的跳过，
+    /// 其余交给后台线程按资料接口取回图片字节，取回后经 AvatarLoaded 交回主线程。
+    /// 渲染期绝不做网络请求，这里只登记待取与派生活。
+    fn request_missing_avatars(&mut self, user_ids: &[String]) {
+        let Some(sender) = self.polling_sender.clone() else {
+            return;
+        };
+        let mut missing: Vec<String> = Vec::new();
+        for user_id in user_ids {
+            if user_id.is_empty() || self.avatar_images.contains_key(user_id) {
+                continue;
+            }
+            // 先占位登记，避免同一批用户在下一帧又被判定为缺失而重复发请求
+            self.avatar_images.insert(user_id.clone(), None);
+            missing.push(user_id.clone());
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let connector = self.connector.clone();
+        thread::spawn(move || {
+            for user_id in missing {
+                let image_bytes = load_cached_avatar(&user_id).or_else(|| {
+                    let bytes = connector
+                        .get_user_profile(&user_id)
+                        .ok()
+                        .and_then(|profile| profile.avatar)
+                        .map(|avatar_path| avatar_path.trim().to_string())
+                        .filter(|avatar_path| !avatar_path.is_empty())
+                        .and_then(|avatar_path| {
+                            connector.fetch_static_resource(&avatar_path).ok()
+                        })?;
+                    store_cached_avatar(&user_id, &bytes);
+                    Some(bytes)
+                });
+                let _ = sender.send(PollingEvent::AvatarLoaded((user_id, image_bytes)));
+            }
+        });
+    }
+
+    /// 取某用户在指定尺寸下的头像像素块（首次用到该尺寸时按已取回的字节解码一次）。
+    /// 没有头像、或字节不是可解码的图片时返回 None，由调用方退回占位显示。
+    fn avatar_pixels_at(
+        &mut self,
+        user_id: &str,
+        columns: usize,
+        rows: usize,
+    ) -> Option<AvatarPixels> {
+        let key = (user_id.to_string(), columns, rows);
+        if let Some(cached) = self.avatar_pixels.get(&key) {
+            return Some(cached.clone());
+        }
+        let image_bytes = self.avatar_images.get(user_id).cloned().flatten()?;
+        let pixels = build_avatar_pixels(&image_bytes, columns, rows)?;
+        self.avatar_pixels.insert(key, pixels.clone());
+        Some(pixels)
+    }
+
+    /// 打开通用表单浮层（设置个人资料、修改密码、修改头像、注销账户共用渲染与按键处理）。
+    fn open_form(&mut self, action: FormAction, fields: Vec<FormField>) {
+        self.active_form = Some((action, fields));
+        self.displaying_overlay = DisplayingOverlay::Form;
+        self.focus_index = 0;
+    }
+
+    /// 提交当前表单：按表单动作分派到对应的服务端接口，成功后关闭浮层。
+    fn submit_active_form(&mut self) {
+        let Some((action, fields)) = self.active_form.clone() else {
+            return;
+        };
+        match action {
+            FormAction::UpdateProfile => self.submit_profile_update(&fields),
+            FormAction::ChangePassword => self.submit_password_change(&fields),
+            FormAction::ChangeAvatar => self.submit_avatar_change(&fields),
+            FormAction::DeleteAccount => self.submit_account_deletion(&fields),
+        }
+    }
+
+    /// 在当前表单的输入项之间循环移动焦点
+    fn cycle_form_focus(&mut self, to_previous: bool) {
+        let field_count = self
+            .active_form
+            .as_ref()
+            .map(|(_, fields)| fields.len())
+            .unwrap_or(0);
+        if field_count == 0 {
+            return;
+        }
+        self.focus_index = if to_previous {
+            (self.focus_index + field_count - 1) % field_count
+        } else {
+            (self.focus_index + 1) % field_count
+        };
+    }
+
+    /// 关闭表单浮层并退回设置菜单
+    fn close_form(&mut self) {
+        self.active_form = None;
+        self.dismiss_overlay_back();
+    }
+
+    /// 设置个人资料：昵称、手机号、简介。输入框留空表示清空该项（服务端按显式 null 处理），
+    /// 未改动时提交原值即可，界面不引入"是否改动过"的额外状态。
+    fn submit_profile_update(&mut self, fields: &[FormField]) {
+        let text_of = |index: usize| fields.get(index).map(FormField::text).unwrap_or_default();
+        let payload = ProfileUpdatePayload {
+            nickname: profile_field_value(&text_of(0)),
+            phone_number: profile_field_value(&text_of(1)),
+            bio: profile_field_value(&text_of(2)),
+            avatar: None,
+        };
+        if payload.nickname.is_none() && payload.phone_number.is_none() && payload.bio.is_none() {
+            self.push_notification(self.t("profile_nothing_to_update"));
+            return;
+        }
+        match self.connector.update_profile(&payload) {
+            Ok(user) => {
+                self.remember_own_profile(&user);
+                self.close_form();
+                self.push_notification(self.t("profile_updated"));
+            }
+            Err(error) => self.push_error(format!(
+                "{}: {error}",
+                self.t("error_profile_update_failed")
+            )),
+        }
+    }
+
+    /// 修改密码：旧密码、新密码、新密码确认。
+    /// 服务端改密会同步作废此前签发的全部令牌，因此成功后必须清掉本地会话重新登录。
+    fn submit_password_change(&mut self, fields: &[FormField]) {
+        let text_of = |index: usize| fields.get(index).map(FormField::text).unwrap_or_default();
+        let old_password = text_of(0);
+        let new_password = text_of(1);
+        if new_password != text_of(2) {
+            self.push_error(self.t("error_password_mismatch"));
+            return;
+        }
+        if old_password.is_empty() || new_password.is_empty() {
+            self.push_error(self.t("error_empty_credentials"));
+            return;
+        }
+        match self.connector.change_password(
+            &crypto::encrypt_login_password(&old_password),
+            &crypto::encrypt_login_password(&new_password),
+        ) {
+            Ok(_) => {
+                self.active_form = None;
+                self.logout();
+                self.displaying_overlay = DisplayingOverlay::Login;
+                self.focus_index = 0;
+                self.push_notification(self.t("password_changed_relogin"));
+            }
+            Err(error) => self.push_error(format!(
+                "{}: {error}",
+                self.t("error_password_change_failed")
+            )),
+        }
+    }
+
+    /// 修改头像：填完整链接走资料接口，填本地图片路径走头像上传接口（服务端只收
+    /// JPEG/PNG/GIF/WebP，大小受服务端配置限制）。
+    fn submit_avatar_change(&mut self, fields: &[FormField]) {
+        let Some(input) = fields.first().map(FormField::text) else {
+            return;
+        };
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            self.push_error(self.t("error_avatar_input_empty"));
+            return;
+        }
+        // 填完整链接走资料接口，其余按本地图片文件走头像上传接口
+        if input.starts_with("http://") || input.starts_with("https://") {
+            let payload = ProfileUpdatePayload {
+                avatar: Some(Some(input)),
+                ..ProfileUpdatePayload::default()
+            };
+            match self.connector.update_profile(&payload) {
+                Ok(user) => self.finish_avatar_change(&user),
+                Err(error) => {
+                    self.push_error(format!("{}: {error}", self.t("error_avatar_update_failed")))
+                }
+            }
+            return;
+        }
+        // 填的是本地路径：与列表选择走同一条上传路（读不到的文案也共用）
+        self.upload_local_avatar(&PathBuf::from(&input));
+    }
+
+    /// 头像换好了：先废掉自己的旧头像字节（内存与磁盘），再记下服务端返回的完整资料。
+    /// 磁盘那份必须删：`request_missing_avatars` 的后台线程先读盘再请求，
+    /// 留着就会永远显示第一次缓存下来的那张 —— 换成 URL 头像也一样。
+    fn finish_avatar_change(&mut self, user: &UserInfo) {
+        drop_cached_avatar(&user.id);
+        self.remember_own_profile(user);
+        self.close_form();
+        self.push_notification(self.t("avatar_updated"));
+    }
+
+    /// 注销账户：再输入一次密码。成功后清空本地一切残留（会话、缓存、头像）。
+    fn submit_account_deletion(&mut self, fields: &[FormField]) {
+        let Some(password) = fields.first().map(FormField::text) else {
+            return;
+        };
+        if password.is_empty() {
+            self.push_error(self.t("error_empty_credentials"));
+            return;
+        }
+        match self
+            .connector
+            .delete_account(&crypto::encrypt_login_password(&password))
+        {
+            Ok(_) => {
+                if let Some(cache) = &self.chat_cache {
+                    cache.clear_all();
+                }
+                self.chat_cache = None;
+                self.avatar_images.clear();
+                self.avatar_pixels.clear();
+                self.active_form = None;
+                self.logout();
+                self.displaying_overlay = DisplayingOverlay::Nothing;
+                self.push_notification(self.t("account_deleted"));
+            }
+            Err(error) => self.push_error(format!(
+                "{}: {error}",
+                self.t("error_account_delete_failed")
+            )),
+        }
+    }
+
+    /// 服务端返回的完整用户对象落到本地：顶栏用户名与自己头像的显示都取自它。
+    /// 头像可能刚被改掉，因此丢掉自己的旧头像结果重新按资料接口取一次，
+    /// 否则界面上还会继续显示上一张。
+    fn remember_own_profile(&mut self, user: &UserInfo) {
+        self.current_username = user.username.clone();
+        self.own_contact = Some((
+            user.email.clone(),
+            user.phone_number.clone().unwrap_or_default(),
+        ));
+        self.avatar_images.remove(&user.id);
+        self.avatar_pixels
+            .retain(|(cached_user_id, _, _), _| cached_user_id != &user.id);
+        let own_user_id = user.id.clone();
+        self.request_missing_avatars(std::slice::from_ref(&own_user_id));
+    }
+
+    /// /profile [用户名或 UID]：无参看自己，有参看指定用户，以卡片浮层展示（含头像）。
+    fn show_profile_card(&mut self, user_key: Option<&str>) {
+        let lookup_key = match user_key {
+            Some(key) if !key.is_empty() => key.to_string(),
+            _ => match self.current_user_id.clone() {
+                Some(user_id) => user_id,
+                None => {
+                    self.push_notification(self.t("error_not_logged_in"));
+                    return;
+                }
+            },
+        };
+        match self.connector.get_user_profile(&lookup_key) {
+            Ok(profile) => {
+                // 卡片上的头像是大图，尺寸与消息区不同，需要单独取一次字节并按大尺寸解码
+                self.avatar_images.remove(&profile.id);
+                self.request_missing_avatars(std::slice::from_ref(&profile.id));
+                self.profile_view = Some(profile);
+                self.displaying_overlay = DisplayingOverlay::ProfileCard;
+            }
+            Err(error) => {
+                self.push_error(format!("{}: {error}", self.t("error_profile_not_found")))
+            }
+        }
+    }
+
+    /// 确保用户目录已在后台发起拉取：只在从没拉过时派生活，之后无论成功失败都不再重复请求。
+    /// 由"打出 /profile 加空格"这次按键触发，补全面板首帧可能还是空的，取回后自动填上。
+    fn ensure_registered_users_loaded(&mut self) {
+        if self.registered_users.is_some() {
+            return;
+        }
+        // 先占位再拉取，避免同一帧之后再次进入本方法重复派线程
+        self.registered_users = Some(Vec::new());
+        let Some(sender) = self.polling_sender.clone() else {
+            return;
+        };
+        let connector = self.connector.clone();
+        thread::spawn(move || match connector.list_all_users() {
+            Ok(users) => {
+                let _ = sender.send(PollingEvent::RegisteredUsersUpdated(users));
+            }
+            Err(error) => debug_log(&format!("拉取用户目录失败: {error}")),
+        });
+    }
+
+    /// /list_users：列出服务端全部注册用户（用户名与 UID 同行显示）。
+    fn show_registered_users(&mut self) {
+        match self.connector.list_all_users() {
+            Ok(users) => {
+                self.registered_users = Some(users.clone());
+                if users.is_empty() {
+                    self.push_notification(self.t("list_users_empty"));
+                    return;
+                }
+                let lines: Vec<String> = users
+                    .iter()
+                    .map(|user| format!("{} - {}", user.username, user.id))
+                    .collect();
+                let title = self
+                    .t("list_users_title")
+                    .replace("{count}", &lines.len().to_string());
+                self.push_notification(format!("{title}\n{}", lines.join("\n")));
+            }
+            Err(error) => {
+                self.push_error(format!("{}: {error}", self.t("error_list_users_failed")))
+            }
+        }
+    }
+
+    /// /search_users <关键字>：按用户名子串或 UID 精确查用户。
+    fn search_registered_users(&mut self, keyword: &str) {
+        if keyword.is_empty() {
+            self.push_notification(self.t("search_users_usage"));
+            return;
+        }
+        match self.connector.search_users(keyword) {
+            Ok(users) => {
+                if users.is_empty() {
+                    self.push_notification(
+                        self.t("search_users_empty")
+                            .replace("{keyword}", keyword)
+                            .to_string(),
+                    );
+                    return;
+                }
+                let lines: Vec<String> = users
+                    .iter()
+                    .map(|user| format!("{} - {}", user.username, user.id))
+                    .collect();
+                let title = self
+                    .t("search_users_title")
+                    .replace("{keyword}", keyword)
+                    .replace("{count}", &lines.len().to_string());
+                self.push_notification(format!("{title}\n{}", lines.join("\n")));
+            }
+            Err(error) => {
+                self.push_error(format!("{}: {error}", self.t("error_search_users_failed")))
+            }
+        }
+    }
+
+    /// 私聊管理浮层里的全部条目：(是否自己发出的, 请求条目)。收到的在前、发出的在后，
+    /// 上下键在两个区之间连续移动，因此渲染与按键都用同一份扁平序列定位选中项。
+    fn request_entries(&self) -> Vec<(bool, RoomRequestInfo)> {
+        let mut entries: Vec<(bool, RoomRequestInfo)> = self
+            .pending_requests
+            .iter()
+            .map(|request| (false, request.clone()))
+            .collect();
+        entries.extend(
+            self.sent_requests
+                .iter()
+                .map(|request| (true, request.clone())),
+        );
+        entries
+    }
+
+    /// 服务端不为"请求被处理"广播事件，只能从"我发出的请求"的状态变化里看出来：
+    /// 上一轮还是待处理、这一轮变成已拒绝的，给发出者补一条通知。
+    fn announce_declined_invitations(&mut self, latest: &[RoomRequestInfo]) {
+        let mut notices: Vec<String> = Vec::new();
+        for previous in &self.sent_requests {
+            if previous.status.as_deref() != Some("pending") {
+                continue;
+            }
+            let Some(current) = latest.iter().find(|request| request.id == previous.id) else {
+                continue;
+            };
+            if current.status.as_deref() != Some("declined") {
+                continue;
+            }
+            let receiver_name = current
+                .receiver
+                .as_ref()
+                .map(|peer| peer.username.clone())
+                .unwrap_or_else(|| self.t("unknown_user"));
+            notices.push(
+                self.t("request_declined_notice")
+                    .replace("{user}", &receiver_name),
+            );
+        }
+        for notice in notices {
+            self.push_notification(notice);
+        }
+    }
+
+    /// 撤回自己发出的私聊请求：服务端把请求置为 cancelled，对方不会再看到它。
+    fn cancel_sent_request(&mut self, request_id: &str) {
+        match self.connector.cancel_room_request(request_id) {
+            Ok(_) => {
+                self.push_notification(self.t("request_cancelled"));
+                self.mark_sent_request_cancelled(request_id);
+                if let Some(index) = self.request_list_state.selected()
+                    && index >= self.request_entries().len()
+                {
+                    self.request_list_state
+                        .select(if self.request_entries().is_empty() {
+                            None
+                        } else {
+                            Some(index.min(self.request_entries().len() - 1))
+                        });
+                }
+            }
+            Err(error) => self.push_error(format!(
+                "{}: {error}",
+                self.t("error_cancel_request_failed")
+            )),
+        }
+    }
+
+    /// /update 与设置项"更新客户端"：用已下载并校验过的更新包安排替换，本进程随后退出，
+    /// 让位给安装进程。安装进程会等本进程号消失再动文件，避免 Windows 上
+    /// "正被占用的可执行文件无法覆盖"。
+    /// 包还没回来时不能在这里同步下载——下载要占满整个界面线程，
+    /// 所以改成再补派一次后台检查，取回后照常弹通知，用户稍后再执行即可。
+    fn start_downloaded_update(&mut self) -> bool {
+        let Some((version, archive_path)) = self.pending_update.clone() else {
+            self.start_update_check_thread(Self::client_version());
+            self.push_notification(self.t("update_not_ready"));
+            return false;
+        };
+        let staged_directory = match paths::update_directory() {
+            Some(directory) => directory.join(format!("staged-{version}")),
+            None => {
+                self.push_error(self.t("error_update_directory_unavailable"));
+                return false;
+            }
+        };
+        if let Err(error) = crate::installer::extract_archive(&archive_path, &staged_directory) {
+            self.push_error(format!(
+                "{}: {error}",
+                self.t("error_update_extract_failed")
+            ));
+            return false;
+        }
+        let Some(prefix) = crate::installer::current_prefix() else {
+            self.push_error(self.t("error_update_prefix_unavailable"));
+            return false;
+        };
+        let request = crate::installer::InstallRequest {
+            source_directory: staged_directory,
+            prefix,
+            wait_for_process: Some(std::process::id()),
+        };
+        match crate::installer::spawn_detached_installer(&request) {
+            Ok(()) => {
+                self.update_handoff_requested = true;
+                true
+            }
+            Err(error) => {
+                self.push_error(format!("{}: {error}", self.t("error_update_start_failed")));
+                false
+            }
+        }
+    }
+
+    /// 主循环退出判定：/update 已把安装进程挂起，本进程要立即让位
+    pub fn should_exit_for_update(&self) -> bool {
+        self.update_handoff_requested
+    }
+}
+
+/// 资料字段取值：有内容就按新值写入，留空则这一项不进请求体（服务端语义是"缺省=保持原值"）。
+/// 表单打开时已把服务端现值预填进来，所以"不改"就是"原样提交"，不需要额外的清空写法。
+fn profile_field_value(text: &str) -> Option<Option<String>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(Some(trimmed.to_string()))
+    }
+}
+
+/// 读本地图片文件用于上传：只认服务端接受的四种格式，其余返回 None 由调用方提示用户。
+/// 服务端另有自己的大小上限（默认 2 MB，可配置），这里只挡明显离谱的体积，
+/// 免得用户误填一个几百兆的文件时整份读进内存；真正的限额交给服务端回答。
+fn read_local_image(path: &std::path::Path) -> Option<(String, String, Vec<u8>)> {
+    let content_type = image_content_type_of(path)?;
+    if fs::metadata(path)
+        .map(|metadata| metadata.len() > 8 * 1024 * 1024)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let file_name = path.file_name()?.to_str()?.to_string();
+    Some((file_name, content_type.to_string(), bytes))
+}
+
+/// 服务端接受的四类图片格式 → multipart 里的 CONTENT_TYPE。
+/// 目录列表与上传共用这一处判定，列出来能选的就一定能传。
+fn image_content_type_of(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// 用户自备头像的目录：不存在就建出来，用户照着这个路径放图片即可。
+/// 启动时与每次进入头像浮层时各保证一次，渲染路径不碰磁盘创建。
+pub(crate) fn ensure_avatar_source_directory() {
+    if let Some(directory) = baihua_core::paths::avatar_source_directory() {
+        let _ = fs::create_dir_all(directory);
+    }
+}
+
+/// 头像目录里可选的图片，元素为 (展示用的文件名, 上传用的完整路径)，按文件名排序。
+/// 目录读不到或没有图片时返回空表，由调用方退回填链接的表单。
+fn local_avatar_files() -> Vec<(String, PathBuf)> {
+    match baihua_core::paths::avatar_source_directory() {
+        Some(directory) => avatar_files_in(&directory),
+        None => Vec::new(),
+    }
+}
+
+/// 列出指定目录里的可上传图片。格式判定与上传共用 `image_content_type_of`，
+/// 列出来能被选中的文件就一定传得上去；子目录与读不到的条目直接跳过。
+fn avatar_files_in(directory: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(String, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            image_content_type_of(&path).map(|_| (name, path))
+        })
+        .collect();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
 }
 
 #[cfg(test)]
@@ -6352,6 +8836,1047 @@ mod tests {
         app
     }
 
+    #[test]
+    fn status_bar_shows_connection_user_and_versions_with_documented_omissions() {
+        let mut app = chat_page_app_for_render("default");
+        // 未探测过连接状态：按离线画空心点，且不显示服务端版本
+        let (connection_label, mark, user_text, right) = app.status_bar_texts();
+        assert_eq!(mark, "○");
+        assert_eq!(connection_label, app.t("bar_connection"));
+        assert!(user_text.is_empty(), "未登录不该显示当前用户");
+        assert!(!right.contains(&app.t("bar_server_version")));
+        assert!(right.contains(&app.t("bar_client_version")));
+        assert!(right.contains(&App::client_version()));
+
+        // 连上但未探测到版本串：仍然不显示服务端版本
+        app.connection_ready = Some(true);
+        let (_, online_mark, _, right_without_version) = app.status_bar_texts();
+        assert_eq!(online_mark, "●");
+        assert!(!right_without_version.contains(&app.t("bar_server_version")));
+
+        // 登录后显示当前用户名，且标记仍夹在"连接"与用户名之间（顶栏顺序即语义顺序）
+        app.current_username = "alice".to_string();
+        let (label, mark, user_text, _) = app.status_bar_texts();
+        assert_eq!(label, app.t("bar_connection"));
+        assert_eq!(mark, "●");
+        assert!(user_text.contains("alice"));
+        assert!(user_text.contains(&app.t("bar_current_user")));
+        let assembled = format!("{label} {mark}{user_text}");
+        assert!(
+            assembled.find(&app.t("bar_connection")).unwrap() < assembled.find("●").unwrap(),
+            "圆点必须紧跟在连接标签之后，不能被用户名推到行尾"
+        );
+        assert!(
+            assembled.contains("●  |  当前用户 alice"),
+            "实际拼接: {assembled}"
+        );
+    }
+
+    #[test]
+    fn editing_search_keyword_backwards_drops_the_previous_result_set() {
+        let mut app = chat_page_app_for_render("default");
+        app.input_collector.message_input_state.set_text("#hello");
+        app.search_result = Some(("hello".to_string(), vec!["message-1".to_string()], 0));
+        // 用退格删掉一个字母：结果不再成立，命中列表与定位一起清掉
+        app.input_collector.message_input_state.set_text("#hell");
+        app.handle_message_input_changed();
+        assert!(
+            app.search_result.is_none(),
+            "改动关键词后应丢弃上次搜索结果"
+        );
+        assert!(app.pending_scroll_message_id.is_none());
+        // 标题回到"搜索模式"，既不显示旧进度也不显示"未找到"
+        let (title, _) = app.message_input_title();
+        let rendered = title
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains(&app.t("search_mode")));
+        assert!(!rendered.contains(&app.t("search_progress")));
+    }
+
+    #[test]
+    fn quick_search_recomputes_instead_of_dropping_results() {
+        let mut app = chat_page_app_for_render("default");
+        app.quick_search = true;
+        app.input_collector.message_input_state.set_text("#hel");
+        app.handle_message_input_changed();
+        let early = app.search_result.clone().expect("快速搜索应即时给出结果");
+        assert_eq!(early.1, vec!["message-1".to_string()]);
+        app.input_collector.message_input_state.set_text("#hello");
+        app.handle_message_input_changed();
+        let refined = app
+            .search_result
+            .clone()
+            .expect("改关键词后应重扫而不是清空");
+        assert_eq!(refined.0, "hello".to_string());
+    }
+
+    #[test]
+    fn notification_panel_clips_to_screen_instead_of_vanishing() {
+        let mut app = chat_page_app_for_render("default");
+        // 十条六十列长文本，在小屏幕上按旧算法高度会算超屏幕而整条不画
+        let long_body = (0..10)
+            .map(|index| format!("{index} 一六〇列宽的长文本占位。").repeat(4))
+            .collect::<Vec<String>>()
+            .join("\n");
+        app.push_notification(long_body.clone());
+        let buffer = render_snapshot(&mut app, 50, 12);
+        let first_line = long_body.lines().next().unwrap_or_default();
+        let visible_head: String = first_line.chars().take(6).collect();
+        assert!(
+            buffer_contains(&buffer, &visible_head),
+            "提示框在小屏幕上被整体丢弃了，长文本没能自适应"
+        );
+    }
+
+    #[test]
+    fn settings_menu_covers_account_operations_and_marks_destructive_ones() {
+        let app = chat_page_app_for_render("default");
+        let entries = app.settings_menu_entries();
+        let labels: Vec<String> = entries.iter().map(|(label, _, _)| label.clone()).collect();
+        for key in [
+            "option_edit_profile",
+            "option_change_password",
+            "option_change_avatar",
+            "option_update_client",
+            "option_delete_account",
+        ] {
+            assert!(
+                labels.iter().any(|label| label.contains(&app.t(key))),
+                "设置菜单缺少条目 {key}"
+            );
+        }
+        let delete_entry = entries
+            .iter()
+            .find(|(label, _, _)| label.contains(&app.t("option_delete_account")))
+            .expect("应有删除账户条目");
+        assert_eq!(
+            delete_entry.1, app.appearance.notice_error_border,
+            "删除账户必须用报错色显示"
+        );
+        assert_eq!(
+            delete_entry.2,
+            SettingsAction::OpenForm(FormAction::DeleteAccount)
+        );
+        // 每一项都要有标签：分派直接读这张表，不再有需要对齐的索引常量
+        assert!(
+            entries.iter().all(|(label, _, _)| !label.trim().is_empty()),
+            "菜单项标签不该为空"
+        );
+    }
+
+    #[test]
+    fn request_overlay_lists_sent_invitations_with_their_status() {
+        let mut app = chat_page_app_for_render("default");
+        app.pending_requests = vec![RoomRequestInfo {
+            id: "request-in".to_string(),
+            message: "加个好友".to_string(),
+            is_encrypted: false,
+            created_at: String::new(),
+            sender: Some(baihua_core::api::RoomRequestPeer {
+                user_id: "user-other".to_string(),
+                username: "bob".to_string(),
+                nickname: None,
+            }),
+            receiver: None,
+            status: Some("pending".to_string()),
+        }];
+        app.sent_requests = vec![RoomRequestInfo {
+            id: "request-out".to_string(),
+            message: "你好".to_string(),
+            is_encrypted: false,
+            created_at: String::new(),
+            sender: None,
+            receiver: Some(baihua_core::api::RoomRequestPeer {
+                user_id: "user-carol".to_string(),
+                username: "carol".to_string(),
+                nickname: None,
+            }),
+            status: Some("accepted".to_string()),
+        }];
+        app.displaying_overlay = DisplayingOverlay::PendingRequests;
+        app.request_list_state.select(Some(0));
+        let buffer = render_snapshot(&mut app, 100, 30);
+        assert!(buffer_contains(&buffer, &app.t("request_section_received")));
+        assert!(buffer_contains(&buffer, &app.t("request_section_sent")));
+        assert!(buffer_contains(&buffer, "carol"));
+        assert!(buffer_contains(&buffer, &app.t("request_status_accepted")));
+        // 扁平序列把收到的排在前面，撤回与拒绝按所在区分别是不同动作
+        let entries = app.request_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(!entries[0].0);
+        assert!(entries[1].0);
+    }
+
+    /// 构造一条私聊请求条目，状态与收发方向可按用例填。
+    fn invitation_with_status(id: &str, status: Option<&str>) -> RoomRequestInfo {
+        RoomRequestInfo {
+            id: id.to_string(),
+            message: "加个好友".to_string(),
+            is_encrypted: false,
+            created_at: String::new(),
+            sender: Some(baihua_core::api::RoomRequestPeer {
+                user_id: "user-other".to_string(),
+                username: "bob".to_string(),
+                nickname: None,
+            }),
+            receiver: Some(baihua_core::api::RoomRequestPeer {
+                user_id: "user-carol".to_string(),
+                username: "carol".to_string(),
+                nickname: None,
+            }),
+            status: status.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn settings_badge_counts_only_invitations_still_pending() {
+        let mut app = chat_page_app_for_render("default");
+        // 收到的条目接口只给待处理的，全部计数；自己发出的要按状态筛
+        app.pending_requests = vec![
+            invitation_with_status("received-1", Some("pending")),
+            invitation_with_status("received-2", Some("pending")),
+        ];
+        app.sent_requests = vec![
+            invitation_with_status("sent-pending", Some("pending")),
+            invitation_with_status("sent-accepted", Some("accepted")),
+            invitation_with_status("sent-declined", Some("declined")),
+            invitation_with_status("sent-expired", Some("expired")),
+            invitation_with_status("sent-cancelled", Some("cancelled")),
+            invitation_with_status("sent-unknown", None),
+        ];
+        let label = app
+            .settings_menu_entries()
+            .iter()
+            .find(|(label, _, _)| label.contains(&app.t("option_pending_requests")))
+            .expect("设置菜单应有私聊请求管理条目")
+            .0
+            .clone();
+        assert_eq!(
+            label,
+            format!(" {} (3)", app.t("option_pending_requests")),
+            "数字提示只该算两条收到的加一条仍在等的"
+        );
+    }
+
+    #[test]
+    fn declined_sent_invitation_is_labelled_declined_and_never_cancelled() {
+        let mut app = chat_page_app_for_render("default");
+        app.sent_requests = vec![invitation_with_status("sent-declined", Some("declined"))];
+        app.displaying_overlay = DisplayingOverlay::PendingRequests;
+        app.request_list_state.select(Some(0));
+        let buffer = render_snapshot(&mut app, 96, 30);
+        assert!(buffer_contains(&buffer, &app.t("request_status_declined")));
+        assert!(
+            !buffer_contains(&buffer, &app.t("request_status_cancelled")),
+            "被拒绝的邀请不能显示成已撤回"
+        );
+    }
+
+    #[test]
+    fn acting_on_an_invitation_keeps_it_in_the_received_history() {
+        let mut app = chat_page_app_for_render("default");
+        app.pending_requests = vec![
+            // 服务端"收到的请求"列表不给状态字段，这里按接口原样留 None
+            invitation_with_status("received-1", None),
+            invitation_with_status("received-2", None),
+        ];
+        app.sent_requests = vec![invitation_with_status("sent-1", Some("pending"))];
+        app.request_list_state.select(Some(0));
+        // 处理完只做本地乐观更新（不再补发一次列表请求与轮询抢着写同一张列表），
+        // 且条目必须留在"收到的"区里：服务端下一次就再也回不到它了
+        app.mark_pending_request_handled("received-1", "accepted");
+        assert_eq!(
+            app.pending_requests.len(),
+            2,
+            "已处理的邀请不能从历史里消失"
+        );
+        assert_eq!(
+            app.pending_requests[0].status.as_deref(),
+            Some("accepted"),
+            "结果状态要就地记上，否则看上去还是待处理"
+        );
+        assert_eq!(app.request_entries().len(), 3);
+        app.mark_pending_request_handled("received-2", "declined");
+        assert_eq!(app.pending_requests[1].status.as_deref(), Some("declined"));
+        app.mark_sent_request_cancelled("sent-1");
+        assert_eq!(
+            app.sent_requests[0].status.as_deref(),
+            Some("cancelled"),
+            "撤回后本地状态就要变，否则列表里仍显示待处理"
+        );
+    }
+
+    #[test]
+    fn polled_received_requests_keep_locally_handled_history() {
+        let mut app = chat_page_app_for_render("default");
+        // 本地历史：一条仍在等、一条已接受
+        app.pending_requests = vec![
+            invitation_with_status("waiting", None),
+            invitation_with_status("handled", Some("accepted")),
+        ];
+        // 轮询带回的列表只会是服务端仍是 pending 的行（已处理的那条不在其中）
+        app.apply_received_requests(vec![
+            invitation_with_status("waiting", None),
+            invitation_with_status("newly-arrived", None),
+        ]);
+        let ids: Vec<&str> = app
+            .pending_requests
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["waiting", "newly-arrived", "handled"]);
+        assert_eq!(
+            app.pending_requests
+                .iter()
+                .find(|request| request.id == "handled")
+                .and_then(|request| request.status.as_deref()),
+            Some("accepted"),
+            "合并轮询结果时不能把本端记的结果状态冲掉"
+        );
+        // 同一条目同时出现在两份来源里时以服务端为准，不重复列两遍
+        app.apply_received_requests(vec![invitation_with_status("handled", None)]);
+        assert_eq!(app.pending_requests.len(), 1);
+    }
+
+    /// 只取面板矩形内部的文本（去掉边框字符与空白）逐行拼接。
+    /// 折行后的文案跨多行，只有把范围限制在面板列区间里才能整段连续比对。
+    fn panel_body_text(buffer: &ratatui::buffer::Buffer, panel_rect: Rect) -> String {
+        let border_characters = ['─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼'];
+        let mut text = String::new();
+        for row in panel_rect.y..panel_rect.y + panel_rect.height {
+            for column in panel_rect.x..panel_rect.x + panel_rect.width {
+                let symbol = buffer[(column, row)].symbol();
+                for character in symbol.chars() {
+                    if !character.is_whitespace() && !border_characters.contains(&character) {
+                        text.push(character);
+                    }
+                }
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn narrow_settings_menu_wraps_entries_instead_of_clipping_them() {
+        let mut app = chat_page_app_for_render("default");
+        app.pending_requests = vec![invitation_with_status("received-1", None)];
+        let labels: Vec<String> = app
+            .settings_menu_entries()
+            .iter()
+            .map(|(label, _, _)| label.clone())
+            .collect();
+        app.displaying_overlay = DisplayingOverlay::SettingsMenu;
+        app.menu_list_state.select(Some(0));
+        let buffer = render_snapshot(&mut app, 26, 64);
+        // 面板矩形用生产代码同一个算法算，才能只取面板内的列区间：
+        // 整行拼接会把面板两侧的聊天页文字混进来，折行的条目因此永远比对不上
+        let (panel_rect, body_width) = overlay_list_panel(&labels, Rect::new(0, 1, 26, 63));
+        assert!(panel_rect.width <= 26, "面板不该比屏幕还宽");
+        let inside = panel_body_text(&buffer, panel_rect);
+        for label in &labels {
+            let compact: String = label
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            assert!(inside.contains(&compact), "设置菜单条目被裁掉: {label}");
+        }
+        assert!(
+            labels.iter().any(|label| display_width(label) > body_width),
+            "这份数据本该窄到需要折行，否则测不到折行分支"
+        );
+    }
+
+    /// 取一段文案的尾巴若干字符（折行后尾行必须整段看得见，被裁掉时最先不见的就是尾巴）
+    fn tail_of(text: &str, characters: usize) -> String {
+        text.chars()
+            .rev()
+            .take(characters)
+            .collect::<Vec<char>>()
+            .iter()
+            .rev()
+            .collect::<String>()
+    }
+
+    #[test]
+    fn english_requests_and_form_hints_wrap_on_a_narrow_panel() {
+        let mut app = chat_page_app_for_render("default");
+        // 英文文案比中文长得多，窄面板上的裁切只在英文里才暴露，所以这一发用 en-US
+        app.load_language("en-US");
+        app.sent_requests = vec![invitation_with_status("sent-1", Some("accepted"))];
+        app.displaying_overlay = DisplayingOverlay::PendingRequests;
+        app.request_list_state.select(Some(0));
+        let buffer = render_snapshot(&mut app, 56, 20);
+        assert!(
+            buffer_contains(&buffer, &tail_of(&app.t("hint_pending_requests"), 8)),
+            "私聊请求浮层的底部提示被右边界裁掉了"
+        );
+
+        app.open_form(
+            FormAction::ChangePassword,
+            vec![
+                FormField::new("password_old_label", "", true),
+                FormField::new("password_new_label", "", true),
+                FormField::new("password_confirm_label", "", true),
+            ],
+        );
+        let narrow = render_snapshot(&mut app, 40, 20);
+        assert!(
+            buffer_contains(&narrow, &tail_of(&app.t("form_password_hint"), 8)),
+            "改密表单的底部提示在 40 列面板里被裁掉了"
+        );
+    }
+
+    #[test]
+    fn narrow_status_bar_keeps_the_connection_mark_and_user() {
+        let mut app = chat_page_app_for_render("default");
+        app.connection_ready = Some(true);
+        app.current_username = "buitest13".to_string();
+        // 版本信息是次要的：一行放不下时让它先被裁，连接标记与当前用户必须留下
+        let buffer = render_snapshot(&mut app, 56, 20);
+        assert!(buffer_contains(&buffer, "连接 ●"), "窄屏把连接标记挤掉了");
+        assert!(
+            buffer_contains(&buffer, &format!("当前用户 {}", app.current_username)),
+            "窄屏把当前用户挤掉了"
+        );
+        // 宽屏上两段都放得下，版本信息照旧完整（服务端版本没探测过，本来就不显示）
+        let wide = render_snapshot(&mut app, 120, 20);
+        assert!(buffer_contains(&wide, &app.t("bar_client_version")));
+        assert!(buffer_contains(&wide, &App::client_version()));
+        assert!(buffer_contains(&wide, "当前用户 buitest13"));
+    }
+
+    #[test]
+    fn wrapped_hint_text_keeps_every_character_and_stays_within_width() {
+        // 表单浮层预留的高度就是这个函数的行数，所以"不丢字 + 每行不超宽"即等价于不裁切
+        let app = chat_page_app_for_render("default");
+        let hint = app.t("form_profile_hint");
+        let wrapped = wrapped_hint_text(&hint, Style::default(), 34);
+        assert!(wrapped.lines.len() >= 2, "窄面板里提示应该折行");
+        let joined: String = wrapped
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let original: String = hint
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert_eq!(joined, original, "折行丢了字");
+        for line in &wrapped.lines {
+            let plain: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(display_width(&plain) <= 34, "折出来的行仍超宽: {plain}");
+        }
+    }
+
+    #[test]
+    fn account_settings_refuse_a_signed_out_user_without_leaving_the_menu() {
+        let mut app = chat_page_app_for_render("default");
+        app.current_user_id = None;
+        app.websocket_token = None;
+        app.displaying_overlay = DisplayingOverlay::SettingsMenu;
+        let profile_index = app
+            .settings_menu_entries()
+            .iter()
+            .position(|(_, _, action)| {
+                matches!(action, SettingsAction::OpenForm(FormAction::UpdateProfile))
+            })
+            .expect("设置菜单应有改资料条目");
+        app.menu_list_state.select(Some(profile_index));
+        app.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.displaying_overlay,
+            DisplayingOverlay::SettingsMenu,
+            "未登录不该切进表单浮层"
+        );
+        assert!(app.active_form.is_none());
+        assert!(
+            app.notifications
+                .iter()
+                .any(|(text, _, _)| text == &app.t("error_not_logged_in"))
+        );
+        // 本地显示开关与语言/外观不依赖登录态，仍要照常生效
+        let toggle_index = app
+            .settings_menu_entries()
+            .iter()
+            .position(|(_, _, action)| matches!(action, SettingsAction::ToggleShowUid))
+            .expect("设置菜单应有显示 UID 开关");
+        app.menu_list_state.select(Some(toggle_index));
+        let before = app.show_uid;
+        app.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.show_uid, !before);
+    }
+
+    #[test]
+    fn avatar_overlay_hands_url_input_over_to_the_form() {
+        let mut app = chat_page_app_for_render("default");
+        app.displaying_overlay = DisplayingOverlay::AvatarSelect;
+        app.avatar_list_state.select(Some(0));
+        app.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(app.displaying_overlay, DisplayingOverlay::Form);
+        assert_eq!(
+            app.active_form.as_ref().map(|(action, _)| action.clone()),
+            Some(FormAction::ChangeAvatar),
+            "Ctrl+U 应打开原来的修改头像表单"
+        );
+    }
+
+    #[test]
+    fn avatar_directory_offers_only_uploadable_images() {
+        let directory = std::env::temp_dir().join("baihua-avatar-source-listing");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("子目录")).expect("临时目录应可创建");
+        for name in [
+            "me.png",
+            "other.JPG",
+            "notes.txt",
+            "archive.tar.gz",
+            "icon.webp",
+        ] {
+            fs::write(directory.join(name), b"x").expect("临时文件应可写入");
+        }
+        let names: Vec<String> = avatar_files_in(&directory)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["icon.webp", "me.png", "other.JPG"]);
+        // 每条都带回真实路径，回车上传用的就是它
+        let entries = avatar_files_in(&directory);
+        assert!(entries.iter().all(|(_, path)| path.starts_with(&directory)));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn completion_descriptions_move_onto_their_own_line_when_tight() {
+        let label = "/profile bobbington";
+        let description = "01a070d7-d079-71c0-a254-32706c393476";
+        let wide = completion_lines(label, description, Style::default(), Style::default(), 80);
+        assert_eq!(wide.len(), 1, "放得下时不该多占一行");
+        let tight = completion_lines(label, description, Style::default(), Style::default(), 24);
+        assert!(tight.len() >= 2, "挤不下时说明要另起一行");
+        let flattened: String = tight
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let expected = format!("{label}{description}")
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert_eq!(flattened, expected, "挤不下时说明要完整挪到下一行");
+    }
+
+    /// 造一张纯色 PNG 的字节：卡片测试不依赖仓库里的素材文件
+    fn synthetic_avatar_png() -> Vec<u8> {
+        let image_buffer = image::RgbaImage::from_pixel(64, 64, image::Rgba([220, 30, 30, 255]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image_buffer
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("测试图片应能编码");
+        encoded.into_inner()
+    }
+
+    /// 头像网格必须始终"列 = 2×行"（一格装上下两个像素），否则正方形源图会被压成矩形。
+    #[test]
+    fn avatar_grid_keeps_the_square_pixel_ratio_at_every_width() {
+        for columns_available in [4u16, 7, 12, 20, 21, 32, 48] {
+            let (columns, rows) = avatar_grid_within(columns_available, 30);
+            assert_eq!(columns, rows * 2, "{columns_available} 列可用时比例失真");
+            assert!(
+                columns <= columns_available.max(2),
+                "{columns_available} 列可用时超出宽度"
+            );
+            assert!(
+                rows <= profile_avatar_cells().1 as u16,
+                "行数不该超过最大网格"
+            );
+        }
+    }
+
+    /// 卡片上真正画出来的像素块也要保持同一比例（宽度只算半块字符所在的列）
+    #[test]
+    fn profile_card_paints_an_avatar_that_is_not_stretched() {
+        let mut app = chat_page_app_for_render("default");
+        app.profile_view = Some(PublicProfile {
+            id: "user-self".to_string(),
+            username: "self".to_string(),
+            nickname: None,
+            bio: Some("短".to_string()),
+            avatar: Some("/static/avatars/me.png".to_string()),
+        });
+        app.avatar_images
+            .insert("user-self".to_string(), Some(synthetic_avatar_png()));
+        app.displaying_overlay = DisplayingOverlay::ProfileCard;
+        for (width, height) in [(40u16, 22u16), (64, 24), (120, 36)] {
+            let buffer = render_snapshot(&mut app, width, height);
+            let mut columns: Vec<u16> = Vec::new();
+            let mut rows: Vec<u16> = Vec::new();
+            for row in 0..buffer.area.height {
+                for column in 0..buffer.area.width {
+                    if buffer[(column, row)].symbol() == "▀" {
+                        if !columns.contains(&column) {
+                            columns.push(column);
+                        }
+                        if !rows.contains(&row) {
+                            rows.push(row);
+                        }
+                    }
+                }
+            }
+            assert!(
+                !rows.is_empty(),
+                "{width}x{height} 下没画出头像素块（头像被文字挤掉了）"
+            );
+            assert_eq!(
+                columns.len(),
+                rows.len() * 2,
+                "{width}x{height} 下头像被压成 {}×{} 的矩形",
+                columns.len(),
+                rows.len()
+            );
+        }
+    }
+
+    #[test]
+    fn profile_card_wraps_long_fields_instead_of_clipping_them() {
+        let mut app = chat_page_app_for_render("default");
+        app.own_contact = Some((
+            "someone.with.a.long.mail@example.com".to_string(),
+            "13800000000".to_string(),
+        ));
+        app.profile_view = Some(PublicProfile {
+            id: "user-self".to_string(),
+            username: "self".to_string(),
+            nickname: Some("长着中文昵称的自己".to_string()),
+            bio: Some("这是一段非常长的个人简介，专门用来验证窄屏下资料卡不会裁掉尾部".to_string()),
+            avatar: Some("https://avatar.example.com/users/0123456789abcdef.png".to_string()),
+        });
+        app.displaying_overlay = DisplayingOverlay::ProfileCard;
+        let buffer = render_snapshot(&mut app, 62, 24);
+        assert!(
+            buffer_contains(&buffer, "裁掉尾部"),
+            "窄屏下长简介尾部被右边界切掉"
+        );
+        assert!(
+            buffer_contains(&buffer, "abcdef.png"),
+            "窄屏下长头像链接尾部被右边界切掉"
+        );
+        assert!(
+            buffer_contains(&buffer, "example.com"),
+            "窄屏下长邮箱尾部被右边界切掉"
+        );
+    }
+
+    #[test]
+    fn form_overlay_masks_password_fields() {
+        let mut app = chat_page_app_for_render("default");
+        app.active_form = Some((
+            FormAction::ChangePassword,
+            vec![
+                FormField::new("password_old_label", "hunter2", true),
+                FormField::new("password_new_label", "", true),
+                FormField::new("password_confirm_label", "", true),
+            ],
+        ));
+        app.displaying_overlay = DisplayingOverlay::Form;
+        let buffer = render_snapshot(&mut app, 90, 24);
+        assert!(buffer_contains(&buffer, &app.t("password_old_label")));
+        assert!(buffer_contains(&buffer, &app.t("password_confirm_label")));
+        assert!(
+            !buffer_contains(&buffer, "hunter2"),
+            "密码字段必须以遮蔽字符显示，不能把明文画到屏幕上"
+        );
+        // 标签列宽取最宽标签，焦点标记只出现在当前项上
+        assert!(buffer_contains(&buffer, &app.t("form_password_hint")));
+    }
+
+    #[test]
+    fn profile_field_value_skips_empty_and_writes_the_rest() {
+        // 留空 = 这一项不进请求体（服务端语义是保持原值），有内容就按新值写入。
+        // 单个减号已不再有特殊含义，就是一个普通值
+        assert_eq!(profile_field_value("   "), None);
+        assert_eq!(profile_field_value("-"), Some(Some("-".to_string())));
+        assert_eq!(
+            profile_field_value("  新昵称  "),
+            Some(Some("新昵称".to_string()))
+        );
+    }
+
+    #[test]
+    fn plain_room_history_is_cached_and_encrypted_room_is_not() {
+        let root = std::env::temp_dir().join(format!("baihua-app-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = chat_page_app_for_render("default");
+        app.current_user_id = Some("user-self".to_string());
+        app.chat_cache = Some(baihua_core::chat_cache::ChatCache::open_in(
+            "user-self",
+            &root,
+        ));
+
+        // 未加密房间：整房写入后能按原样读回，并带回翻页游标
+        app.cache_loaded_messages("room-one");
+        let cache = app.chat_cache.as_ref().expect("应已建立缓存目录");
+        let cached = cache.load_room("room-one").expect("明聊房间应已落盘");
+        assert_eq!(cached.messages.len(), 2);
+        assert_eq!(cached.messages[0].id, "message-1");
+
+        // 加密房间：一律不落盘
+        app.rooms.push(RoomInfo {
+            id: "room-secret".to_string(),
+            name: None,
+            is_group: false,
+            created_by: "user-self".to_string(),
+            members: vec!["user-self".to_string(), "user-other".to_string()],
+            is_encrypted: true,
+            created_at: String::new(),
+        });
+        app.messages.push(MessageInfo {
+            id: "message-secret".to_string(),
+            room_id: "room-secret".to_string(),
+            sender_id: "user-other".to_string(),
+            content: "只存在于内存里的明文".to_string(),
+            created_at: "2026-08-30T08:02:00+00:00".to_string(),
+        });
+        app.cache_loaded_messages("room-secret");
+        assert!(
+            cache.load_room("room-secret").is_none(),
+            "加密房间不得写入本地缓存"
+        );
+        // 消息列表混合了两个房间的内容时，也不允许按某个房间落盘
+        assert!(
+            cache.load_room("room-one").is_some(),
+            "此前写好的明聊缓存不该被误删"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exit_alias_runs_the_same_quit_path() {
+        let commands = chat_commands();
+        let quit = commands
+            .iter()
+            .find(|(name, _)| *name == "quit")
+            .expect("应有 /quit");
+        let exit = commands
+            .iter()
+            .find(|(name, _)| *name == "exit")
+            .expect("应有 /exit 别名");
+        assert_eq!(quit.1, exit.1, "别名必须共用同一条说明文案");
+        // 没有私聊要清理时退出流程立即就绪，正好用来验证别名走的是同一条路径
+        let mut app = chat_page_app_for_render("default");
+        assert!(!app.should_quit_now());
+        app.execute_chat_command("/exit");
+        assert!(app.should_quit_now(), "/exit 应像 /quit 一样进入退出流程");
+    }
+
+    #[test]
+    fn dark_theme_is_shipped_complete_and_differs_from_default() {
+        let names = Appearance::available_names();
+        assert!(
+            names.iter().any(|name| name == "dark"),
+            "应随仓库提供暗色主题"
+        );
+        let (dark, has_missing_field, extra_fields) = Appearance::load("dark");
+        assert!(!has_missing_field);
+        assert!(extra_fields.is_empty());
+        let built_in = Appearance::built_in();
+        assert_ne!(dark.app_background, built_in.app_background);
+        assert_ne!(dark.message_text, built_in.message_text);
+        // 暗色主题下正文必须比背景亮，否则等于看不见
+        assert!(
+            theme_luminance(dark.message_text) > theme_luminance(dark.app_background),
+            "暗色主题的正文颜色应明显亮于背景"
+        );
+    }
+
+    /// 颜色的感知亮度（与 contrasting_foreground 同一套加权，用于主题自检）
+    fn theme_luminance(color: Color) -> u32 {
+        match color {
+            Color::Rgb(red, green, blue) => {
+                (u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000
+            }
+            _ => 255,
+        }
+    }
+
+    #[test]
+    fn form_with_one_field_falls_back_to_box_input_and_still_masks_it() {
+        let mut app = chat_page_app_for_render("default");
+        // 一个条目的表单（删除账户）按规矩用方框输入框，而不是箭头行
+        app.active_form = Some((
+            FormAction::DeleteAccount,
+            vec![FormField::new(
+                "delete_account_password_label",
+                "hunter2",
+                true,
+            )],
+        ));
+        app.displaying_overlay = DisplayingOverlay::Form;
+        let buffer = render_snapshot(&mut app, 90, 24);
+        let body = buffer_row_text(&buffer, 0);
+        assert!(!body.contains("hunter2"), "口令不该出现在屏幕上");
+        // 方框存在的证据：有一个左上角，且边框是"未选中"的输入框边框色
+        // （表单刻意不用选中色，见 render_box_field）
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "┌" && cell.fg == app.appearance.input_border),
+            "少于三个条目的表单应自带方框输入框，且默认不是选中色"
+        );
+        assert!(buffer_contains(
+            &buffer,
+            &app.t("delete_account_password_label")
+        ));
+    }
+
+    #[test]
+    fn request_overlay_shows_the_whole_invitation_message() {
+        let mut app = chat_page_app_for_render("default");
+        let long_message =
+            "这是一条很长很长的私聊验证消息，用来检验浮层会不会把内容截成一行。".repeat(3);
+        app.pending_requests = vec![RoomRequestInfo {
+            id: "request-long".to_string(),
+            message: long_message.clone(),
+            is_encrypted: false,
+            created_at: String::new(),
+            sender: Some(baihua_core::api::RoomRequestPeer {
+                user_id: "user-other".to_string(),
+                username: "bob".to_string(),
+                nickname: None,
+            }),
+            receiver: None,
+            status: Some("pending".to_string()),
+        }];
+        app.sent_requests = vec![RoomRequestInfo {
+            id: "request-out".to_string(),
+            message: "你好，加个好友".to_string(),
+            is_encrypted: true,
+            created_at: String::new(),
+            sender: None,
+            receiver: Some(baihua_core::api::RoomRequestPeer {
+                user_id: "user-carol".to_string(),
+                username: "carol".to_string(),
+                nickname: None,
+            }),
+            status: Some("pending".to_string()),
+        }];
+        app.displaying_overlay = DisplayingOverlay::PendingRequests;
+        app.request_list_state.select(Some(0));
+        let buffer = render_snapshot(&mut app, 96, 30);
+        let tail: String = long_message.chars().rev().take(6).collect::<String>();
+        let tail: String = tail.chars().rev().collect();
+        assert!(
+            buffer_contains(&buffer, &tail),
+            "邀请正文被截断，末尾的 {tail:?} 没出现在浮层里"
+        );
+        // 自己发出的那条也在，并带上加密标记与状态
+        assert!(buffer_contains(&buffer, "carol"));
+        assert!(buffer_contains(&buffer, &app.t("request_status_pending")));
+    }
+
+    #[test]
+    fn closing_an_overlay_returns_keyboard_focus_to_the_message_box() {
+        let mut app = chat_page_app_for_render("default");
+        // 浮层打开时 focus_index 指的是浮层里的输入项，关掉后必须交还消息输入框，
+        // 否则会回到"打字没有落点"的状态（表现是键盘输入完全没反应）
+        app.displaying_overlay = DisplayingOverlay::Form;
+        app.active_form = Some((
+            FormAction::DeleteAccount,
+            vec![FormField::new("delete_account_password_label", "", true)],
+        ));
+        app.focus_index = 0;
+        let escape = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(&escape);
+        assert_eq!(app.displaying_overlay, DisplayingOverlay::SettingsMenu);
+        app.handle_event(&escape);
+        assert_eq!(app.displaying_overlay, DisplayingOverlay::Nothing);
+        for character in ['/', 'p', 'r'] {
+            app.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(
+            app.input_collector.message_input_state.text(),
+            "/pr",
+            "退出浮层后输入应落回消息输入框"
+        );
+    }
+
+    #[test]
+    fn login_and_register_with_arguments_are_refused_without_a_word() {
+        let mut app = chat_page_app_for_render("default");
+        // 带参数的登录既不该执行、也不该被清空重写，静默拒绝即可
+        app.input_collector
+            .message_input_state
+            .set_text("/login somebody hunter2");
+        app.handle_chat_submit();
+        assert_eq!(
+            app.input_collector.message_input_state.text(),
+            "/login somebody hunter2",
+            "带参数的登录行不该被吃掉"
+        );
+        assert_eq!(app.displaying_overlay, DisplayingOverlay::Nothing);
+        assert!(app.notifications.is_empty(), "不该再多一句提示");
+        // 无参数才打开登录浮层
+        app.input_collector.message_input_state.set_text("/login");
+        app.handle_chat_submit();
+        assert_eq!(app.displaying_overlay, DisplayingOverlay::Login);
+    }
+
+    #[test]
+    fn declined_invitation_is_announced_once_to_the_sender() {
+        fn invitation(status: &str) -> RoomRequestInfo {
+            RoomRequestInfo {
+                id: "request-1".to_string(),
+                message: "加个好友".to_string(),
+                is_encrypted: false,
+                created_at: String::new(),
+                sender: None,
+                receiver: Some(baihua_core::api::RoomRequestPeer {
+                    user_id: "user-carol".to_string(),
+                    username: "carol".to_string(),
+                    nickname: None,
+                }),
+                status: Some(status.to_string()),
+            }
+        }
+        let mut app = chat_page_app_for_render("default");
+        app.sent_requests = vec![invitation("pending")];
+        // 轮询带回"已拒绝"，发出者要收到一条通知
+        app.announce_declined_invitations(&[invitation("declined")]);
+        let notices: Vec<String> = app
+            .notifications
+            .iter()
+            .map(|(text, _, _)| text.clone())
+            .collect();
+        assert_eq!(notices.len(), 1, "实际通知: {notices:?}");
+        assert!(
+            notices[0].contains("carol"),
+            "通知里要点明是谁拒的: {notices:?}"
+        );
+        // 本地列表更新后再来一轮同样状态，不该重复提示
+        app.notifications.clear();
+        app.sent_requests = vec![invitation("declined")];
+        app.announce_declined_invitations(&[invitation("declined")]);
+        assert!(app.notifications.is_empty(), "同一状态变化不该报两次");
+    }
+
+    #[test]
+    fn profile_completion_reads_the_cached_directory_only() {
+        let mut app = chat_page_app_for_render("default");
+        // 目录还没拉到时没有候选，且渲染路径不会发请求（base_url 指向不可达端口，
+        // 一旦这里真去请求就会走到执行分支而不是补全分支）
+        app.registered_users = None;
+        assert!(app.completion_candidates("profile ").is_empty());
+        app.registered_users = Some(vec![UserSearchResult {
+            id: "01a0".to_string(),
+            username: "carol".to_string(),
+            nickname: Some("卡尔".to_string()),
+            bio: None,
+            avatar: None,
+        }]);
+        let candidates = app.completion_candidates("profile ");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "/profile carol");
+        assert_eq!(candidates[0].1, "carol - 01a0");
+        assert_eq!(candidates[0].2, "卡尔");
+        // 已输入前缀时继续过滤，不要求从头匹配
+        assert_eq!(app.completion_candidates("profile ca").len(), 1);
+        assert!(app.completion_candidates("profile zz").is_empty());
+    }
+
+    #[test]
+    fn every_overlay_frame_uses_the_theme_overlay_border_color() {
+        let mut app = chat_page_app_for_render("high-contrast");
+        let overlay_border = app.appearance.overlay_border;
+        let frames = [
+            DisplayingOverlay::SettingsMenu,
+            DisplayingOverlay::LanguageSelect,
+            DisplayingOverlay::AppearanceSelect,
+            DisplayingOverlay::Login,
+            DisplayingOverlay::Register,
+            DisplayingOverlay::CreateGroup,
+            DisplayingOverlay::CreatePrivate,
+            DisplayingOverlay::ServerAddress,
+            DisplayingOverlay::PendingRequests,
+            DisplayingOverlay::ProfileCard,
+            DisplayingOverlay::Form,
+            DisplayingOverlay::AvatarSelect,
+        ];
+        for frame_kind in frames {
+            app.displaying_overlay = frame_kind.clone();
+            if frame_kind == DisplayingOverlay::Form {
+                app.active_form = Some((
+                    FormAction::ChangeAvatar,
+                    vec![FormField::new("avatar_input_label", "", false)],
+                ));
+            } else {
+                app.active_form = None;
+            }
+            if frame_kind == DisplayingOverlay::ProfileCard {
+                app.profile_view = Some(PublicProfile {
+                    id: "user-other".to_string(),
+                    username: "bob".to_string(),
+                    nickname: None,
+                    bio: None,
+                    avatar: None,
+                });
+            } else {
+                app.profile_view = None;
+            }
+            let buffer = render_snapshot(&mut app, 100, 30);
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "└" && cell.fg == overlay_border),
+                "{frame_kind:?} 的窗口边框没走外观里的 overlay_border"
+            );
+        }
+    }
+
+    #[test]
+    fn very_long_single_line_notification_is_still_visible_on_a_small_screen() {
+        let mut app = chat_page_app_for_render("default");
+        let head = "很长的单行提示内容";
+        app.push_notification(format!("{}结尾看得见", head.repeat(12)));
+        let buffer = render_snapshot(&mut app, 60, 14);
+        // 旧算法按整段文本的总宽度估高度，小屏幕上算出来超过屏高就整条不画；
+        // 现在按"最宽一行"定宽、逐行估高，放不下时裁切显示而不是丢弃
+        assert!(
+            buffer_contains(&buffer, head),
+            "长提示在小屏幕上被整条丢弃，没有自适应宽高"
+        );
+    }
+
     /// 用 ratatui 的测试后端把整个界面渲染进内存缓冲区。
     /// 没有真实终端时这是唯一能验证到"像素"（单元格符号与样式）的手段。
     fn render_snapshot(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
@@ -6378,6 +9903,20 @@ mod tests {
     /// 整屏任意一行是否包含给定文本
     fn buffer_contains(buffer: &ratatui::buffer::Buffer, text: &str) -> bool {
         (0..buffer.area.height).any(|row| buffer_row_text(buffer, row).contains(text))
+    }
+
+    /// 收集整屏套用某背景色的单元格所在行（去重排序），用于验证高亮落在哪条消息上
+    fn rows_with_background(buffer: &ratatui::buffer::Buffer, background: Color) -> Vec<i32> {
+        let mut rows: Vec<i32> = Vec::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                if buffer[(column, row)].bg == background {
+                    rows.push(row as i32);
+                    break;
+                }
+            }
+        }
+        rows
     }
 
     /// 收集整屏套用某背景色的单元格文本，用于验证高亮恰好覆盖了命中片段
@@ -6685,24 +10224,60 @@ mod tests {
             painted_cells > 120 * 36 / 2,
             "应用背景未铺满整屏，仅 {painted_cells} 个单元格着色"
         );
-        // 房间列表左上角边框取 room_border（high-contrast 下为白色）
-        assert_eq!(buffer[(0u16, 0u16)].fg, Color::White);
+        // 第 0 行是顶栏，房间列表左上角边框从第 1 行起（high-contrast 下为白色）
+        assert_eq!(buffer[(0u16, 1u16)].fg, Color::White);
     }
 
     #[test]
     fn rendered_screen_highlights_search_matches_with_theme_background() {
         let mut app = chat_page_app_for_render("high-contrast");
-        // 进入搜索模式并执行过一次搜索：关键词 hello 命中第一条消息
+        // 再补一条同样命中 hello 的消息，好把"其余命中"与"当前命中"两种颜色区分开
+        app.messages.push(MessageInfo {
+            id: "message-3".to_string(),
+            room_id: "room-one".to_string(),
+            sender_id: "user-other".to_string(),
+            content: "hello once more".to_string(),
+            created_at: "2026-08-30T08:02:00+00:00".to_string(),
+        });
+        // 进入搜索模式并执行过一次搜索：两条命中，当前停在第一条
         app.input_collector.message_input_state.set_text("#hello");
-        app.search_result = Some(("hello".to_string(), vec!["message-1".to_string()], 0));
+        app.search_result = Some((
+            "hello".to_string(),
+            vec!["message-1".to_string(), "message-3".to_string()],
+            0,
+        ));
         let buffer = render_snapshot(&mut app, 120, 36);
-        // high-contrast 的 search_match_background 为 light_yellow，命中单元格拼起来应正好是关键词
+        // 其余命中用 search_match_background（light_yellow），当前这条用
+        // search_current_match_background（light_red），各自只盖住关键词那几个字
         assert_eq!(
             cells_with_background(&buffer, Color::LightYellow),
             "hello".to_string()
         );
+        let current_rows = rows_with_background(&buffer, Color::LightRed);
+        let other_rows = rows_with_background(&buffer, Color::LightYellow);
+        assert_eq!(current_rows.len(), 1, "只应有一条命中被标成当前色");
+        assert_eq!(other_rows.len(), 1, "只应有一条命中保持普通命中色");
+        assert!(
+            current_rows[0] < other_rows[0],
+            "当前停在第一条命中，特殊色应出现在更靠上的行"
+        );
+        // 换到第二个匹配项：两种颜色的位置互换，证明"当前"标记跟着选中项走
+        app.search_result = Some((
+            "hello".to_string(),
+            vec!["message-1".to_string(), "message-3".to_string()],
+            1,
+        ));
+        let swapped_buffer = render_snapshot(&mut app, 120, 36);
+        assert_eq!(
+            rows_with_background(&swapped_buffer, Color::LightRed),
+            other_rows
+        );
+        assert_eq!(
+            rows_with_background(&swapped_buffer, Color::LightYellow),
+            current_rows
+        );
         // 输入框标题给出匹配进度
-        assert!(buffer_contains(&buffer, "搜索模式: 第 1/1 个匹配项"));
+        assert!(buffer_contains(&buffer, "搜索模式: 第 1/2 个匹配项"));
         // 搜索模式边框取 search_border（high-contrast 下为 light_red）
         assert!(buffer.content.iter().any(|cell| cell.fg == Color::LightRed));
     }
@@ -6761,18 +10336,22 @@ mod tests {
             is_encrypted: false,
             created_at: String::new(),
         });
-        // 未知状态不标注
+        // 顶栏的连接标记同样是实心点，所以这里一律按"房间名 + 标记"整体断言，
+        // 免得把顶栏那个点误当成房间列表的在线标注
+        // 私聊在列表里显示为本地化后的"私聊"字样，标记就贴在它后面
+        let private_room_label = app.t("private_chat_fallback");
+        let peer_line = |mark: &str| format!("{private_room_label} {mark}");
         let unknown_buffer = render_snapshot(&mut app, 120, 36);
-        assert!(!buffer_contains(&unknown_buffer, "●"));
-        assert!(!buffer_contains(&unknown_buffer, "○"));
+        assert!(!buffer_contains(&unknown_buffer, &peer_line("●")));
+        assert!(!buffer_contains(&unknown_buffer, &peer_line("○")));
         // 收到在线广播后标注实心点，离线后标注空心点
         app.presence_by_user.insert("user-other".to_string(), true);
         let online_buffer = render_snapshot(&mut app, 120, 36);
-        assert!(buffer_contains(&online_buffer, "●"));
+        assert!(buffer_contains(&online_buffer, &peer_line("●")));
         app.presence_by_user.insert("user-other".to_string(), false);
         let offline_buffer = render_snapshot(&mut app, 120, 36);
-        assert!(buffer_contains(&offline_buffer, "○"));
-        assert!(!buffer_contains(&offline_buffer, "●"));
+        assert!(buffer_contains(&offline_buffer, &peer_line("○")));
+        assert!(!buffer_contains(&offline_buffer, &peer_line("●")));
     }
 
     #[test]
@@ -6780,11 +10359,11 @@ mod tests {
         // 同一份内容分别用两套外观渲染，边框取色必须随主题切换
         let mut built_in_app = chat_page_app_for_render("default");
         let built_in_buffer = render_snapshot(&mut built_in_app, 120, 36);
-        assert_eq!(built_in_buffer[(0u16, 0u16)].fg, Color::Cyan);
+        assert_eq!(built_in_buffer[(0u16, 1u16)].fg, Color::Cyan);
 
         let mut light_app = chat_page_app_for_render("light");
         let light_buffer = render_snapshot(&mut light_app, 120, 36);
-        assert_eq!(light_buffer[(0u16, 0u16)].fg, Color::Rgb(138, 127, 109));
+        assert_eq!(light_buffer[(0u16, 1u16)].fg, Color::Rgb(138, 127, 109));
         assert_eq!(light_buffer[(59u16, 20u16)].bg, Color::Rgb(239, 235, 226));
     }
 }

@@ -7,10 +7,10 @@
 [![作者: ChepleBob](https://img.shields.io/badge/作者-ChepleBob-00B4D8)](https://github.com/ChepleBob30)
 [![语言: Rust](https://img.shields.io/badge/语言-Rust-5F4C49)](https://www.rust-lang.org/)
 [![许可证: Apache v2](https://img.shields.io/badge/许可证-Apache%20v2-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
-[![TUI版本](https://img.shields.io/badge/TUI版本-v0.1.0--alpha.2-3D35DB)](https://github.com/binder-organization/Baihua-Client/releases)
-[![Core版本](https://img.shields.io/badge/Core版本-v0.2.0-EB9317)](https://github.com/binder-organization/Baihua-Client/tree/main/baihua-core)
+[![TUI版本](https://img.shields.io/badge/TUI版本-v0.1.0-3D35DB)](https://github.com/binder-organization/Baihua-Client/releases)
+[![Core版本](https://img.shields.io/badge/Core版本-v0.3.0-EB9317)](https://github.com/binder-organization/Baihua-Client/tree/main/baihua-core)
 
-[English](../../README.md) | 简体中文
+[English](../../README.md) | [简体中文](./README_zh-CN.md)
 
 ---
 
@@ -28,31 +28,39 @@
 
 ## 版本信息
 
-### 最新版本
-
-- TUI 0.1.0-alpha.2
-- Core 0.2.0
-
 ### 更新日志 - TUI
 
-#### 添加
+#### Added
 
-- 群聊中有人在打字时，会提示其他人；
-- 使用`/info`可以查看群聊成员在线情况；
-- 输入`#`可以开启消息搜索模式，按下enter或启用快速搜索模式即可搜索当前群聊的匹配文本；
-- 使用`/appearance`或在设置中选择`外观`可以修改界面颜色，目前外观配置文件存储于config/themes目录下，自带默认/高对比度/亮色三种外观配置；
-- 支持选中绝大多数文本。
+- Added a top sidebar.
+- Added a dark theme.
+- Added local cache, stored under the "~/.baihua/client/cache" directory.
+- Added an update module.
+- Added an installer for initial installation and automatic client updates.
+- Added the `/list_users` command to display all registered users.
+- Added the `/profile <username/UID>` command, which outputs in a prompt box. If left empty, it displays your own profile; entering a valid username or UID displays that person's profile.
+- Added support for displaying user avatars; avatars can be viewed when using `/profile`.
+- Added a new settings entry "Set Profile", supporting modification of nickname, bio, and phone number.
+- Added a new settings entry "Delete Account", which requires re-entering the password to delete.
+- Added a new settings entry "Change Password", which requires entering the old password once and the new password to take effect.
+- Added a new settings entry "Change Avatar", which takes effect by providing a valid link.
+- Added the `/search_users <keyword>` command to search for registered users.
+- Added a CLI tool; type `baihua` to start it, used to launch the client and perform installation and uninstallation operations.
 
-#### 更改
+#### Changed
 
-- 移除了`/list_member`，其功能已被整合到`/info`中；
-- 不再提示tab/esc/enter相关的操作；
-- 在设置里唤出的叠加层关闭时统一回到设置页面，而不是直接关闭叠加层。
+- Improved the private chat management page to display invitations sent by the user to others. Rejecting such an invitation cancels the invitation sent to the other person.
+- Enriched the content displayed by `/info`.
+- Added `/exit` as an alias for `/quit`.
+- `/login` and `/register` no longer support providing arguments directly for operation.
+- Box selection copying can now select all text.
+- In search mode, the currently selected match is specially marked with a different color (this content should be extended to the appearance list).
+- When unable to connect to the server, the "unable to connect to server" error no longer pops up repeatedly; after popping up once, it is marked using the top sidebar.
 
-#### 修复
+#### Fixed
 
-- 在部分情况下退出登录再重新登录回无法实时收到消息。
-
+- Fixed the issue where the prompt box could not automatically stretch to fit when a single line of text was too long.
+- Fixed the issue in non-quick search mode where using backspace to delete text would retain the original search results.
 
 ---
 

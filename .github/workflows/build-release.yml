@@ -1,0 +1,358 @@
+# Build and package the Baihua Client for all platforms on every merge to main,
+# then publish a GitHub release with the build artifacts.
+#
+# The workflow produces:
+# 1. Archives (for automatic updates via baihua-core/src/update.rs):
+#    baihua-<version>-<target-triple>.tar.gz   (macOS / Linux)
+#    baihua-<version>-<target-triple>.zip       (Windows)
+# 2. Standalone executables (for direct download and manual install):
+#    baihua-<version>-<target-triple>           (macOS / Linux)
+#    baihua-<version>-<target-triple>.exe       (Windows)
+#
+# Each archive is accompanied by a .sha256 checksum file.
+# The release tag uses the format tui-v<version> and is marked as pre-release
+# when the version contains alpha, beta, or rc.
+
+name: Build Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Read versions and changelogs from both packages before building.
+  # This step determines which products have version changes and what to release.
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare Release Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tui_version: ${{ steps.meta.outputs.tui_version }}
+      gui_version: ${{ steps.meta.outputs.gui_version }}
+      tui_prerelease: ${{ steps.meta.outputs.tui_prerelease }}
+      gui_prerelease: ${{ steps.meta.outputs.gui_prerelease }}
+      tui_changelog: ${{ steps.meta.outputs.tui_changelog }}
+      gui_changelog: ${{ steps.meta.outputs.gui_changelog }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read versions and changelogs
+        id: meta
+        shell: bash
+        run: |
+          # --- TUI version ---
+          if [ -f baihua-client-tui/Cargo.toml ]; then
+            TUI_VERSION=$(grep -m1 '^version' baihua-client-tui/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          else
+            TUI_VERSION=""
+          fi
+          echo "tui_version=$TUI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "TUI version: ${TUI_VERSION:-<not found>}"
+
+          # --- GUI version ---
+          if [ -f baihua-client-gui/Cargo.toml ]; then
+            GUI_VERSION=$(grep -m1 '^version' baihua-client-gui/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          else
+            GUI_VERSION=""
+          fi
+          echo "gui_version=$GUI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "GUI version: ${GUI_VERSION:-<not found>}"
+
+          # --- Pre-release detection ---
+          detect_prerelease() {
+            local version="$1"
+            if echo "$version" | grep -qiE '(alpha|beta|rc)'; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+          echo "tui_prerelease=$(detect_prerelease "$TUI_VERSION")" >> "$GITHUB_OUTPUT"
+          echo "gui_prerelease=$(detect_prerelease "$GUI_VERSION")" >> "$GITHUB_OUTPUT"
+
+          # --- TUI changelog (extract section for current version) ---
+          extract_changelog() {
+            local file="$1"
+            local version="$2"
+            if [ ! -f "$file" ]; then
+              echo "No changelog file found: $file"
+              return
+            fi
+            # Extract content between the version header and the next ## header (or end of file)
+            # Match "## [version]" or "## [Unreleased]"
+            awk -v ver="$version" '
+              /^## \[/ {
+                if (found) exit
+                if (index($0, "[" ver "]")) found=1
+                next
+              }
+              found { print }
+            ' "$file"
+          }
+
+          TUI_BODY=$(extract_changelog "CHANGELOG_TUI.md" "$TUI_VERSION")
+          if [ -z "$TUI_BODY" ]; then
+            TUI_BODY="No changelog provided for TUI version $TUI_VERSION."
+          fi
+          {
+            echo "tui_changelog<<TUI_CHANGELOG_EOF"
+            echo "$TUI_BODY"
+            echo "TUI_CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # --- GUI changelog ---
+          GUI_BODY=$(extract_changelog "CHANGELOG_GUI.md" "$GUI_VERSION")
+          if [ -z "$GUI_BODY" ]; then
+            GUI_BODY="No changelog provided for GUI version $GUI_VERSION."
+          fi
+          {
+            echo "gui_changelog<<GUI_CHANGELOG_EOF"
+            echo "$GUI_BODY"
+            echo "GUI_CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Lint and test before building releases.
+  # ---------------------------------------------------------------------------
+  check:
+    name: Lint and Test
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # Build matrix: one job per target, each running on its native runner so no
+  # cross-compilation toolchain is needed.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive_ext: tar.gz
+            exe_name: baihua
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive_ext: tar.gz
+            exe_name: baihua
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive_ext: zip
+            exe_name: baihua.exe
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive_ext: tar.gz
+            exe_name: baihua
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release -p baihua-client-tui --target ${{ matrix.target }}
+
+      # -- Package (Unix) ------------------------------------------------------
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          VERSION="${{ needs.prepare.outputs.tui_version }}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE="baihua-${VERSION}-${TARGET}.tar.gz"
+          STAGING="staging-${TARGET}"
+
+          mkdir -p "${STAGING}/bin" "${STAGING}/config"
+          cp "target/${TARGET}/release/baihua" "${STAGING}/bin/"
+          cp -R baihua-client-tui/config/. "${STAGING}/config/"
+
+          tar -czf "${ARCHIVE}" -C "${STAGING}" .
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+          echo "archive=${ARCHIVE}" >> "$GITHUB_ENV"
+          rm -rf "${STAGING}"
+
+      # -- Package (Windows) ---------------------------------------------------
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.prepare.outputs.tui_version }}"
+          $target = "${{ matrix.target }}"
+          $archive = "baihua-${version}-${target}.zip"
+          $staging = "staging-${target}"
+
+          New-Item -ItemType Directory -Force "${staging}\bin" | Out-Null
+          New-Item -ItemType Directory -Force "${staging}\config" | Out-Null
+
+          Copy-Item "target\${target}\release\baihua.exe" "${staging}\bin\"
+          Copy-Item -Recurse baihua-client-tui\config\* "${staging}\config\"
+
+          Compress-Archive -Path "${staging}\*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "${hash}  ${archive}" | Set-Content "${archive}.sha256"
+
+          echo "archive=${archive}" >> $env:GITHUB_ENV
+          Remove-Item -Recurse -Force $staging
+
+      # -- Upload archive artifact ---------------------------------------------
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.archive }}
+          path: |
+            ${{ env.archive }}
+            ${{ env.archive }}.sha256
+          retention-days: 30
+
+      # -- Upload standalone executable ----------------------------------------
+      - name: Upload standalone executable (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: baihua-${{ needs.prepare.outputs.tui_version }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/baihua
+          retention-days: 30
+
+      - name: Upload standalone executable (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: baihua-${{ needs.prepare.outputs.tui_version }}-${{ matrix.target }}.exe
+          path: target/${{ matrix.target }}/release/baihua.exe
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Collect all artifacts and publish a GitHub release for TUI.
+  # When baihua-client-gui is ready, add a parallel release job for GUI.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish TUI Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh artifacts/
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          VERSION="${{ needs.prepare.outputs.tui_version }}"
+          TAG="tui-v${VERSION}"
+          IS_PRERELEASE="${{ needs.prepare.outputs.tui_prerelease }}"
+          BODY="${{ needs.prepare.outputs.tui_changelog }}"
+
+          # Create and push the tag
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          # Build the gh release create command
+          ARGS=(
+            "$TAG"
+            "--title" "$TAG"
+            "--notes" "$BODY"
+          )
+
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            ARGS+=("--prerelease")
+          fi
+
+          # Attach all archives, checksums, and standalone executables from the artifacts directory
+          for file in artifacts/*; do
+            ARGS+=("$file")
+          done
+
+          gh release create "${ARGS[@]}"
+
+  # ---------------------------------------------------------------------------
+  # Placeholder: GUI release job.
+  # Uncomment and configure when baihua-client-gui is ready to publish.
+  # ---------------------------------------------------------------------------
+  # release-gui:
+  #   name: Publish GUI Release
+  #   needs: [prepare, build]
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Download GUI artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: artifacts
+  #         pattern: baihua-gui-*
+  #         merge-multiple: true
+  #
+  #     - name: Create tag and release
+  #       env:
+  #         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       shell: bash
+  #       run: |
+  #         VERSION="${{ needs.prepare.outputs.gui_version }}"
+  #         TAG="gui-v${VERSION}"
+  #         IS_PRERELEASE="${{ needs.prepare.outputs.gui_prerelease }}"
+  #         BODY="${{ needs.prepare.outputs.gui_changelog }}"
+  #
+  #         git tag "$TAG"
+  #         git push origin "$TAG"
+  #
+  #         ARGS=(
+  #           "$TAG"
+  #           "--title" "$TAG"
+  #           "--notes" "$BODY"
+  #         )
+  #
+  #         if [ "$IS_PRERELEASE" = "true" ]; then
+  #           ARGS+=("--prerelease")
+  #         fi
+  #
+  #         for file in artifacts/*; do
+  #           ARGS+=("$file")
+  #         done
+  #
+  #         gh release create "${ARGS[@]}"

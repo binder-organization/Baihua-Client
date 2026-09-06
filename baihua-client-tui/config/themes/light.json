@@ -2,6 +2,7 @@
   "app_background": "#efebe2",
   "message_border": "#8a7f6d",
   "room_border": "#8a7f6d",
+  "overlay_border": "#455a64",
   "message_text": "#2b2b2b",
   "selected_text": "#b3541e",
   "other_username_text": "#1f6f8b",
@@ -16,5 +17,6 @@
   "search_border": "#c62828",
   "selection_background": "#ffd54f",
   "search_match_background": "#ef9a9a",
+  "search_current_match_background": "#c62828",
   "read_state_text": "#1565c0"
 }

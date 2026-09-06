@@ -2,6 +2,7 @@
   "app_background": "default",
   "message_border": "cyan",
   "room_border": "cyan",
+  "overlay_border": "cyan",
   "message_text": "white",
   "selected_text": "yellow",
   "other_username_text": "cyan",
@@ -16,5 +17,6 @@
   "search_border": "red",
   "selection_background": "yellow",
   "search_match_background": "red",
+  "search_current_match_background": "light_yellow",
   "read_state_text": "blue"
 }
