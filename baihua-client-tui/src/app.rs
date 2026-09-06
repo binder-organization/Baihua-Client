@@ -50,8 +50,8 @@ use x25519_dalek::EphemeralSecret;
 /// 安全写入文件：创建文件时使用 0600 权限（仅所有者可读写），
 /// 防止敏感配置（如 preferences.json）被其他用户读取。
 fn secure_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -4346,9 +4346,7 @@ impl App {
                 // 一律切换匹配项。放在修饰键分支之前并用"任意修饰键"匹配，
                 // 是因为不同终端对 Ctrl/Ctrl+Shift+方向键的上报差异极大（Terminal.app 甚至不区分），
                 // 只认某一种组合键会表现为按了完全没反应、只剩输入框光标在动。
-                if matches!(key.code, KeyCode::Up | KeyCode::Down)
-                    && self.in_search_mode()
-                {
+                if matches!(key.code, KeyCode::Up | KeyCode::Down) && self.in_search_mode() {
                     debug_log(&format!("搜索切换匹配项: {key:?}"));
                     self.navigate_search_result(key.code == KeyCode::Up);
                     return false;
@@ -4375,8 +4373,7 @@ impl App {
                         let input_text = self.input_collector.message_input_state.text();
                         if let Some(command_prefix) = input_text.strip_prefix('/') {
                             // 补全列表开启时上下键选择命令，禁用群聊切换
-                            let candidate_count =
-                                self.completion_candidates(command_prefix).len();
+                            let candidate_count = self.completion_candidates(command_prefix).len();
                             if candidate_count > 0 {
                                 let current = self.command_list_state.selected().unwrap_or(0);
                                 let next = if key.code == KeyCode::Up {
