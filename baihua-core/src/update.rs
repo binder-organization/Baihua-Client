@@ -248,7 +248,7 @@ pub fn download_package(package: &ReleasePackage) -> Result<std::path::PathBuf, 
         .bytes()
         .map_err(|error| format!("download interrupted: {error}"))?;
     let expected = client
-        .get(format!("{}.sha256", &package.download_url))
+        .get(format!("{}.sha256", package.download_url))
         .send()
         .map_err(|error| format!("failed to fetch the digest file: {error}"))?
         .error_for_status()
