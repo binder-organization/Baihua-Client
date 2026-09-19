@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 baihua-core = { path = "../baihua-core" }
-eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui = "0.36.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde_json = "1"
