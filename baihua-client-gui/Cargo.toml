@@ -4,7 +4,9 @@ version = "0.1.0-alpha.1"
 edition = "2024"
 
 [[bin]]
-name = "baihua-client-gui"
+# The executable is named `baihua-gui` (matching the installer, the `baihua gui`
+# launcher and the release workflow); the package name stays `baihua-client-gui`.
+name = "baihua-gui"
 path = "src/main.rs"
 
 [dependencies]
