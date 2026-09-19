@@ -1,10 +1,10 @@
-//! 终端头像渲染。
+//! Terminal avatar rendering.
 //!
-//! 终端没有图片层，能用的最小公共单元是真色前景/背景加半块字符 `▀`：
-//! 一个字符格的上半像素走前景色、下半像素走背景色，于是 1 格可承载 2 行像素，
-//! 2 列 × 2 行的格子就能放下 2×4 的头像缩略图。该写法不依赖 kitty 图形协议或 sixel，
-//! 在任何支持真色的终端（含 macOS 自带 Terminal.app）里都能出图，
-//! 终端不支持真色时由终端自行降级为最接近的色，不会出现乱码。
+//! The terminal has no image layer; the smallest common unit available is true-color foreground/background plus the half-character `▀`:
+//! the top half-pixels of a character cell take the foreground color and the bottom half-pixels take the background color, so 1 cell can carry 2 rows of pixels,
+//! a 2-column × 2-row cell can hold a 2×4 avatar thumbnail. This approach does not depend on the kitty graphics protocol or sixel,
+//! it can produce images in any terminal supporting true color (including macOS's built-in Terminal.app),
+//! when the terminal does not support true color, the terminal itself degrades to the closest color, and no garbled characters appear.
 
 use image::imageops::FilterType;
 use ratatui::{
@@ -13,7 +13,7 @@ use ratatui::{
     style::{Color, Style},
 };
 
-/// 已解码并缩放到位的头像像素块：行主序的 RGBA 字节，宽度按列、高度按像素行（= 单元格行数 × 2）。
+/// Decoded and scaled avatar pixel block: RGBA bytes in row-major order, width by columns, height by pixel rows (= cell row count × 2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AvatarPixels {
     columns: usize,
@@ -22,13 +22,13 @@ pub struct AvatarPixels {
 }
 
 impl AvatarPixels {
-    /// 占用的单元格宽高（单元格高度是像素行数的一半）
+    /// Cell size occupied (cell height is half the pixel row count)
     pub fn cell_size(&self) -> (usize, usize) {
         (self.columns, self.pixel_rows / 2)
     }
 
-    /// 把头像画进区域左上角的若干单元格：透明像素按调用方给的应用背景色混合，
-    /// 因此浅色主题与深色主题下都不会在头像边缘留下黑边。
+    /// Paint the avatar into cells at the top-left of the area: transparent pixels are blended with the application background color provided by the caller,
+    /// so no black border is left at the avatar edge under either light or dark themes.
     pub fn paint(&self, frame: &mut Frame, area: Rect, background: Color) {
         let base_background = match background {
             Color::Rgb(red, green, blue) => [red, green, blue],
@@ -54,7 +54,7 @@ impl AvatarPixels {
         }
     }
 
-    /// 取指定像素行与列的颜色，并按 alpha 与底色混合。越界按底色处理（图片被目标尺寸截断时不留空洞）。
+    /// Get the color at the specified pixel row and column, and blend with alpha against the background. Out-of-bounds is handled as the background color (no holes when the image is cropped to the target size).
     fn blended(&self, pixel_row: usize, column: usize, base: [u8; 3]) -> Color {
         let Some(pixel) = self.rgba.get(pixel_row * self.columns + column) else {
             return Color::Rgb(base[0], base[1], base[2]);
@@ -74,9 +74,9 @@ impl AvatarPixels {
     }
 }
 
-/// 把任意图片字节解码成 `columns` 列 × `rows` 行的头像像素块：
-/// 先按短边居中裁成正方形（避免非正方形头像被拉伸变形），再缩放到目标像素尺寸。
-/// 解码失败（不是受支持的图片、内容损坏）时返回 None，由调用方退回占位显示。
+/// Decode any image bytes into an avatar pixel block of `columns` columns × `rows` rows:
+/// first crop to a square centered on the short side (to avoid stretching distortion for non-square avatars), then scale to the target pixel size.
+/// Return None when decoding fails (not a supported image, content corrupted); the caller falls back to placeholder display.
 pub fn build_avatar_pixels(
     image_bytes: &[u8],
     columns: usize,
@@ -96,12 +96,12 @@ pub fn build_avatar_pixels(
     })
 }
 
-/// 把正方形原图缩到头像块的精确像素尺寸。
+/// Scale the square original image to the exact pixel size of the avatar block.
 ///
-/// 头像原图往往比目标大一到两个数量级（几百像素压到几十像素）。这种倍率的缩小如果
-/// 直接上 Lanczos，采样核覆盖不到整个源区域，会漏掉像素并起振铃（边缘出现原图没有的亮点），
-/// 所以超过两倍缩率时走 image 的 thumbnail 路径 —— 它按整块源区域做面积加权取样，
-/// 正是"先低通再采样"。缩率不大时直接 Lanczos，避免多余的平滑损失锐度。
+/// The original avatar image is often one to two orders of magnitude larger than the target (hundreds of pixels squeezed into dozens). Such a shrink ratio, if
+/// using Lanczos directly, the sampling kernel cannot cover the entire source area, causing pixels to be missed and ringing (bright dots at the edge that were not in the original),
+/// so when the shrink ratio exceeds two, use image's thumbnail path -- it does area-weighted sampling over the entire source region,
+/// which is exactly "low-pass then sample". For small ratios, use Lanczos directly to avoid unnecessary smoothing and loss of sharpness.
 fn resample_to_cells(
     square: &image::RgbaImage,
     target_columns: u32,
@@ -121,7 +121,7 @@ fn resample_to_cells(
     )
 }
 
-/// 居中裁出边长等于短边的正方形 RGBA 图。
+/// Crop a square RGBA image centered with side length equal to the short side.
 fn cropped_to_square(decoded: &image::DynamicImage) -> image::RgbaImage {
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -131,8 +131,8 @@ fn cropped_to_square(decoded: &image::DynamicImage) -> image::RgbaImage {
     image::imageops::crop_imm(&rgba, left, top, side, side).to_image()
 }
 
-/// 头像不可用时（未设置、下载失败、格式不支持）的占位色：按用户 ID 稳定哈希到一组中等亮度色，
-/// 同一用户每次显示一致，不同用户能一眼区分，且不会亮到盖过正文。
+/// Placeholder color when the avatar is unavailable (not set, download failed, format unsupported): stably hashed by user ID to a set of medium-brightness colors,
+/// the same user looks the same every time, different users are easily distinguishable, and it is not so bright as to overwhelm the body text.
 pub fn placeholder_color(seed: &str) -> Color {
     let mut hash: u64 = 5381;
     for byte in seed.bytes() {
@@ -151,7 +151,7 @@ pub fn placeholder_color(seed: &str) -> Color {
     Color::Rgb(red, green, blue)
 }
 
-/// 取用户名用于占位显示的首字符（拉丁字母转大写，其它文字原样取一个字），无内容时用问号。
+/// Get the first character of the username for placeholder display (Latin letters are uppercased, other scripts take one character as-is); use a question mark when empty.
 pub fn placeholder_initial(username: &str) -> String {
     username
         .chars()
@@ -170,7 +170,7 @@ pub fn placeholder_initial(username: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 造一张纯色带透明角的测试图（PNG 字节）
+    /// Create a test image with solid color and transparent corners (PNG bytes)
     fn synthetic_png(width: u32, height: u32) -> Vec<u8> {
         let mut image_buffer =
             image::RgbaImage::from_pixel(width, height, image::Rgba([220, 30, 30, 255]));
@@ -178,33 +178,33 @@ mod tests {
         let mut encoded = std::io::Cursor::new(Vec::new());
         image_buffer
             .write_to(&mut encoded, image::ImageFormat::Png)
-            .expect("测试图片应能编码");
+            .expect("Test image should be encodable");
         encoded.into_inner()
     }
 
     #[test]
     fn avatar_pixels_have_exactly_two_pixel_rows_per_cell_row() {
-        let pixels =
-            build_avatar_pixels(&synthetic_png(64, 64), 3, 2).expect("测试图片应能解码为头像");
+        let pixels = build_avatar_pixels(&synthetic_png(64, 64), 3, 2)
+            .expect("Test image should be decodable as an avatar");
         assert_eq!(pixels.cell_size(), (3, 2));
         assert_eq!(pixels.rgba.len(), 3 * 4);
     }
 
     #[test]
     fn large_source_is_downsampled_in_two_stages_and_still_lands_on_the_exact_grid() {
-        // 512×512 远大于目标，会走"面积平均 + Lanczos"的两段路径，
-        // 但输出尺寸必须仍是精确的 列 × 行×2 像素
-        let pixels =
-            build_avatar_pixels(&synthetic_png(512, 512), 16, 8).expect("大图应能缩成头像块");
+        // 512×512 is far larger than the target, it will go through the two-stage path of "area averaging + Lanczos",
+        // but the output size must still be exactly columns × rows×2 pixels
+        let pixels = build_avatar_pixels(&synthetic_png(512, 512), 16, 8)
+            .expect("Large image should be able to shrink to an avatar block");
         assert_eq!(pixels.cell_size(), (16, 8));
         assert_eq!(pixels.rgba.len(), 16 * 16);
     }
 
     #[test]
     fn non_square_source_is_center_cropped_before_scaling() {
-        // 12×3 的横条按短边裁成 3×3 后缩放，宽高都取到目标值，不会被拉扁
-        let pixels =
-            build_avatar_pixels(&synthetic_png(12, 3), 2, 2).expect("横条图应能裁切并缩放");
+        // A 12×3 horizontal bar is cropped to 3×3 on the short side then scaled; width and height both reach the target, it will not be stretched
+        let pixels = build_avatar_pixels(&synthetic_png(12, 3), 2, 2)
+            .expect("Horizontal bar image should be cropable and scalable");
         assert_eq!(pixels.cell_size(), (2, 2));
     }
 
@@ -226,13 +226,15 @@ mod tests {
     #[test]
     fn painting_writes_half_block_cells_with_truecolor_pair() {
         use ratatui::{Terminal, backend::TestBackend};
-        let pixels = build_avatar_pixels(&synthetic_png(16, 16), 2, 2).expect("应能解码头像");
-        let mut terminal = Terminal::new(TestBackend::new(8, 4)).expect("测试终端应能创建");
+        let pixels =
+            build_avatar_pixels(&synthetic_png(16, 16), 2, 2).expect("should decode avatar");
+        let mut terminal =
+            Terminal::new(TestBackend::new(8, 4)).expect("test terminal should be created");
         terminal
             .draw(|frame| pixels.paint(frame, frame.area(), Color::Rgb(10, 10, 10)))
-            .expect("绘制头像不应失败");
+            .expect("avatar drawing should not fail");
         let buffer = terminal.backend().buffer().clone();
-        let cell = buffer.cell((0, 0)).expect("首格应存在");
+        let cell = buffer.cell((0, 0)).expect("first cell should exist");
         assert_eq!(cell.symbol(), "▀");
         assert!(matches!(cell.fg, Color::Rgb(_, _, _)));
         assert!(matches!(cell.bg, Color::Rgb(_, _, _)));

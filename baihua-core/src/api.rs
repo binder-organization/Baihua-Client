@@ -333,13 +333,15 @@ pub struct MessageInfo {
     /// 一条消息读不出来就会废掉整页历史，故同样收敛成空串，显示侧退回"未知用户"。
     #[serde(default, deserialize_with = "null_to_empty_string")]
     pub sender_id: String,
-    /// 加密房间的历史消息此字段为 null（密文存于 encrypted_content），用占位文本兜底
-    #[serde(default = "default_encrypted_content")]
+    /// 加密房间的历史消息此字段为 null（密文存于 encrypted_content），按空串收下。
+    /// 空内容只是"这条历史消息没有可读正文"的记号，具体显示什么占位文案由各界面按自己的语言表决定
+    /// （语言键 `message_encrypted_history_unavailable`）：核心层不写死某一种语言的提示。
+    #[serde(default, deserialize_with = "null_to_empty_string")]
     pub content: String,
     pub created_at: String,
 }
 
-/// 服务端可空的外键字段（引用用户、用户被删后置 null）统一按空串收下：
+/// 服务端可空字段（引用用户被删后为 null、加密房间的正文为 null）统一按空串收下：
 /// 键缺失与显式 null 两种情况都要接住，否则整批数据一起废掉。
 fn null_to_empty_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -347,10 +349,6 @@ where
 {
     let value = <Option<String>>::deserialize(deserializer)?;
     Ok(value.unwrap_or_default())
-}
-
-fn default_encrypted_content() -> String {
-    "[加密历史消息，会话结束后已不可读]".to_string()
 }
 
 /// Messages response with pagination
@@ -853,7 +851,7 @@ impl Connector {
         let status = response.status();
         if !status.is_success() {
             return Err(ConnectorError::InvalidResponse(format!(
-                "静态资源获取失败: HTTP {status}"
+                "failed to fetch the static resource: HTTP {status}"
             )));
         }
         Ok(response.bytes()?.to_vec())
@@ -1154,8 +1152,8 @@ fn parse_handshake_data(
     })
 }
 
-/// 从 JSON 数据中解析消息对象。content 为可选（加密房间历史为 null），
-/// 与 HTTP DTO 的 serde default 一致用占位文本兜底，绝不因单字段缺失丢弃整条消息
+/// 从 JSON 数据中解析消息对象。content 为可选（加密房间的历史为 null），
+/// 与 HTTP DTO 一致按空串收下（界面对空正文补本地化的占位文案），绝不因单字段缺失丢弃整条消息
 fn parse_message_info(data: &serde_json::Value) -> Option<MessageInfo> {
     Some(MessageInfo {
         id: data.get("id")?.as_str()?.to_string(),
@@ -1165,7 +1163,7 @@ fn parse_message_info(data: &serde_json::Value) -> Option<MessageInfo> {
             .get("content")
             .and_then(|value| value.as_str())
             .map(|value| value.to_string())
-            .unwrap_or_else(default_encrypted_content),
+            .unwrap_or_default(),
         created_at: data.get("created_at")?.as_str()?.to_string(),
     })
 }
@@ -1437,12 +1435,16 @@ mod tests {
         assert_eq!(rooms[1].created_by, "");
 
         let history: MessagesData = serde_json::from_str(
-            r#"{"messages":[{"id":"msg-1","room_id":"room-1","sender_id":null,"content":"你好","created_at":"2026-09-05T00:00:00Z"}],"has_more":false,"next_cursor":null}"#,
+            r#"{"messages":[{"id":"msg-1","room_id":"room-1","sender_id":null,"content":"你好","created_at":"2026-09-05T00:00:00Z"},{"id":"msg-2","room_id":"room-1","sender_id":"user-a","content":null,"created_at":"2026-09-05T00:01:00Z"},{"id":"msg-3","room_id":"room-1","sender_id":"user-a","created_at":"2026-09-05T00:02:00Z"}],"has_more":false,"next_cursor":null}"#,
         )
-        .expect("sender_id 为 null 不该让整页消息解码失败");
-        assert_eq!(history.messages.len(), 1);
+        .expect("sender_id 与 content 为 null 都不该让整页消息解码失败");
+        assert_eq!(history.messages.len(), 3);
         assert_eq!(history.messages[0].sender_id, "");
         assert_eq!(history.messages[0].content, "你好");
+        // 加密房间的正文服务端给 null（密文存在 encrypted_content 里）：空内容是这个接缝的记号，
+        // 不是给用户看的文案，界面按自己的语言表补占位文字
+        assert_eq!(history.messages[1].content, "");
+        assert_eq!(history.messages[2].content, "");
     }
 
     #[test]
@@ -1698,7 +1700,7 @@ mod tests {
 
         // 发送聊天请求
         connector
-            .create_room_request(&partner_id, "建立私密聊天", false)
+            .create_room_request(&partner_id, "建立私聊", false)
             .expect("create room request failed");
 
         // 对方登录后查看待处理请求并接受

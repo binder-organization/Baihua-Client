@@ -1,6 +1,6 @@
 [package]
 name = "baihua-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [lib]
@@ -8,17 +8,18 @@ name = "baihua_core"
 path = "src/lib.rs"
 
 [dependencies]
+chrono = { version = "0.4.45", features = ["clock"] }
+dirs = "6.0.0"
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+hkdf = "0.13"
+http = "1"
+rand = "0.10.2"
+reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
-thiserror = "2"
-tungstenite = "0.30.0"
-http = "1"
-x25519-dalek = { version = "3", features = ["static_secrets"] }
-ed25519-dalek = { version = "3", features = ["rand_core"] }
-chacha20poly1305 = "0.11"
-hkdf = "0.13"
 sha2 = "0.11"
+tungstenite = "0.30.0"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 base64 = "0.23"
-rand = "0.10.2"
-dirs = "6.0.0"
+chacha20poly1305 = "0.11"
+thiserror = "2"

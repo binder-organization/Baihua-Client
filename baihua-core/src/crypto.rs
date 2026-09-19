@@ -14,24 +14,27 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-/// 加密模块错误类型
+/// Encryption module error type
+///
+/// 错误文案是给开发者看的**技术细节**，统一用英文：界面把它拼在本地化前缀后面
+/// （`format!("{}: {error}", self.text("error_key_derivation"))`），核心层不产出某一种语言的用户文案。
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    #[error("base64 数据解码失败: {0}")]
+    #[error("failed to decode the base64 data: {0}")]
     Base64(#[from] base64::DecodeError),
-    #[error("加密或解密失败")]
+    #[error("encryption or decryption failed")]
     CipherFailed,
-    #[error("公钥数据无效")]
+    #[error("invalid public key data")]
     InvalidKeyData,
-    #[error("消息内容不是有效的 UTF-8 文本")]
+    #[error("the message body is not valid UTF-8 text")]
     InvalidText,
 }
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
 
-/// 登录凭据本地确定性加密：固定密钥 + 固定零值 nonce，同一密码恒定产生同一密文。
-/// 注册与登录使用相同变换，服务端对密文做 bcrypt 存储与校验，明文密码不再经过网络。
-/// 注意：密文本身即等效凭据，且此密钥内嵌于客户端，属于防窃听级别的凭据变换。
+/// Local deterministic encryption of login credentials: fixed key + fixed zero nonce, same password always produces the same ciphertext.
+/// Registration and login use the same transformation; the server stores and verifies the ciphertext with bcrypt, so the plaintext password never goes over the network.
+/// Note: the ciphertext itself is an equivalent credential, and this key is embedded in the client, belonging to a passively-secure credential transformation.
 pub fn encrypt_login_password(password: &str) -> String {
     let key_bytes: [u8; 32] = Sha256::digest(b"baihua-client-login-credential-key-v1").into();
     let cipher = XChaCha20Poly1305::new((&key_bytes).into());
@@ -56,23 +59,23 @@ pub fn generate_ephemeral_secret() -> EphemeralSecret {
     EphemeralSecret::random_from_rng(&mut UnwrapErr(SysRng))
 }
 
-/// 临时公钥编码为 base64
+/// Encode the ephemeral public key as base64
 pub fn encode_x25519_public(secret: &EphemeralSecret) -> String {
     BASE64.encode(PublicKey::from(secret).as_bytes())
 }
 
-/// 身份公钥编码为 base64
+/// Encode the identity public key as base64
 pub fn encode_identity_public(identity: &SigningKey) -> String {
     BASE64.encode(identity.verifying_key().to_bytes())
 }
 
-/// 以身份私钥对临时公钥字节签名（服务端文档约定的签名对象）
+/// Sign the ephemeral public key bytes with the identity private key (the signature object as specified in the server documentation)
 pub fn sign_public_key(identity: &SigningKey, public_key_base64: &str) -> Result<String> {
     let public_bytes = BASE64.decode(public_key_base64)?;
     Ok(BASE64.encode(identity.sign(&public_bytes).to_bytes()))
 }
 
-/// 校验对端握手签名：对端身份公钥是否签署了其临时公钥
+/// Verify the peer's handshake signature: whether the peer's identity public key signed its ephemeral public key
 pub fn verify_handshake_signature(
     identity_key_base64: &str,
     public_key_base64: &str,
@@ -98,8 +101,8 @@ pub fn verify_handshake_signature(
     verified.is_ok()
 }
 
-/// 消耗己方临时私钥与对端临时公钥完成 Diffie-Hellman，
-/// 再经 HKDF-SHA256 派生出 32 字节对称会话密钥
+/// Perform Diffie-Hellman using the own ephemeral private key and the peer's ephemeral public key,
+/// then derive a 32-byte symmetric session key via HKDF-SHA256
 pub fn derive_shared_key(
     ephemeral_secret: EphemeralSecret,
     peer_public_key_base64: &str,
@@ -116,7 +119,7 @@ pub fn derive_shared_key(
     Ok(output_key)
 }
 
-/// 加密聊天消息：24 字节随机 nonce + XChaCha20Poly1305 密文，拼接后 base64
+/// Encrypt a chat message: 24-byte random nonce + XChaCha20Poly1305 ciphertext, concatenated and base64-encoded
 pub fn encrypt_message(key: &[u8; 32], plaintext: &str) -> Result<String> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce_bytes = [0u8; 24];
@@ -131,10 +134,10 @@ pub fn encrypt_message(key: &[u8; 32], plaintext: &str) -> Result<String> {
     Ok(BASE64.encode(blob))
 }
 
-/// 解密聊天消息，为 encrypt_message 的逆过程
+/// Decrypt a chat message; the inverse of encrypt_message
 pub fn decrypt_message(key: &[u8; 32], blob_base64: &str) -> Result<String> {
     let blob = BASE64.decode(blob_base64)?;
-    // nonce(24) + Poly1305 标签(16) 为最小长度
+    // nonce(24) + Poly1305 tag(16) is the minimum length
     if blob.len() < 40 {
         return Err(CryptoError::CipherFailed);
     }
@@ -147,17 +150,17 @@ pub fn decrypt_message(key: &[u8; 32], blob_base64: &str) -> Result<String> {
     String::from_utf8(plaintext).map_err(|_| CryptoError::InvalidText)
 }
 
-/// 静态存储加解密密钥：由固定盐派生，供登录令牌写入配置文件时加密，防止明文落盘
+/// Static storage encryption/decryption key: derived from a fixed salt, used to encrypt the login token when writing to the config file, preventing plaintext on disk
 fn at_rest_key() -> [u8; 32] {
     Sha256::digest(b"baihua-client-at-rest-key-v1").into()
 }
 
-/// 加密敏感配置（登录令牌）用于静态存储，解密经 decrypt_at_rest
+/// Encrypt sensitive config (login token) for static storage; decrypt via decrypt_at_rest
 pub fn encrypt_at_rest(plaintext: &str) -> String {
     encrypt_message(&at_rest_key(), plaintext).expect("加密静态配置不会失败")
 }
 
-/// 解密静态存储的敏感配置；数据损坏或密钥不符时返回 None
+/// Decrypt a statically stored sensitive config; returns None when the data is corrupted or the key does not match
 pub fn decrypt_at_rest(blob_base64: &str) -> Option<String> {
     decrypt_message(&at_rest_key(), blob_base64).ok()
 }

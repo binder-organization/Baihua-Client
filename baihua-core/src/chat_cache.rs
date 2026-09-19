@@ -1,43 +1,43 @@
-//! 聊天消息本地缓存。
+//! Local cache for chat messages.
 //!
-//! 落盘位置与服务端同一目录树下的客户端缓存子目录：
+//! The on-disk location is a client cache subdirectory under the same directory tree as the server:
 //! `<$BAIHUA_DIR|~/.baihua>/client/cache/chat_msg/<用户 ID>/<房间 ID>.json`，
-//! 按用户隔离，避免同一台机器上多账号互相看到对方的聊天记录。
+//! Isolated by user to prevent multiple accounts on the same machine from seeing each other's chat records.
 //!
-//! 缓存边界（安全前提）：只缓存未加密房间的消息。端到端加密私聊的明文只在内存里存在，
-//! 会话结束后服务端也只留密文，把解密结果写到磁盘会让"端到端"退化成"本机可读"，
-//! 因此加密房间一律不写入、不读取，退出登录时也不会为它们建文件。
+//! Cache boundary (security premise): only cache messages from unencrypted rooms. Plaintext for end-to-end encrypted private chats exists only in memory,
+//! after the session ends the server also keeps only ciphertext; writing the decryption result to disk would degrade "end-to-end" to "readable on this machine",
+//! so encrypted rooms are never written or read, and no files are created for them on logout.
 //!
-//! 完整性：每个房间的文件同时记录服务端的更早消息游标 `older_cursor` 与 `has_more`，
-//! 切回房间时先把缓存整体载入显示，再用服务端最新一页按消息 ID 合并（只增不减、按时间排序），
-//! 因此既不必重复拉取已看过的历史，也不会因为只拉一页而丢掉本地已有的更早消息。
+//! Integrity: each room's file records both the server's older message cursor `older_cursor` and `has_more`,
+//! when returning to a room, the full cache is loaded and displayed first, then merged with the server's latest page by message ID (only increasing, sorted by time),
+//! so there is no need to re-fetch already-seen history, and no local earlier messages are lost from fetching only one page.
 
 use crate::api::MessageInfo;
 use serde::{Deserialize, Serialize};
 
-/// 单个房间的缓存文件内容：消息列表加上恢复分页所需的游标信息。
+/// The cache file content for a single room: message list plus cursor info for restoring pagination.
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedRoom {
-    /// 缓存格式版本，格式变化时旧文件直接作废而不是强行解析
+    /// Cache format version; when the format changes, old files are invalidated rather than forcibly parsed
     version: u32,
     room_id: String,
-    /// 已缓存的最早一条消息的服务端 ID（服务端 before 游标），None 表示本地已握有全部历史
+    /// The server ID of the earliest cached message (server before cursor); None means the local side already has all history
     older_cursor: Option<String>,
-    /// 服务端是否仍报告有更早消息可拉
+    /// Whether the server still reports having older messages to fetch
     has_more: bool,
-    /// 落盘时刻（Unix 秒），用于排查缓存新旧
+    /// On-disk timestamp (Unix seconds), used for debugging cache freshness
     saved_at: i64,
     messages: Vec<MessageInfo>,
 }
 
-/// 一个账号的消息缓存。目录不可用（拿不到主目录、磁盘只读）时不创建实例，调用方按无缓存处理。
+/// Message cache for one account. When the directory is unavailable (cannot get home directory, disk read-only), no instance is created and the caller treats it as having no cache.
 #[derive(Debug, Clone)]
 pub struct ChatCache {
     directory: std::path::PathBuf,
 }
 
 impl ChatCache {
-    /// 为指定用户打开缓存目录（不存在则创建）。用户 ID 为空或目录无法建立时返回 None。
+    /// Open the cache directory for a specified user (create if not exists). Returns None when the user ID is empty or the directory cannot be established.
     pub fn open(user_id: &str) -> Option<Self> {
         if user_id.is_empty() {
             return None;
@@ -49,8 +49,8 @@ impl ChatCache {
         Some(Self { directory })
     }
 
-    /// 在指定根目录下为某用户打开缓存目录。供测试与自定义存储位置的调用方使用，
-    /// 语义与 `open` 一致，只是不从环境变量与主目录推导根路径。
+    /// Open a cache directory for a user under a specified root. Used by tests and callers with custom storage locations,
+    /// Same semantics as `open`, except the root path is not derived from environment variables and the home directory.
     pub fn open_in(user_id: &str, root: &std::path::Path) -> Self {
         let directory = root.join(safe_file_stem(user_id));
         let _ = std::fs::create_dir_all(&directory);
@@ -62,7 +62,7 @@ impl ChatCache {
             .join(format!("{}.json", safe_file_stem(room_id)))
     }
 
-    /// 读取某房间的缓存；文件缺失、损坏、版本不符或房间为空时返回 None。
+    /// Read the cache for a room; returns None when the file is missing, corrupted, version mismatch, or the room is empty.
     pub fn load_room(&self, room_id: &str) -> Option<CachedMessages> {
         let content = std::fs::read_to_string(self.file_path(room_id)).ok()?;
         let cached: CachedRoom = serde_json::from_str(&content).ok()?;
@@ -76,7 +76,7 @@ impl ChatCache {
         })
     }
 
-    /// 整房写入（切房加载、翻页、全量搜索之后调用）。消息为空时删除文件而不是留个空壳。
+    /// Write the entire room (called after room switching, pagination, full search). Deletes the file when messages are empty instead of leaving an empty shell.
     pub fn store_room(
         &self,
         room_id: &str,
@@ -90,7 +90,7 @@ impl ChatCache {
         }
         let mut ordered = merge_by_id(messages, &[]);
         sort_messages(&mut ordered);
-        // 单房间只保留最近的这部分消息，超出的最旧部分丢弃（游标仍指向服务端，可再次拉回）
+        // Keep only the most recent portion for a single room; discard the oldest excess (the cursor still points to the server, so it can be fetched again)
         if ordered.len() > 2000 {
             let excess = ordered.len() - 2000;
             ordered.drain(0..excess);
@@ -112,7 +112,7 @@ impl ChatCache {
         let _ = std::fs::write(self.file_path(room_id), serialized);
     }
 
-    /// 追加少量消息（实时收到或自己发出）：与已有缓存按 ID 合并，避免整文件重写时丢历史。
+    /// Append a few messages (received in real-time or sent by self): merge with the existing cache by ID to avoid losing history when rewriting the whole file.
     pub fn append_messages(&self, room_id: &str, messages: &[MessageInfo]) {
         if messages.is_empty() {
             return;
@@ -135,7 +135,7 @@ impl ChatCache {
         );
     }
 
-    /// 删除某房间缓存（被移出房间、主动退房、本地关闭私聊时调用）。
+    /// Delete a room's cache (called when removed from the room, voluntarily left, or a private chat is locally closed).
     pub fn forget_room(&self, room_id: &str) {
         let path = self.file_path(room_id);
         if path.exists() {
@@ -143,7 +143,7 @@ impl ChatCache {
         }
     }
 
-    /// 清空当前账号的全部缓存（注销账户时调用，绝不留残余）。
+    /// Clear all caches for the current account (called on logout; leave no residue).
     pub fn clear_all(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.directory) {
             for entry in entries.flatten() {
@@ -160,7 +160,7 @@ impl ChatCache {
     }
 }
 
-/// `load_room` 的返回视图：缓存的消息与恢复分页所需的游标。
+/// Return view of `load_room`: cached messages plus cursor for restoring pagination.
 #[derive(Debug, Clone)]
 pub struct CachedMessages {
     pub messages: Vec<MessageInfo>,
@@ -168,8 +168,8 @@ pub struct CachedMessages {
     pub has_more: bool,
 }
 
-/// 把两批消息按 ID 合并成一批：已有的优先保留（加密私聊里本地是解密后的明文，
-/// 服务端回的是密文占位），新出现的条目追加进来。
+/// Merge two batches of messages by ID into one: existing ones are kept first (in encrypted private chats, the local side has decrypted plaintext,
+/// the server returns a ciphertext placeholder), newly appearing entries are appended.
 fn merge_by_id(existing: &[MessageInfo], incoming: &[MessageInfo]) -> Vec<MessageInfo> {
     let mut merged: Vec<MessageInfo> = Vec::with_capacity(existing.len() + incoming.len());
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -181,14 +181,14 @@ fn merge_by_id(existing: &[MessageInfo], incoming: &[MessageInfo]) -> Vec<Messag
     merged
 }
 
-/// 按创建时间升序排列；时间相同的按服务端 ID（UUIDv7 本身单调）兜底，保证显示顺序稳定。
+/// Sort by creation time ascending; ties broken by server ID (UUIDv7 is itself monotonically increasing), ensuring stable display order.
 fn sort_messages(messages: &mut [MessageInfo]) {
     messages
         .sort_by(|left, right| (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id)));
 }
 
-/// 把任意字符串压成可安全用作文件名的片段：UUID 与房间 ID 原样通过，
-/// 其余字符（含路径分隔符）替换为下划线，防止越出缓存目录。
+/// Compress any string into a fragment safe for use as a filename: UUIDs and room IDs pass through as-is,
+/// other characters (including path separators) are replaced with underscores to prevent escaping the cache directory.
 fn safe_file_stem(text: &str) -> String {
     text.chars()
         .map(|character| match character {

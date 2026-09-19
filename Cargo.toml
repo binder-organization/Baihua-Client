@@ -2,6 +2,7 @@
 members = [
     "baihua-client-tui",
     "baihua-client-gui",
+    "baihua-cli",
     "baihua-core",
 ]
 resolver = "3"

@@ -1,12 +1,12 @@
-//! 客户端本地目录与资源定位。
+//! Client local directories and resource location.
 //!
-//! 目录根与服务端保持一致的约定：优先取环境变量 `BAIHUA_DIR`，否则用用户主目录下的
+//! The root directory follows the same convention as the server: prefer the environment variable `BAIHUA_DIR`, otherwise use the user's home directory's
 //! `.baihua`。服务端把数据放在该根目录，客户端统一放在其下的 `client` 子目录，
-//! 两端共用同一棵树但不互相覆盖。
+//! both sides share the same tree but do not overwrite each other.
 
 use std::path::PathBuf;
 
-/// 数据根目录：`$BAIHUA_DIR` 或 `~/.baihua`。取不到主目录时返回 None（调用方跳过本地存储）。
+/// Data root directory: `$BAIHUA_DIR` or `~/.baihua`. Returns None when the home directory cannot be obtained (the caller skips local storage).
 pub fn data_root() -> Option<PathBuf> {
     if let Some(override_directory) = std::env::var_os("BAIHUA_DIR") {
         let directory = PathBuf::from(override_directory);
@@ -18,56 +18,55 @@ pub fn data_root() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".baihua"))
 }
 
-/// 客户端专属目录 `<$BAIHUA_DIR|~/.baihua>/client`。
+/// Client-specific directory `<$BAIHUA_DIR|~/.baihua>/client`.
 fn client_root() -> Option<PathBuf> {
     data_root().map(|root| root.join("client"))
 }
 
-/// 可再生数据的根 `<客户端目录>/cache`。里面全部是"删了也能重新拿回来"的东西，
-/// 卸载时可以选择一并清掉。
+/// Root of regenerable data `<client directory>/cache`. Everything inside is stuff that "can be recovered if deleted",
+/// uninstall can optionally clean it all up.
 pub fn cache_directory() -> Option<PathBuf> {
     client_root().map(|root| root.join("cache"))
 }
 
-/// 聊天消息本地缓存目录 `<客户端目录>/cache/chat_msg`。
+/// Local chat message cache directory `<client directory>/cache/chat_msg`.
 pub fn chat_message_directory() -> Option<PathBuf> {
     cache_directory().map(|cache| cache.join("chat_msg"))
 }
 
-/// 头像图片缓存目录 `<客户端目录>/cache/avatar`。
+/// Avatar image cache directory `<client directory>/cache/avatar`.
 pub fn avatar_directory() -> Option<PathBuf> {
     cache_directory().map(|cache| cache.join("avatar"))
 }
 
-/// 用户自备头像的目录 `<客户端目录>/config/avatars`：用户自己把图片放进去，
-/// 客户端只在"修改头像"里列出这里的图片文件名供选择，不下载也不写入这个目录。
-/// 与安装布局同级（`baihua install` 把配置装到 `<客户端目录>/config`），卸载按 Y/n 一并询问。
+/// Directory for user-supplied avatars `<client directory>/config/avatars`: the user puts images in here,
+/// the client only lists the image filenames here for selection in "Change Avatar"; it neither downloads nor writes to this directory.
+/// at the same level as the install layout (`baihua install` puts config into `<client directory>/config`); uninstall asks Y/n to clean it up together.
 pub fn avatar_source_directory() -> Option<PathBuf> {
     client_root().map(|root| root.join("config").join("avatars"))
 }
 
-/// 更新包下载暂存目录 `<客户端目录>/update`。
+/// Update package download staging directory `<client directory>/update`.
 pub fn update_directory() -> Option<PathBuf> {
     client_root().map(|root| root.join("update"))
 }
 
-/// 默认安装目录 `<客户端目录>/bin`：安装在用户可写位置，无需管理员权限，三端一致。
+/// Default install directory `<client directory>/bin`: installed in a user-writable location, no admin rights needed, consistent across all platforms.
 pub fn install_directory() -> Option<PathBuf> {
     client_root().map(|root| root.join("bin"))
 }
 
-/// 当前可执行文件的完整路径（安装与自更新都要以它为锚点）。
+/// Full path of the current executable (both install and self-update need it as an anchor).
 pub fn current_executable() -> Option<PathBuf> {
     std::env::current_exe().ok()
 }
 
-/// 定位配置目录（`languages/`、`themes/`、`preferences.json` 所在处）。
+/// Locate the config directory (where `languages/`, `themes/`, `preferences.json` live).
 ///
-/// 依次尝试：当前工作目录下的 `config`（在包目录内 `cargo run` 的情形）、
-/// 仓库里的 `baihua-client-tui/config`（在仓库根目录直接跑二进制的开发情形）、
-/// 可执行文件各级祖先目录下的 `config` 与 `baihua-client-tui/config`
-/// （安装为 `.../bin/baihua-client` 时配置在 `.../config`，也覆盖从 target/debug 直接跑的情形）。
-/// 一处都没有时返回首个候选，让读取失败的表现与旧版一致（沿用内置默认值）。
+/// Try in order: `config` under the current working directory (the case of `cargo run` inside the package directory),
+/// then `config` under ancestor directories of the executable
+/// (when installed as `.../bin/baihua-client` the config is in `.../config`, also covers running directly from target/debug).
+/// When none are found, return the first candidate so the failure behavior matches the old version (uses built-in defaults).
 pub fn config_directory() -> PathBuf {
     let candidates = config_directory_candidates();
     candidates
@@ -77,45 +76,45 @@ pub fn config_directory() -> PathBuf {
         .unwrap_or_else(|| candidates[0].clone())
 }
 
-/// 配置目录的全部候选，按优先级排列。安装程序与错误提示需要把它完整展示给用户。
+/// All candidates for the config directory, sorted by priority. The installer and error messages need to display this completely to the user.
+///
+/// The repository keeps a single shared `config/` directory at the root, used by both interfaces (the TUI and the GUI
+/// read the same languages, themes and preferences). There used to be a second candidate `baihua-client-tui/config`;
+/// it is gone now, so every candidate below points at a plain `config/` directory.
 pub fn config_directory_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("config"),
-        PathBuf::from("baihua-client-tui/config"),
-    ];
+    let mut candidates = vec![PathBuf::from("config")];
     let Some(executable) = current_executable() else {
         return candidates;
     };
-    // 从可执行文件所在目录逐级上溯：安装布局是 <前缀>/bin/<程序> + <前缀>/config，
-    // 开发布局是 <仓库>/target/<配置>/<程序> + <仓库>/baihua-client-tui/config，
-    // 两种都落在"一层层往上找"这条路径上，不需要为每种布局单独写死深度
+    // Walk up from the executable directory: the install layout is <prefix>/bin/<program> + <prefix>/config,
+    // the development layout is <repo>/target/<config>/<program> + <repo>/config,
+    // both fall on the path of "walk up level by level"; no need to hardcode the depth for each layout
     let mut directory = executable.parent().map(|parent| parent.to_path_buf());
     while let Some(current) = directory {
         candidates.push(current.join("config"));
-        candidates.push(current.join("baihua-client-tui/config"));
         directory = current.parent().map(|parent| parent.to_path_buf());
     }
     candidates
 }
 
-/// 拼出配置目录下某个相对路径（如 `themes/dark.json`）。
-/// 此函数用于读取配置，会按优先级查找已存在的配置目录。
+/// Join a relative path under the config directory (such as `themes/dark.json`).
+/// This function is used to read config; it looks up existing config directories by priority.
 pub fn config_path(relative_path: &str) -> PathBuf {
     config_directory().join(relative_path)
 }
 
-/// 拼出可写配置目录下某个相对路径（如 `preferences.json`）。
-/// 此函数用于写入配置，始终指向用户主目录下的客户端配置目录（`~/.baihua/client/config`），
-/// 避免在开发环境下修改项目源码目录中的配置文件。
+/// Join a relative path under the writable config directory (such as `preferences.json`).
+/// This function is used for writing config; always points to the client config directory under the user's home directory (`~/.baihua/client/config`),
+/// avoid modifying config files in the project source directory in the development environment.
 pub fn writable_config_path(relative_path: &str) -> PathBuf {
     client_root()
         .map(|root| root.join("config").join(relative_path))
         .unwrap_or_else(|| config_path(relative_path))
 }
 
-/// 拼出可写配置目录下某个相对路径，如果该文件不存在则回退到只读配置目录。
-/// 此函数用于读取可能被用户修改的配置（如 preferences.json），
-/// 优先从用户主目录读取，不存在时才从项目源码目录读取默认值。
+/// Join a relative path under the writable config directory; fall back to the read-only config directory if the file does not exist.
+/// This function is used to read configs that might have been modified by the user (such as preferences.json),
+/// prefer reading from the user's home directory; only read defaults from the project source directory when absent.
 pub fn readable_config_path(relative_path: &str) -> PathBuf {
     let writable = writable_config_path(relative_path);
     if writable.exists() {
@@ -159,6 +158,15 @@ mod tests {
         let Some(root) = data_root() else {
             return;
         };
+        // 两个界面共用同一份配置与缓存：用户数据都在同一个客户端根目录下——
+        // 配置（preferences.json 与用户自备头像）在 `<客户端根目录>/config`，
+        // 可再生的消息缓存与头像缓存在 `<客户端根目录>/cache`。
+        // 界面不参与路径计算（都由本模块决定），所以终端版与图形版算出来的永远是同一条路径。
+        let preferences = writable_config_path("preferences.json");
+        assert!(
+            preferences.starts_with(root.join("client").join("config")),
+            "用户配置要落在客户端根目录的 config 下，两个界面共用同一份: {preferences:?}"
+        );
         let messages = chat_message_directory().expect("消息缓存目录应可定位");
         let avatars = avatar_directory().expect("头像缓存目录应可定位");
         let updates = update_directory().expect("更新目录应可定位");

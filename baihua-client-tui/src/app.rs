@@ -8,8 +8,8 @@ use baihua_core::{
         websocket_auth_sentinel,
     },
     chat_cache::ChatCache,
-    crypto, paths,
-    update::{UpdateCheck, check_for_update, download_package},
+    config, crypto, installer, paths,
+    update::{ReleaseChannel, UpdateCheck, check_for_update, download_package},
 };
 use chrono::{DateTime, Local};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -47,9 +47,9 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use x25519_dalek::EphemeralSecret;
 
-/// 安全写入文件：在 Unix 系统上创建文件时使用 0600 权限（仅所有者可读写），
-/// 防止敏感配置（如 preferences.json）被其他用户读取。
-/// Windows 系统没有等效的文件权限机制，直接使用标准写入。
+/// Securely write a file: on Unix systems, create the file with 0600 permissions (readable and writable only by the owner),
+/// preventing sensitive configuration files (such as preferences.json) from being read by other users.
+/// Windows has no equivalent file permission mechanism, so standard writing is used directly.
 fn secure_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -69,7 +69,7 @@ fn secure_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     }
 }
 
-/// 调试诊断。
+/// Debug diagnostics.
 #[cfg(debug_assertions)]
 fn debug_log(message: &str) {
     use std::io::Write;
@@ -86,11 +86,11 @@ fn debug_log(message: &str) {
     }
 }
 
-/// 调试诊断（发布版为空操作）。
+/// Debug diagnostics (no-op in release builds).
 #[cfg(not(debug_assertions))]
 fn debug_log(_message: &str) {}
 
-/// 正在显示的叠加层。
+/// Currently displayed overlay.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayingOverlay {
     Nothing,
@@ -100,29 +100,29 @@ pub enum DisplayingOverlay {
     SettingsMenu,
     LanguageSelect,
     ServerAddress,
-    /// 命令 /login 无参打开的登录表单浮层（密码框遮蔽）
+    // The login form overlay opened without arguments by the /login command (password field obscured)
     Login,
-    /// 命令 /register 无参打开的注册表单浮层（密码框遮蔽）
+    // The registration form overlay opened without arguments by the /register command (password field obscured)
     Register,
-    /// 设置页或 /appearance 无参打开的外观选择浮层
+    // The appearance selection overlay opened from the settings page or /appearance without arguments
     AppearanceSelect,
-    /// 个人资料卡片（/profile 打开）：显示用户名、UID、昵称、简介与头像
+    // Profile card (opened via /profile): displays username, UID, nickname, bio, and avatar
     ProfileCard,
-    /// 通用表单浮层（设置个人资料、修改密码、修改头像、注销账户）：
-    /// 具体字段与提交动作在 App::active_form 里，本变体只表示"当前显示的是表单"
+    // General form overlay (settings profile, change password, change avatar, delete account):
+    // Specific fields and submit actions are in App::active_form; this variant only means "a form is currently displayed"
     Form,
-    /// 本地头像选择浮层：列出 `<客户端目录>/config/avatars` 里的图片文件，
-    /// 回车直接用该文件上传头像；浮层里按 Ctrl+U 才转到填网络链接的修改头像表单
+    // Local avatar selection overlay: lists image files in `<client_dir>/config/avatars`,
+    // Press Enter to upload that file as the avatar; press Ctrl+U in the overlay to switch to the form for entering a network link
     AvatarSelect,
 }
 
-/// 表单浮层里的一个输入项。
+/// A single input field in the form overlay.
 #[derive(Debug, Clone)]
 struct FormField {
-    /// 标签文案键（表单浮层逐行显示在输入框左侧）
+    // Label text key (displayed line by line to the left of the input field in the form overlay)
     label_key: String,
     state: TextInputState,
-    /// 密码类输入：显示为遮蔽字符，且不会被整屏框选复制走内容
+    // Password-type input: displayed as obscured characters, and will not be copied by full-screen selection
     secret: bool,
 }
 
@@ -137,49 +137,49 @@ impl FormField {
         }
     }
 
-    /// 输入框当前文本（去首尾空白）
+    /// Current text of the input field (trimmed)
     fn text(&self) -> String {
         self.state.value.text().string().trim().to_string()
     }
 }
 
-/// 表单浮层要执行的动作。字段值按表单声明顺序从 active_form 取出。
+/// The action to perform from the form overlay. Field values are taken from active_form in declaration order.
 #[derive(Debug, Clone, PartialEq)]
 enum FormAction {
-    /// 设置个人资料：昵称、手机号、简介
+    // Update profile: nickname, phone number, bio
     UpdateProfile,
-    /// 修改密码：旧密码、新密码、新密码确认
+    // Change password: old password, new password, confirm new password
     ChangePassword,
-    /// 修改头像：本地图片路径或服务端可访问的完整链接
+    // Change avatar: local image path or full URL accessible from the server
     ChangeAvatar,
-    /// 注销账户：再输入一次密码
+    // Delete account: enter password again
     DeleteAccount,
 }
 
-/// 加密会话所处阶段
+/// Encryption session phase
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EncryptionPhase {
-    /// 已发起邀请，等待对端接受
+    // Invitation sent, waiting for peer to accept
     AwaitingAcceptance,
-    /// 密钥已协商，等待服务器确认双方就绪
+    // Key negotiated, waiting for server to confirm both sides are ready
     AwaitingSessionReady,
-    /// 会话激活，可收发加密消息
+    // Session active, can send and receive encrypted messages
     Active,
 }
 
-/// 单个房间的加密会话状态；临时私钥不实现 Debug/Clone，由外层手工实现 Debug
+/// Encryption session state for a single room; the ephemeral private key does not implement Debug/Clone, it is manually implemented by the outer code
 struct EncryptionSession {
     phase: EncryptionPhase,
     ephemeral_secret: Option<EphemeralSecret>,
-    /// 己方临时公钥（base64）：重发邀请必须复用同一份，否则双方密钥无法一致
+    // Our ephemeral public key (base64): re-sending an invitation must reuse the same one, otherwise the keys on both sides will not match
     own_public_key: String,
     shared_key: Option<[u8; 32]>,
     pending_content: Option<String>,
-    /// 本阶段开始时刻：等待接受超过时限将自动重新发起邀请
+    // Start time of this phase: if acceptance is not received within the timeout, an invitation is automatically re-sent
     initiated_at: Instant,
 }
 
-/// 客户端加密状态：用户身份密钥与各房间加密会话
+/// Client encryption state: user identity key and per-room encryption sessions
 struct ClientCrypto {
     identity_key: SigningKey,
     sessions: HashMap<String, EncryptionSession>,
@@ -193,81 +193,81 @@ impl fmt::Debug for ClientCrypto {
     }
 }
 
-/// 所有输入框状态集中管理
+/// All input field states managed centrally
 #[derive(Default, Debug, Clone)]
 pub struct InputCollector {
-    // 登录页面
+    // Login page
     pub login_name_state: TextInputState,
     pub login_password_state: TextInputState,
-    // 注册页面
+    // Registration page
     pub register_name_state: TextInputState,
     pub register_email_state: TextInputState,
     pub register_password_state: TextInputState,
-    // 聊天页面
+    // Chat page
     pub message_input_state: TextAreaState,
-    // 创建群聊弹窗
+    // Create group chat popup
     pub create_group_name_state: TextInputState,
     pub create_group_members_state: TextInputState,
-    // 创建私密聊天弹窗
+    // Create private chat popup
     pub create_private_username_state: TextInputState,
-    // 服务器地址弹窗
+    // Server address popup
     pub server_address_state: TextInputState,
-    // 整屏鼠标框选复制：起点在左键按下时记录，拖拽时更新终点，松开时据此从整屏行文本快照
-    // 取文本复制到剪贴板并清空。起点落在消息输入框内时不使用这两个字段，
-    // 那种情况仍由输入控件自身维护选区（保留控件内的选词与光标语义）。
+    // Full-screen mouse selection copy: start point recorded on left mouse button press, endpoint updated while dragging, and used on release to copy text from the full-screen row snapshot
+    // to copy text to clipboard and clear. When the start point is inside the message input box, these fields are not used,
+    // the input control itself maintains the selection area (preserving in-control selection and cursor semantics).
     pub selection_start: Option<(u16, u16)>,
     pub selection_end: Option<(u16, u16)>,
 }
 
-/// 外观系统的数据载体：客户端全部可配色槽位的集中定义。
-/// 每个字段对应 config/themes/{外观名}.json 里的一个同名键，用户选择的名称持久化在
-/// preferences.json 的 appearance 字段；界面渲染一律从这里取色，不再散落硬编码颜色。
+/// Data carrier for the appearance system: centralized definition of all colorable slots in the client.
+/// Each field corresponds to a same-named key in config/themes/{appearance_name}.json; the user-chosen name is persisted in
+/// the appearance field of preferences.json; the interface takes colors from here for rendering, no longer scattering hardcoded colors.
 #[derive(Debug, Clone, PartialEq)]
 struct Appearance {
-    /// 应用整体背景色（覆盖终端默认底色，含弹窗区域）
+    // Overall application background color (overrides terminal default background, including popup areas)
     app_background: Color,
-    /// 消息显示区边框颜色
+    // Message display area border color
     message_border: Color,
-    /// 群聊列表边框颜色
+    // Group chat list border color
     room_border: Color,
-    /// 所有叠加层窗口的边框颜色（浮层风格统一靠这一个槽位，主题里可单独调）
+    // Border color for all overlay windows (overlay style unified to this slot; can be adjusted separately in the theme)
     overlay_border: Color,
-    /// 消息正文文本颜色
+    // Message body text color
     message_text: Color,
-    /// 被选中文本颜色（群聊项、设置菜单项、指令自动补全项）
+    // Selected text color (room list items, settings menu items, command auto-completion items)
     selected_text: Color,
-    /// 他人用户名文本颜色
+    // Other user's username text color
     other_username_text: Color,
-    /// 自己用户名文本颜色
+    // Own username text color
     own_username_text: Color,
-    /// 消息时间文本颜色
+    // Message timestamp text color
     time_text: Color,
-    /// 快捷键提示文本颜色
+    // Keyboard shortcut hint text color
     hint_text: Color,
-    /// 提示框处于提示状态时的边框颜色
+    // Border color when the tooltip is in hint state
     notice_hint_border: Color,
-    /// 提示框处于报错状态时的边框颜色
+    // Border color when the tooltip is in error state
     notice_error_border: Color,
-    /// 消息输入框默认状态边框颜色
+    // Message input box default state border color
     input_border: Color,
-    /// 消息输入框内正文文本颜色
+    // Message input box body text color
     input_text: Color,
-    /// 消息输入框指令模式边框颜色
+    // Message input box command mode border color
     command_border: Color,
-    /// 消息输入框搜索模式边框颜色
+    // Message input box search mode border color
     search_border: Color,
-    /// 鼠标框选待复制文本的背景颜色
+    // Background color for text selected by mouse for copying
     selection_background: Color,
-    /// 搜索模式命中片段的背景颜色
+    // Background color for search mode matched fragments
     search_match_background: Color,
-    /// 搜索模式中"当前定位到的那一个匹配项"的背景颜色（与其余命中区分）
+    // Background color for "the currently located match" in search mode (distinguished from other hits)
     search_current_match_background: Color,
-    /// 消息下方已读/未读状态文本颜色
+    // Read/unread status text color below messages
     read_state_text: Color,
 }
 
-/// 主题文件中的颜色写法：支持十六进制 "#rrggbb"、终端基本色名、以及 [红, 绿, 蓝] 三元素数组。
-/// 无法识别时返回 None，由调用方按"该槽位缺失"处理，绝不猜测近似色。
+/// Color notation in theme files: supports hex "#rrggbb", terminal basic color names, and [red, green, blue] three-element arrays.
+/// Return None when unrecognized; the caller handles it as "that slot is missing" and never guesses an approximate color.
 fn parse_theme_color(value: &serde_json::Value) -> Option<Color> {
     if let Some(components) = value.as_array() {
         let mut bytes = [0u8; 3];
@@ -315,9 +315,9 @@ fn parse_theme_color(value: &serde_json::Value) -> Option<Color> {
     Some(named)
 }
 
-/// 依据背景色亮度挑选可读的前景色：暗底配亮字、亮底配暗字。
-/// 主题只为框选与搜索命中提供背景色，若沿用正文前景色可能出现字色与底色同深浅而看不清，
-/// 故统一由此函数推导前景色；背景为终端默认色时按暗底处理。
+/// Select a readable foreground color based on background brightness: dark background gets light text, light background gets dark text.
+/// The theme only provides background colors for selection and search hits; if the body foreground color is used, the text and background may be the same darkness and hard to see,
+/// so the foreground color is uniformly derived from this function; when the background is the terminal default color, it is treated as dark.
 fn contrasting_foreground(background: Color) -> Color {
     let brightness: u32 = match background {
         Color::Rgb(red, green, blue) => {
@@ -358,8 +358,8 @@ fn contrasting_foreground(background: Color) -> Color {
 }
 
 impl Appearance {
-    /// 内置默认外观：与引入外观系统之前的硬编码配色完全一致，
-    /// 同时作为主题文件缺项时的兜底色，保证未配置主题的用户看到原有效果。
+    /// Built-in default appearance: identical to the hardcoded color scheme before the appearance system was introduced,
+    /// and also serves as the fallback color when a theme file has missing slots, ensuring users without a configured theme see the original effect.
     fn built_in() -> Self {
         Self {
             app_background: Color::Reset,
@@ -385,10 +385,10 @@ impl Appearance {
         }
     }
 
-    /// 读取 `<配置目录>/themes/{name}.json`，一次性返回完整外观结构体。
-    /// 元组第二项为"字段不完整"标记：只要存在缺失槽位即为真，按主题规范不列出具体缺哪个字段；
-    /// 第三项为主题文件里多出来的未知字段名列表。
-    /// 文件不可读或不是合法 JSON 时返回内置默认外观，并把字段不完整标记置为真。
+    // Read `<config_dir>/themes/{name}.json`, returning the complete appearance struct at once.
+    // The second tuple element is the "missing field" flag: true if any slot is missing, following theme conventions the specific missing field is not listed;
+    /// The third element is the list of unknown field names extra in the theme file.
+    /// Returns the built-in default appearance when the file is unreadable or not valid JSON, with the missing field flag set to true.
     fn load(name: &str) -> (Self, bool, Vec<String>) {
         let mut appearance = Self::built_in();
         let path = paths::config_path(&format!("themes/{name}.json"));
@@ -447,13 +447,13 @@ impl Appearance {
         (appearance, has_missing_field, extra_fields)
     }
 
-    /// 表单浮层（改密码、改头像、设置资料、删除账户）里方框输入框的边框色：
-    /// 恒取未选中色，当前项靠标题加粗与箭头行的 > 标记指示，避免浮层一打开满眼选中色。
+    /// Border color for boxed input fields in form overlays (change password, change avatar, settings profile, delete account):
+    /// Always takes the unselected color; the current item is indicated by bold title and > marker on the arrow row, avoiding seeing selection color everywhere when the overlay opens.
     fn form_field_border(&self) -> Color {
         self.input_border
     }
 
-    /// 登录浮层方框输入框的边框色：聚焦项用选中色，该浮层保留原有的强指示风格。
+    /// Border color for boxed input fields in the login overlay: focused items use the selected color, the overlay retains its original strong indication style.
     fn login_field_border(&self, focused: bool) -> Color {
         if focused {
             self.selected_text
@@ -462,7 +462,7 @@ impl Appearance {
         }
     }
 
-    /// 列出 config/themes 目录下所有可用外观名称（去掉 .json 后缀），按名称字典序排列
+    /// List all available appearance names under config/themes (removing .json suffix), sorted alphabetically
     fn available_names() -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(paths::config_directory().join("themes"))
             .into_iter()
@@ -490,155 +490,155 @@ impl Appearance {
 
 #[derive(Debug)]
 pub struct App {
-    // ==================== 上层：用户可控配置（来自 preferences.json 或界面/指令设置）====================
+    // ==================== Upper layer: user-controllable configuration (from preferences.json or interface/command settings)====================
     pub input_collector: InputCollector,
     pub connector: Connector,
-    /// 当前加载的语言字符串映射（key → 本地化文本）
+    // Currently loaded language string mapping (key → localized text)
     language_strings: HashMap<String, String>,
-    /// 是否在消息中同时显示发送者的 uid（true 显示 username(uid)）
+    // Whether to display the sender's uid in messages (true shows username(uid))
     show_uid: bool,
-    /// 时间显示是否带日期（true 显示日期+时间，false 仅显示时间）
+    // Whether the time display includes the date (true shows date+time, false shows time only)
     time_with_date: bool,
-    /// 是否启用系统通知（新消息/私聊请求时发出提示）
+    // Whether to enable system notifications (prompt when new messages/private chat requests arrive)
     sound_enabled: bool,
-    /// 开启"消息免打扰"的房间 ID 集合（以各房间唯一 id 为键），持久化到 preferences.json。
-    /// 免打扰房间在别处收到新消息时：不发系统通知/提示音，未读数以点（·）显示而非具体数字。
+    // Set of room IDs with "message do not disturb" enabled (keyed by each room's unique id), persisted in preferences.json.
+    // Muted rooms do not send system notifications/sounds when receiving new messages elsewhere; unread counts are shown as dots (·) instead of specific numbers.
     muted_room_ids: HashSet<String>,
-    /// 当前生效的外观配色（由 preferences.json 的 appearance 字段指向的主题文件加载）
+    // Currently active appearance color scheme (loaded from the theme file pointed to by the appearance field of preferences.json)
     appearance: Appearance,
-    /// 当前外观名称（无主题文件时为 "built_in"），用于设置页与 /appearance 回显
+    // Current appearance name ("built_in" when no theme file), used for settings page and /appearance echo
     appearance_name: String,
-    /// 快速搜索：搜索模式下随输入即时在已加载消息里出结果，无需按 Enter。
-    /// Enter 仍保留"整房拉全历史后再搜"的完整语义（每次按键都翻页拉全量会打爆接口）。
-    /// 由 preferences.json 的 quick_search 字段持久化
+    // Quick search: in search mode, results appear in loaded messages as you type, no need to press Enter.
+    // Enter still retains the full semantics of "load all history for the whole room then search" (pressing every key would page-load the entire history and overwhelm the API).
+    // Persisted by the quick_search field of preferences.json
     quick_search: bool,
 
-    // ==================== 下层：程序运行期维护的临时状态（不写入配置文件）====================
-    /// 当前聚焦的输入框索引
+    // ==================== Lower layer: temporary state maintained during program runtime (not written to config files)====================
+    // Index of the currently focused input field
     focus_index: usize,
-    /// 右上角通知列表，元素为 (通知文本, 是否错误类, 过期时刻)，到期自动移除
+    // Top-right notification list, elements are (notification text, is error type, expiration time), auto-removed when expired
     notifications: Vec<(String, bool, Instant)>,
-    /// 聊天页面状态。
+    // Chat page state.
     rooms: Vec<RoomInfo>,
     rooms_state: ListState,
     messages: Vec<MessageInfo>,
-    /// 房间 ID → 未读消息计数，用于在非当前选中群聊名称后以红色显示消息数量
+    // Room ID → unread message count, used to show message count in red after the non-selected group chat name
     unread_counts: HashMap<String, u32>,
     current_user_id: Option<String>,
     displaying_overlay: DisplayingOverlay,
-    /// sender_id -> username 映射
+    // sender_id → username mapping
     sender_names: HashMap<String, String>,
-    /// 后台轮询线程通信发送器（多个后台线程共用）
+    // Background polling thread communication sender (shared by multiple background threads)
     polling_sender: Option<mpsc::Sender<PollingEvent>>,
-    /// 后台 WebSocket 线程的命令通道（完整的 WS JSON 载荷）
+    // Background WebSocket thread command channel (complete WS JSON payload)
     websocket_sender: Option<mpsc::Sender<String>>,
-    /// WebSocket 线程的认证令牌副本，供检测到新房间时重建连接使用
+    // WebSocket thread authentication token copy, used to rebuild the connection when a new room is detected
     websocket_token: Option<String>,
-    /// WebSocket 线程运行标志，置为 false 可令其退出
+    // WebSocket thread running flag, setting to false makes it exit
     websocket_running: Option<Arc<AtomicBool>>,
-    /// WebSocket 最近一次成功建立连接的时刻，用于定期刷新房间订阅防止退化
+    // Moment of the most recent successful WebSocket connection, used to periodically refresh room subscriptions to prevent degradation
     websocket_connected_at: Instant,
-    /// 后台轮询线程运行标志，置为 false 可令其退出（退出登录时使用）
+    // Background polling thread running flag, setting to false makes it exit (used when logging out)
     polling_running: Option<Arc<AtomicBool>>,
-    /// 命令补全列表当前的选中项
+    // Currently selected item in the command completion list
     command_list_state: ListState,
-    /// 客户端加密状态（身份密钥与各房间加密会话）
+    // Client encryption state (identity key and per-room encryption sessions)
     crypto: ClientCrypto,
-    /// 待处理聊天请求列表
+    // Pending chat request list
     pending_requests: Vec<RoomRequestInfo>,
-    /// 待处理请求列表当前的选中项
+    // Currently selected item in the pending request list
     request_list_state: ListState,
-    /// 设置菜单当前的选中项
+    // Currently selected item in the settings menu
     menu_list_state: ListState,
-    /// 消息显示区距底部的滚动距离（0 表示贴底跟随最新消息），单位为渲染行
+    // Scroll distance of the message display area from the bottom (0 means snap to bottom following latest messages), unit is rendered rows
     messages_scroll_from_bottom: u16,
-    /// 当前选中房间"更早消息"分页游标（上一次消息拉取响应里的 next_cursor，
-    /// 即已加载列表中最旧一条消息的服务端 ID）。Some 表示服务器告知仍有更早消息
-    /// 可拉取、None 表示已无更多或拉取失败已停止；由 load_messages_for_selected_room
-    /// 在每次整房加载后赋值，render_messages 检测到用户滚到顶部时经 load_older_messages 消费并前移
+    // Pagination cursor for "older messages" of the currently selected room (next_cursor from the last message fetch response,
+    // i.e., the server ID of the oldest message in the loaded list). Some means the server indicates there are still earlier messages
+    // can be fetched, None means no more or fetch failed and stopped; assigned by load_messages_for_selected_room
+    // after each full room load, consumed and advanced by load_older_messages when render_messages detects the user has scrolled to the top
     messages_older_cursor: Option<String>,
-    /// 最近一次整房消息加载完成的时刻。切房加载同步阻塞主线程数百毫秒，期间用户
-    /// 滚轮事件在系统队列积压，加载完成后会被逐条补处理，把新房间视图"自动"顶上去
-    /// 并可能误触顶拉取；该时刻起一小段窗口内丢弃滚轮事件即可消除这些迟到输入
+    // Moment the most recent full room message load completed. Switching rooms loads synchronously and blocks the main thread for hundreds of milliseconds, during which the user
+    // mouse events pile up in the system queue, and after loading completes they are processed one by one, "automatically" pushing the new room view up
+    // and may accidentally trigger top-pull; discarding mouse events within a short window from this moment eliminates these late inputs
     messages_reloaded_at: Instant,
-    /// 已在本地关闭的加密私聊房间 ID：仅从界面隐藏，不通知服务器以避免产生单人房间
+    // Encrypted private chat room IDs closed locally: hidden from the interface only, not notified to the server to avoid creating single-person rooms
     closed_room_ids: HashSet<String>,
-    /// 本客户端主动退出（/quit、/quit_group、/kick）的群聊房间 ID，
-    /// 用于区分“主动退出”与“被移出群聊”，避免误报被踢提示
+    // Group chat room IDs that this client actively left (/quit, /quit_group, /kick),
+    // Distinguishes "voluntary quit" from "removed from group" to avoid false kick reports
     left_room_ids: HashSet<String>,
-    /// /quit 退出清理已在后台完成，主循环检测到后应立即退出
+    // /quit exit cleanup has completed in the background, the main loop should exit immediately upon detection
     quit_ready: bool,
-    /// 语言选择列表当前的选中项
+    // Currently selected item in the language selection list
     language_list_state: ListState,
-    /// 外观选择列表当前的选中项
+    // Currently selected item in the appearance selection list
     appearance_list_state: ListState,
-    /// 本地头像选择列表当前的选中项
+    // Currently selected item in the local avatar selection list
     avatar_list_state: ListState,
-    /// 搜索模式结果：(已执行搜索的关键词, 命中消息的 ID 列表, 当前匹配项序号)。
-    /// None 表示本轮搜索模式尚未执行过搜索（输入框标题仅显示"搜索模式"）。
+    // Search mode results: (executed search keyword, list of hit message IDs, current match index).
+    // None means no search has been executed in this search mode round (the input box title only shows "search mode").
     search_result: Option<(String, Vec<String>, usize)>,
-    /// 搜索模式下待定位的消息 ID：切换匹配项时写入，render_messages 把它滚入视口后清空
+    // Message ID to be positioned in search mode: written when switching matches, cleared after render_messages scrolls it into view
     pending_scroll_message_id: Option<String>,
-    /// 正在输入的成员：元素为 (房间 ID, 用户名, 最近一次 typing 帧时刻)。
-    /// 服务端只有 typing:true、没有"停止输入"信号，故按 TODO 约定的 2 秒窗口在本地衰减，
-    /// 超过窗口的条目既不显示也在 handle_tick 里清理
+    // Currently typing members: elements are (room ID, username, most recent typing frame timestamp).
+    // The server only has typing:true and no "stop typing" signal, so it decays locally based on the 2-second window agreed in TODO,
+    // entries beyond the window are neither displayed nor cleaned up in handle_tick
     typing_members: Vec<(String, String, Instant)>,
-    /// 最近一次向上游发出 typing 帧的时刻，用于按接缝给出的间隔节流
-    /// （服务端入站限流 30 条/30 秒，逐字符上报会立刻打满配额）
+    // Moment the most recent typing frame was sent upstream, used to throttle at the interval given by the seam
+    // (server inbound rate limit is 30/30 seconds, per-character reporting would immediately fill the quota)
     last_typing_frame_sent_at: Option<Instant>,
-    /// 成员在线状态表：用户 ID → 是否在线。完全由服务端 user_online / user_offline
-    /// 跳变广播累积（服务端建立连接时不下发在线名单基线），
-    /// 表中不存在即"未知"，界面不显示状态标记，避免把未知误显示为离线。
+    // Member presence table: user ID → online status. Completely accumulated from server user_online / user_offline
+    // jump broadcast accumulation (the server does not send a baseline online list when establishing a connection),
+    // absence from the table means "unknown", the interface does not show a status marker, avoiding incorrectly displaying unknown as offline.
     presence_by_user: HashMap<String, bool>,
-    /// 上一帧整屏的行文本快照（已按双宽字符跨格还原），框选松开时按行列区间从中取文本。
-    /// 必须在浮层与通知都画完之后采集，才能复制到任意位置的文本而不只是消息区。
+    // Previous frame's full-screen row text snapshot (restored for double-width characters spanning cells), used to extract text by row and column range when selection is released.
+    // Must be collected after the overlay and notifications are drawn, so text can be copied from any position, not just the message area.
     screen_text_rows: Vec<String>,
-    /// 请求主循环执行一次整屏重绘（terminal.clear 后下一帧全量重画）的标记。
-    /// 由 Ctrl+L 置位：终端侧偶发的自动滚动会让屏幕内容与 ratatui 的增量缓冲区错位，
-    /// 增量渲染只重写"有变化"的格子因而无法自愈，全量重画是唯一可靠修法。
+    // Flag requesting the main loop to perform a full-screen repaint (full redraw the frame after terminal.clear).
+    // Set by Ctrl+L: incidental auto-scroll on the terminal side causes the screen content to desync from ratatui's incremental buffer,
+    // incremental rendering only rewrites "changed" cells so it cannot self-heal, a full redraw is the only reliable fix.
     full_repaint_requested: bool,
-    /// 消息输入框在屏幕上的矩形，由 render_message_input 每帧写入。
-    /// 该区域内的拖拽仍交给输入控件自己处理（保留控件内的选区与光标语义），
-    /// 区域外的拖拽才启动整屏框选，两种框选不会同时生效。
+    // Rectangle of the message input box on screen, written every frame by render_message_input.
+    // Dragging within this area is still handled by the input control itself (preserving in-control selection and cursor semantics),
+    // only dragging outside this area triggers full-screen selection; the two selection types do not take effect simultaneously.
     message_input_area: Rect,
-    /// 服务端实时连接状态：None 表示还没探测过（顶栏不显示标记，避免启动瞬间误报离线），
-    /// Some(true/false) 才会画出在线或离线标记。顶栏标记与"连不上服务器只提示一次"共用它。
+    // Server real-time connection status: None means not yet probed (status bar shows no marker to avoid false offline report at startup),
+    // Some(true/false) causes the online or offline marker to be drawn. The status bar marker and the "server unreachable, prompt once" share this.
     connection_ready: Option<bool>,
-    /// 当前登录用户名（顶栏"当前用户"显示；未登录时为空串）
+    // Current logged-in username (shown as "current user" in the status bar; empty string when not logged in)
     current_username: String,
-    /// /profile 浮层当前展示的用户资料
+    // User profile currently displayed in the /profile overlay
     profile_view: Option<PublicProfile>,
-    /// 通用表单浮层的动作与字段（仅 displaying_overlay == Form 时有值）
+    // Action and fields of the general form overlay (only have values when displaying_overlay == Form)
     active_form: Option<(FormAction, Vec<FormField>)>,
-    /// 自己的邮箱与手机号。服务端只在注册、登录、资料与头像接口的完整响应里给这两项，
-    /// 公开资料接口刻意不含它们，因此看别人时卡片上这两行显示"无"。
+    // Own email and phone number. The server only provides these two items in the complete response of registration, login, profile, and avatar interfaces,
+    // the public profile interface deliberately excludes them, so these two lines on the card show "none" when viewing others.
     own_contact: Option<(String, String)>,
-    /// 自己发出的聊天请求列表（私聊管理浮层与收到的请求一起展示）
+    // List of chat requests sent by oneself (displayed together with received requests in the private chat management overlay)
     sent_requests: Vec<RoomRequestInfo>,
-    /// 注册用户目录缓存（服务端全量用户列表）。None 表示还没拉过，Some 即使为空也算拉过，
-    /// 不再重复请求。/profile 的自动补全每帧都读它，所以拉取只能由按键触发、在后台线程完成，
-    /// 绝不能出现在渲染路径里
+    // Registered user directory cache (server's full user list). None means not yet fetched, Some even if empty counts as fetched,
+    // no repeated requests. /profile auto-completion reads it every frame, so fetching can only be triggered by key presses and completed in the background thread,
+    // and must absolutely not appear in the render path
     registered_users: Option<Vec<UserSearchResult>>,
-    /// 消息本地缓存（只缓存未加密房间）。按当前登录用户 ID 建立目录，未登录时为 None
+    // Local message cache (only caches unencrypted rooms). The directory is established by the current logged-in user ID, None when not logged in
     chat_cache: Option<ChatCache>,
-    /// 头像原始字节：用户 ID → 图片字节，None 表示"已确认没有头像或取回失败"。
-    /// 条目存在即不再重复请求，避免每帧为同一个用户反复联网；字节由后台线程取回后经
-    /// PollingEvent::AvatarLoaded 交回主线程，渲染期只做一次解码（见 avatar_pixels）。
+    // Raw avatar bytes: user ID → image bytes, None means "confirmed no avatar or fetch failed".
+    // an existing entry means no repeated requests, avoiding repeatedly connecting to the network for the same user every frame; bytes are fetched in the background thread and delivered via
+    // PollingEvent::AvatarLoaded back to the main thread, only one decoding is done during rendering (see avatar_pixels)。
     avatar_images: HashMap<String, Option<Vec<u8>>>,
-    /// 按显示尺寸解码好的头像像素块：键为 (用户 ID, 列数, 行数)。
-    /// 同一尺寸只解码一次（消息列表用小块，个人资料卡片用大块），之后每帧直接查表。
+    // Decoded avatar pixel blocks at display size: key is (user ID, column count, row count).
+    // the same size is only decoded once (message list uses small blocks, profile card uses large blocks), thereafter looked up directly in the table every frame.
     avatar_pixels: HashMap<(String, usize, usize), AvatarPixels>,
-    /// 已下载并通过校验的新版本：(新版本号, 本地包路径)。/update 与设置项"更新客户端"消费它
+    // Downloaded and verified new version: (new version number, local package path). Consumed by /update and the settings item "update client"
     pending_update: Option<(String, PathBuf)>,
-    /// /update 已安排后台安装进程等待本进程退出，主循环检测到该标记后立即退出
+    // /update has arranged a background installation process waiting for this process to exit, the main loop exits immediately upon detecting this flag
     update_handoff_requested: bool,
-    /// 后台版本检查与下载是否正在进行，避免重复派生下载线程
+    // Whether background version checking and downloading is in progress, to avoid spawning duplicate download threads
     update_check_running: Option<Arc<AtomicBool>>,
-    /// 常驻可达性探测线程的运行标志（换服务器地址时停旧起新）
+    // Running flag of the persistent reachability probe thread (stop old, start new when changing server address)
     reachability_running: Option<Arc<AtomicBool>>,
-    /// 消息缓存待落盘的起始时刻：Some 表示"当前房间消息列表比磁盘新"。
-    /// 消息逐条到达时只置位不写盘，handle_tick 攒够批量窗口后一次性整房写入，
-    /// 避免活跃群里每条消息都触发一次整文件重写
+    // The moment when message cache is pending being flushed to disk: Some means "the current room's message list is newer than the disk".
+    // Only set when messages arrive one by one, not written to disk; handle_tick accumulates enough of a batch window and writes the entire room at once,
+    // avoiding triggering a full file rewrite for every message in an active group chat
     cache_pending_flush_since: Option<Instant>,
 }
 
@@ -714,11 +714,11 @@ impl Default for App {
     }
 }
 
-/// 计算本帧允许绘制的区域：整屏高度减一，把最底行留空。
-/// 原因：向屏幕最后一行（尤其右下角那一格）写入时，部分终端会触发自动换行并把已有内容上滚一行，
-/// 而 ratatui 的增量缓冲区并不知道这次滚动，之后每帧只重绘"有变化"的格子，
-/// 错位就再也修不回来——表现为用中文输入法连续输入大段文本后整块界面被顶掉一截，
-/// 只有切群这种引起全量重绘的操作才能恢复。留空最后一行即可从根上避免滚动。
+/// Calculate the area allowed for this frame: reduce the full-screen height by one, leaving the bottom row empty.
+/// Reason: when writing to the last row of the screen (especially the bottom-right cell), some terminals trigger auto-wrap and scroll existing content up one row,
+/// but ratatui's incremental buffer doesn't know about this scroll, and each subsequent frame only redraws "changed" cells,
+/// the misalignment can never be fixed — manifesting as the entire interface being pushed up a section after entering a large block of text with a Chinese input method,
+/// only operations that trigger a full redraw like switching groups can recover. Leaving the last row empty avoids scrolling at the root.
 fn drawable_area(area: Rect) -> Rect {
     if area.height <= 1 {
         return area;
@@ -729,15 +729,15 @@ fn drawable_area(area: Rect) -> Rect {
     }
 }
 
-/// 用指定背景色铺满给定区域（各组件只补自己写过的样式，因此先铺底即可被统一继承）。
+/// Fill the given area with a specified background color (each component only patches the styles it wrote, so painting the base first allows uniform inheritance).
 fn paint_background(frame: &mut Frame, area: Rect, background: Color) {
     frame
         .buffer_mut()
         .set_style(area, Style::default().bg(background));
 }
 
-/// 把整屏缓冲区逐行还原为文本快照（双宽字符跨格推进，不插入多余空格）。
-/// 在每帧所有元素绘制完成后采集，框选复制才能覆盖消息区、房间列表、浮层与通知等任意位置。
+/// Restore the full-screen buffer to a text snapshot row by row (double-width characters advance across cells, no extra spaces inserted).
+/// Collected after all elements are drawn each frame, so full-screen selection can cover any position including message area, room list, overlays, and notifications.
 fn collect_screen_text_rows(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     for row in area.top()..area.bottom() {
@@ -756,8 +756,8 @@ fn collect_screen_text_rows(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec
     rows
 }
 
-/// 从整屏行文本快照里取出框选矩形覆盖的文本：按行拼接、每行按显示宽度切列、
-/// 去掉行尾空格与首尾整行为空的行。端点先后顺序无关，终点那一列本身计入选区。
+/// Extract text covered by the selection rectangle from the full-screen row text snapshot: concatenate by row, cut columns by display width,
+/// remove trailing spaces from rows and rows that are entirely empty at the beginning/end. Start and end order doesn't matter, the end column itself is included in the selection.
 fn extract_selected_screen_text(
     screen_text_rows: &[String],
     selection_start: (u16, u16),
@@ -766,7 +766,7 @@ fn extract_selected_screen_text(
     let first_row = selection_start.1.min(selection_end.1);
     let last_row = selection_start.1.max(selection_end.1);
     let first_column = selection_start.0.min(selection_end.0);
-    // 终点列含格本身，故取右边界时右移一列
+    // The end column includes the cell itself, so shift right by one when taking the right boundary
     let last_column = selection_start.0.max(selection_end.0) + 1;
     let mut selected_rows: Vec<String> = Vec::new();
     for row in first_row..=last_row {
@@ -792,8 +792,8 @@ fn extract_selected_screen_text(
     selected_rows.join("\n")
 }
 
-/// 剔除框选结果里的界面装饰：制表框线符号、项目符号与圆点，以及作为背景填充的空白。
-/// 这些格子属于外框与背景而不是内容文字，框选跨越面板边缘时不应被一起复制走。
+/// Strip interface decorations from the selection result: box-drawing symbols, bullet points, and dots, and blanks used as background fill.
+/// These cells belong to the outer frame and background rather than content text, and should not be copied when selection crosses panel edges.
 fn strip_decoration_characters(row_text: &str) -> String {
     row_text
         .chars()
@@ -837,10 +837,10 @@ fn strip_decoration_characters(row_text: &str) -> String {
         .collect()
 }
 
-/// 粘贴内容归一化：统一换行符并剔除除换行与制表以外的控制字符。
-/// macOS Terminal.app 粘贴多行文本时送来的行尾是 \r\n，
-/// 只按 \n 拆行会把每行结尾的 \r 一起插进文本缓冲区，
-/// 表现为行间多出一个乱码格、需要用退格键删掉才能恢复正常文本。
+/// Normalize pasted content: unify line endings and strip control characters except newlines and tabs.
+/// When macOS Terminal.app pastes multi-line text, the line ending sent is \r\n,
+/// splitting only by \n would insert the \r at the end of each line into the text buffer,
+/// manifesting as a garbled cell between lines, which needs to be deleted with backspace to restore normal text.
 fn normalize_pasted_text(pasted_text: &str) -> String {
     pasted_text
         .replace("\r\n", "\n")
@@ -850,14 +850,14 @@ fn normalize_pasted_text(pasted_text: &str) -> String {
         .collect()
 }
 
-/// 判断某个格子里是不是"内容文字"：空白填充与界面装饰（框线、箭头、圆点等）都不算。
-/// 框选只应落在内容文字上，空白与外框既不该高亮，也不该被复制。
+/// Determine if a cell contains "content text": blank fill and interface decorations (box lines, arrows, dots, etc.) are not included.
+/// Selection should only fall on content text; blanks and outer frames should neither be highlighted nor copied.
 fn is_content_character(character: char) -> bool {
     !character.is_whitespace() && !is_decoration_character(character)
 }
 
-/// 界面装饰字符集合：制表框线、选中箭头、在线状态圆点、项目点、头像半块等。
-/// 框选复制与高亮都按这份名单剔除，避免把界面图形当成聊天内容复制走。
+/// Set of interface decoration characters: box-drawing lines, selection arrows, online status dots, project dots, half-character avatars, etc.
+/// Selection copy and highlighting both exclude according to this list, avoiding treating interface graphics as chat content.
 fn is_decoration_character(character: char) -> bool {
     matches!(
         character,
@@ -898,7 +898,7 @@ fn is_decoration_character(character: char) -> bool {
     )
 }
 
-/// 用外观的框选背景色高亮整屏框选矩形（两个端点的先后顺序无关），并夹取到屏幕范围内。
+/// Highlight the full-screen selection rectangle with the appearance's selection background color (order of the two endpoints doesn't matter), clamped to the screen range.
 fn paint_screen_selection(
     frame: &mut Frame,
     area: Rect,
@@ -922,7 +922,7 @@ fn paint_screen_selection(
             let Some(cell) = buffer.cell_mut((column, row)) else {
                 continue;
             };
-            // 只高亮内容文字格：外框、装饰符与背景空白不参与框选显示
+            // Only highlight content text cells: outer frames, decorations, and background blanks are not part of the selection display
             if cell
                 .symbol()
                 .chars()
@@ -936,14 +936,14 @@ fn paint_screen_selection(
 }
 
 impl App {
-    /// 设置后台轮询线程通信发送器
+    // Set the background polling thread communication sender
     pub fn set_polling_sender(&mut self, sender: Option<mpsc::Sender<PollingEvent>>) {
         self.polling_sender = sender;
     }
 
-    /// 启动后台轮询线程，定期从服务器获取房间列表、待处理与已发送的聊天请求。
-    /// 取数失败时按错误类别分流：连不上服务端只报可达性跳变（界面据此提示一次并标记顶栏），
-    /// 服务端明确返回的业务错误仍按 Error 弹出。
+    // Start the background polling thread to periodically fetch room lists, pending and sent chat requests from the server.
+    // When fetching fails, categorize by error type: inability to reach the server only reports a reachability change (interface prompts once and marks the status bar),
+    // business errors explicitly returned by the server are still popped as Error.
     pub fn start_polling_thread(&mut self) {
         let Some(sender) = self.polling_sender.clone() else {
             return;
@@ -952,7 +952,7 @@ impl App {
         let connector = self.connector.clone();
         let lang_map = self.language_strings.clone();
 
-        // 通知旧轮询线程停止，避免退出登录等场景出现多个轮询线程并存
+        // Notify the old polling thread to stop, avoiding multiple polling threads existing in scenarios like logging out
         if let Some(running_flag) = self.polling_running.take() {
             running_flag.store(false, Ordering::Relaxed);
         }
@@ -980,8 +980,8 @@ impl App {
             let mut request_poll_counter: u32 = 0;
 
             while running_flag.load(Ordering::Relaxed) {
-                // 每 2 秒轮询房间列表。连不上服务端由常驻探测线程统一报告，
-                // 这里不把传输层失败当业务错误抛出，否则一次网络抖动就是一串报错框
+                // Poll the room list every 2 seconds. Inability to reach the server is uniformly reported by the persistent probe thread,
+                // here transport-layer failures are not thrown as business errors, otherwise one network jitter would be a string of error popups
                 if room_poll_counter.is_multiple_of(20) {
                     match connector.list_rooms() {
                         Ok(rooms) => {
@@ -991,7 +991,9 @@ impl App {
                             }
                         }
                         Err(error) if error.is_connection_failure() => {
-                            debug_log(&format!("轮询房间列表时连不上服务端: {error}"));
+                            debug_log(&format!(
+                                "Cannot reach the server when polling room list: {error}"
+                            ));
                         }
                         Err(error) => {
                             let _ = sender.send(PollingEvent::Error(format!(
@@ -1002,8 +1004,8 @@ impl App {
                     }
                 }
 
-                // 每 3 秒轮询收到的与已发出的聊天请求；请求接口失败不改变可达性结论，
-                // 房间列表已经承担同样的连通性判断，这里只把业务错误报出去
+                // Poll received and sent chat requests every 3 seconds; request interface failure doesn't change the reachability conclusion,
+                // the room list already bears the same connectivity judgment, here only business errors are reported
                 if request_poll_counter.is_multiple_of(30) {
                     match connector.list_pending_requests() {
                         Ok(requests) => {
@@ -1033,19 +1035,19 @@ impl App {
         });
     }
 
-    /// 启动 WebSocket 线程，负责实时消息的发送与接收
-    /// 启动 WebSocket 线程：断线自动重连，直至被 restart_websocket_thread 替换或应用退出
-    /// 可选的 connected_sender：收到服务端 connected 回执时发送信号，用于自动登录等待连接就绪
+    // Start the WebSocket thread responsible for real-time message sending and receiving
+    // Start the WebSocket thread: auto-reconnects on disconnect, until replaced by restart_websocket_thread or the application exits
+    // Optional connected_sender: sends a signal when the server's connected receipt is received, used for auto-login waiting for connection readiness
     pub fn start_websocket_thread(
         &mut self,
         token: &str,
         mut connected_sender: Option<Sender<()>>,
     ) {
-        // 通知旧线程停止，并等待其完全退出：确保旧 socket 关闭后再建立新连接，
-        // 避免服务端短时间内看到同一用户两个连接并存导致状态混乱
+        // Notify the old thread to stop and wait for it to fully exit: ensure the old socket is closed before establishing a new connection,
+        // avoiding the server seeing two connections from the same user briefly and getting confused
         if let Some(running_flag) = self.websocket_running.take() {
             running_flag.store(false, Ordering::Relaxed);
-            // 等待旧线程退出（其内层循环 sleep 50ms 后检查标志并 return）
+            // Wait for the old thread to exit (its inner loop sleeps 50ms then checks the flag and returns)
             thread::sleep(Duration::from_millis(150));
         }
         let Some(event_sender) = self.polling_sender.clone() else {
@@ -1060,12 +1062,12 @@ impl App {
         self.websocket_running = Some(running_flag.clone());
         let thread_running = running_flag.clone();
 
-        // WebSocket 连接地址由接缝按当前版本推导（scheme 映射 + 固定路径 /websocket）
+        // WebSocket connection URL is derived by the seam based on the current version (scheme mapping + fixed path /websocket)
         let version = self.connector.version();
         let websocket_url = version.websocket_url(self.connector.base_url());
         let token = token.to_string();
         let lang_map = self.language_strings.clone();
-        // 应用层双向心跳帧与间隔（按版本），供后台线程周期发送以维持客户端→服务端方向流量
+        // Application-layer bidirectional heartbeat frame and interval (by version), for the background thread to send periodically to maintain client→server direction traffic
         let heartbeat_frame = version.heartbeat_frame();
         let heartbeat_interval = version.application_heartbeat_interval();
 
@@ -1076,18 +1078,18 @@ impl App {
                     .cloned()
                     .unwrap_or_else(|| key.to_string())
             };
-            // 外层循环支持断线自动重连；重连后服务器会按最新房间列表完成订阅
+            // The outer loop supports auto-reconnect on disconnect; after reconnecting, the server completes subscription based on the latest room list
             while thread_running.load(Ordering::Relaxed) {
-                // 由库自动生成符合 RFC 6455 的完整握手请求（含 Sec-WebSocket-Key 等必需头）
+                // The library auto-generates a complete handshake request conforming to RFC 6455 (including required headers like Sec-WebSocket-Key)
                 let mut request = match websocket_url.as_str().into_client_request() {
                     Ok(request) => request,
                     Err(e) => {
-                        debug_log(&format!("WS 请求构造失败: {e}"));
+                        debug_log(&format!("WS request construction failed: {e}"));
                         let _ = event_sender.send(PollingEvent::Error(format!(
                             "{}: {e}",
                             tr("error_ws_handshake")
                         )));
-                        // 请求构造失败等待后重试
+                        // Wait and retry after request construction failure
                         for _ in 0..20 {
                             if !thread_running.load(Ordering::Relaxed) {
                                 return;
@@ -1102,12 +1104,12 @@ impl App {
                         request.headers_mut().insert("Authorization", value);
                     }
                     Err(e) => {
-                        debug_log(&format!("WS 认证头构造失败: {e}"));
+                        debug_log(&format!("WS auth header construction failed: {e}"));
                         let _ = event_sender.send(PollingEvent::Error(format!(
                             "{}: {e}",
                             tr("error_construct_auth_failed")
                         )));
-                        // 认证头构造失败等待后重试
+                        // Wait and retry after auth header construction failure
                         for _ in 0..20 {
                             if !thread_running.load(Ordering::Relaxed) {
                                 return;
@@ -1120,23 +1122,23 @@ impl App {
 
                 let mut socket = match tungstenite::connect(request) {
                     Ok((socket, _)) => {
-                        debug_log("WS 已连接");
+                        debug_log("WS connected");
                         socket
                     }
                     Err(e) => {
-                        debug_log(&format!("WS 连接失败: {e}"));
+                        debug_log(&format!("WS connection failed: {e}"));
                         let err_msg = e.to_string();
                         let _ = event_sender.send(PollingEvent::WebSocketState(
                             "error_ws_connect_failed".to_string(),
                         ));
-                        // 服务端握手鉴权失败（401/403/令牌过期等，判定标记由接缝按版本给出）：
-                        // 清除会话并通知主线程，直接退出不再重试
+                        // Server handshake authentication failure (401/403/token expired, etc., the judgment marker is given by the seam based on version):
+                        // Clear the session and notify the main thread, exit directly without retrying
                         if version.is_auth_failure(&err_msg) {
                             let _ = event_sender
                                 .send(PollingEvent::Error(websocket_auth_sentinel().to_string()));
                             return;
                         }
-                        // 连接失败等待后重试
+                        // Wait and retry after connection failure
                         for _ in 0..20 {
                             if !thread_running.load(Ordering::Relaxed) {
                                 return;
@@ -1146,16 +1148,16 @@ impl App {
                         continue;
                     }
                 };
-                // 将底层 TCP 流设为非阻塞模式，使无数据时读取操作立即返回
+                // Set the underlying TCP stream to non-blocking mode so read operations return immediately when there's no data
                 if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_ref() {
                     let _ = stream.set_nonblocking(true);
                 }
 
                 let mut connected_signaled = false;
-                // 应用层双向心跳：服务端仅发送协议级 Ping 帧（30 秒），客户端方向完全静默
-                // 会被中间网络设备（NAT/代理/防火墙）判定单向无流量并丢弃连接映射。
-                // {"type":"pong"} 是服务端唯一确认静默忽略的报文（无回复），用于产生
-                // 客户端→服务端方向的 TCP 流量以保持 NAT 映射活跃。
+                // Application-layer bidirectional heartbeat: the server only sends protocol-level Ping frames (30 seconds), the client direction is completely silent
+                // Will be judged by intermediate network devices (NAT/proxy/firewall) as one-directional no traffic and the connection mapping will be discarded.
+                // {"type":"pong"} is the only message the server confirms to silently ignore (no reply), used to generate
+                // client→server direction TCP traffic to keep the NAT mapping active.
                 let mut keepalive = Instant::now();
 
                 loop {
@@ -1169,11 +1171,11 @@ impl App {
                                     "WS 收到类型: {}",
                                     text.chars().take(80).collect::<String>()
                                 ));
-                                // 如果是 connected 事件且有 connected_sender，发送信号通知连接就绪
+                                // If it's a connected event and there's a connected_sender, send a signal to notify connection readiness
                                 if !connected_signaled
                                     && let PollingEvent::WebSocketConnected = &event
                                 {
-                                    debug_log("WS connected 回执已收到，发送同步信号");
+                                    debug_log("WS connected receipt received, sending sync signal");
                                     if let Some(sender) = connected_sender.take() {
                                         let _ = sender.send(());
                                         connected_signaled = true;
@@ -1186,7 +1188,7 @@ impl App {
                         Err(tungstenite::Error::Io(ref error))
                             if error.kind() == ErrorKind::WouldBlock => {}
                         Err(e) => {
-                            debug_log(&format!("WS 断开: {e}"));
+                            debug_log(&format!("WS disconnected: {e}"));
                             let _ = event_sender.send(PollingEvent::WebSocketState(
                                 "error_ws_disconnected_reconnect".to_string(),
                             ));
@@ -1195,7 +1197,7 @@ impl App {
                     }
 
                     while let Ok(payload) = command_receiver.try_recv() {
-                        debug_log(&format!("WS 发出: {payload}"));
+                        debug_log(&format!("WS sent: {payload}"));
                         if socket.write(WebSocketMessage::text(payload)).is_err() {
                             let _ = event_sender.send(PollingEvent::WebSocketState(
                                 "error_ws_send_failed".to_string(),
@@ -1203,21 +1205,21 @@ impl App {
                         }
                     }
 
-                    // 周期性发送应用层心跳帧（帧内容与间隔均由接缝按版本给出），
-                    // 维持客户端→服务端方向 TCP 流量，避免中间设备丢弃连接映射
+                    // Periodically send application-layer heartbeat frames (frame content and interval are given by the seam based on version),
+                    // Maintain client→server direction TCP traffic, avoiding intermediate devices discarding the connection mapping
                     if keepalive.elapsed() >= heartbeat_interval {
                         let _ = socket.write(WebSocketMessage::text(heartbeat_frame.clone()));
                         keepalive = Instant::now();
                     }
 
-                    // 无条件 flush： tungstenite 自动排队的 Pong（响应服务端 Ping）
-                    // 和心跳报文均通过此 flush 写入 TCP 流
+                    // Unconditional flush: Pong automatically queued by tungstenite (responding to server Ping)
+                    // and heartbeat messages are all written to the TCP stream through this flush
                     let _ = socket.flush();
 
                     thread::sleep(Duration::from_millis(50));
                 }
 
-                // 断开后稍候重连
+                // Wait briefly after disconnect then reconnect
                 for _ in 0..10 {
                     if !thread_running.load(Ordering::Relaxed) {
                         return;
@@ -1228,8 +1230,8 @@ impl App {
         });
     }
 
-    /// 重建 WebSocket 连接：服务器仅在连接建立时快照房间订阅，
-    /// 出现新房间（如聊天请求刚被接受）时必须重连才能收到该房间的推送
+    /// Rebuild the WebSocket connection: the server only snapshots room subscriptions when the connection is established,
+    /// must reconnect to receive pushes for that room when a new room appears (like when a chat request is just accepted)
     fn restart_websocket_thread(&mut self) {
         if let Some(token) = self.websocket_token.clone() {
             self.start_websocket_thread(&token, None);
@@ -1237,7 +1239,7 @@ impl App {
         }
     }
 
-    /// 处理后台线程发送的事件
+    // Handle events sent by background threads
     pub fn handle_polling_event(&mut self, event: PollingEvent) {
         match event {
             PollingEvent::RoomsUpdated(rooms) => {
@@ -1266,8 +1268,8 @@ impl App {
             }
             PollingEvent::WebSocketConnected => {
                 self.update_connection_state(true);
-                // 连接（或重连）就绪：对所有未激活握手按既有密钥材料原样重发。
-                // 旧邀请可能在无人订阅期间广播丢失；无未激活会话时为空操作
+                // Connection (or reconnection) is ready: re-send all inactive handshakes with existing key material as-is.
+                // Old invitations may be broadcast and lost during periods when nobody is subscribed; no-op when there are no inactive sessions
                 let stale_room_ids: Vec<String> = self
                     .crypto
                     .sessions
@@ -1280,7 +1282,7 @@ impl App {
                 }
             }
             PollingEvent::MessageSent(message) => {
-                // 服务器会同时回发确认与新消息广播，按 id 去重避免自己消息显示两次
+                // The server simultaneously sends back an acknowledgment and new message broadcast; deduplicate by id to avoid showing own messages twice
                 if !self
                     .messages
                     .iter()
@@ -1301,14 +1303,14 @@ impl App {
                         .and_then(|i| self.rooms.get(i))
                         .map(|r| &r.id)
                 ));
-                // 检查是否是自己的消息
+                // Check if it's our own message
                 let is_own_message = self
                     .current_user_id
                     .as_ref()
                     .map(|uid| uid == &message.sender_id)
                     .unwrap_or(false);
-                // 只要是他人的消息就触发系统通知（含提示音），无论是否在当前查看的房间；
-                // 该房间开启免打扰时抑制通知（未读数仍累加）
+                // Any message from others triggers a system notification (including sound), regardless of whether it's in the currently viewed room;
+                // the room's do-not-disturb setting suppresses the notification (unread count still accumulates)
                 if !is_own_message && !self.muted_room_ids.contains(&message.room_id) {
                     let sender_name = self.sender_display_name(&message.sender_id);
                     self.send_system_notification(
@@ -1316,7 +1318,7 @@ impl App {
                         &format!("{}: {}", sender_name, message.content),
                     );
                 }
-                // 如果消息属于当前选中的房间且未重复，则追加到消息列表
+                // If the message belongs to the currently selected room and is not a duplicate, append it to the message list
                 let selected_room_id = self
                     .rooms_state
                     .selected()
@@ -1331,8 +1333,8 @@ impl App {
                         "append_incoming_msg room={} id={}",
                         message.room_id, message.id
                     ));
-                    // 实时收到某人消息，说明他此刻确有连接：以此修正在线状态，
-                    // 避免因错过 user_online 跳变而长期误显示为离线
+                    // Receiving a message from someone in real-time means they have an active connection now: use this to correct the presence status,
+                    // avoiding long-term incorrect display as offline due to missing user_online transitions
                     if !is_own_message && !message.sender_id.is_empty() {
                         self.presence_by_user
                             .insert(message.sender_id.clone(), true);
@@ -1344,12 +1346,12 @@ impl App {
                     self.messages.push(message);
                     self.mark_messages_dirty();
                     if is_match {
-                        // 搜索进行中来了新的命中消息：重扫命中列表让"第 i/n"随之更新，
-                        // 但不抢占视图位置（用户可能正在读当前匹配项附近的内容）
+                        // A new hit message arrived during search: rescan the hit list to update "i/n" accordingly,
+                        // but don't seize the view position (the user may be reading content near the current match)
                         self.refresh_search_matches();
                     }
                 } else {
-                    // 消息属于非当前选中房间：累加未读数，渲染时以红色 (N) 显示
+                    // Message belongs to a non-selected room: accumulate unread count, displayed as red (N) when rendering
                     if selected_room_id.as_deref() != Some(message.room_id.as_str())
                         && self.rooms.iter().any(|r| r.id == message.room_id)
                     {
@@ -1367,7 +1369,7 @@ impl App {
                 }
             }
             PollingEvent::PendingRequestsUpdated(requests) => {
-                // 检测新到达的请求并提示，随后更新列表与选中项
+                // Detect newly arrived requests and prompt, then update the list and selection
                 for request in &requests {
                     let is_new = !self
                         .pending_requests
@@ -1384,7 +1386,7 @@ impl App {
                                 .replace("{sender}", &sender_name)
                                 .to_string(),
                         );
-                        // 发送系统通知
+                        // Send system notification
                         self.send_system_notification(
                             &self.t("notification_new_request"),
                             &self
@@ -1401,30 +1403,30 @@ impl App {
             }
             PollingEvent::EncryptInvitation(handshake) => {
                 debug_log(&format!(
-                    "事件 EncryptInvitation room={} peer={}",
+                    "Event EncryptInvitation room={} peer={}",
                     handshake.room_id, handshake.peer_id
                 ));
                 self.handle_encrypt_invitation(handshake);
             }
             PollingEvent::EncryptAccepted(handshake) => {
                 debug_log(&format!(
-                    "事件 EncryptAccepted room={} peer={}",
+                    "Event EncryptAccepted room={} peer={}",
                     handshake.room_id, handshake.peer_id
                 ));
                 self.handle_encrypt_accepted(handshake);
             }
             PollingEvent::EncryptSessionReady(room_id) => {
-                debug_log(&format!("事件 EncryptSessionReady room={room_id}"));
+                debug_log(&format!("Event EncryptSessionReady room={room_id}"));
                 if let Some(session) = self.crypto.sessions.get_mut(&room_id) {
                     session.phase = EncryptionPhase::Active;
                 }
                 self.push_notification(self.t("notification_session_active"));
-                // 依次冲刷握手期间排队的全部消息
+                // Flush all messages queued during the handshake sequentially
                 while self.flush_pending_encrypted_message(&room_id) {}
             }
             PollingEvent::EncryptedMessage(info) => {
                 debug_log(&format!(
-                    "事件 EncryptedMessage room={} sender={}",
+                    "Event EncryptedMessage room={} sender={}",
                     info.room_id, info.sender_id
                 ));
                 self.handle_encrypted_message(info);
@@ -1432,10 +1434,10 @@ impl App {
             PollingEvent::EncryptedMessageSent(_) => {}
             PollingEvent::EncryptSessionEnded((room_id, reason)) => {
                 self.crypto.sessions.remove(&room_id);
-                // reason→文案键名的映射由接缝按版本集中给出
+                // The mapping of reason→text key name is given centrally by the seam based on version
                 let reason_text = self.connector.version().session_end_reason_key(&reason);
                 let reason_text = self.t(reason_text);
-                // 服务器重置会话时只清空消息不删房间；本地软关闭该聊天避免产生单人房间
+                // Server session reset clears messages but not the room; soft-close locally to avoid creating a solo room
                 self.close_local_room(&room_id);
                 self.push_notification(
                     self.t("notification_room_removed")
@@ -1444,25 +1446,25 @@ impl App {
                 );
             }
             PollingEvent::WebSocketState(message_key) => {
-                // 本端 WebSocket 抖动会自愈（自动重连 + 定期刷新订阅），默认不打扰用户；
-                // 只有确实发不出去的报文才提示，避免"突然报错又自己好了"的噪声
-                debug_log(&format!("WebSocket 状态事件: {message_key}"));
+                // Local WebSocket jitter self-heals (auto-reconnect + periodic subscription refresh); by default do not disturb the user;
+                // Only genuinely undeliverable packets prompt; avoid the noise of "error then self-recovery"
+                debug_log(&format!("WebSocket status event: {message_key}"));
                 match message_key.as_str() {
                     "error_ws_send_failed" => self.push_error(self.t(&message_key)),
-                    // 连不上服务端：交给顶栏标记，同一故障持续期间只在这一帧弹一次错误
+                    // Cannot connect to server: delegate to the top bar marker; only pop one error per frame while the fault persists
                     "error_ws_connect_failed" => {
-                        // 版本串清空即可；连接标记交给常驻探测线程，它比单条链路的抖动可靠
+                        // Just clear the version string; the connection flag delegates to the persistent probing thread, which is more reliable than single-link jitter
                         self.connector.clear_server_version();
                     }
                     _ => {}
                 }
             }
             PollingEvent::MemberTyping((room_id, user_id, username)) => {
-                // 自己发出的 typing 帧服务端已过滤回声，此处再兜一层防多连接场景自我显示
+                // The server already filters echo of our own typing frames; this adds another layer to prevent self-display in multi-connection scenarios
                 if Some(&user_id) == self.current_user_id.as_ref() || username.is_empty() {
                     return;
                 }
-                // 同一成员只保留最新一条：先摘掉旧记录再插入，避免重复名字堆进标题
+                // Keep only the latest entry per member: remove the old record before inserting, avoiding duplicate names piling into the title
                 self.typing_members
                     .retain(|(_, kept_user_id, _)| kept_user_id != &user_id);
                 self.typing_members
@@ -1471,16 +1473,16 @@ impl App {
             PollingEvent::PresenceChanged((user_id, username, is_online)) => {
                 self.presence_by_user.insert(user_id.clone(), is_online);
                 if !is_online {
-                    // 只更新在线状态与输入指示，绝不在这里清理加密会话：
-                    // 服务端在本端 WebSocket 重连（新房间刷新订阅、60 秒定期重建）期间会瞬时
-                    // 判定该用户完全离线并广播 user_offline，据此拆会话正是"切群再切回就把
-                    // 私聊打断"的成因。会话生命周期只由服务端的权威事件驱动
-                    // （encrypt_partner_disconnected 起 30 秒宽限、encrypt_session_ended /
-                    // encrypt_session_expired 结束），对端在宽限期内恢复连接则会话继续可用。
+                    // Only update online status and typing indicators; never clean up encrypted sessions here:
+                    // The server will momentarily consider the user fully offline during local WebSocket reconnection (new room subscription refresh, 60-second periodic rebuild):
+                    // broadcast user_offline; dismantling sessions based on this is exactly why "switching groups and back causes
+                    // private chats to break." Session lifecycles are driven solely by authoritative server events
+                    // (30-second grace period from encrypt_partner_disconnected, encrypt_session_ended /
+                    // encrypt_session_expired); if the peer reconnects within the grace period the session remains usable.
                     self.typing_members
                         .retain(|(_, kept_user_id, _)| kept_user_id != &user_id);
                 }
-                // 在线广播自带用户名，顺带补全名称映射（新成员首次发言前也能正确显示）
+                // Online broadcasts include the username; also enrich the name mapping so new members display correctly before their first message
                 if !username.is_empty() {
                     self.sender_names.insert(user_id, username);
                 }
@@ -1489,8 +1491,8 @@ impl App {
                 self.quit_ready = true;
             }
             PollingEvent::Error(error) => {
-                // 客户端自造的鉴权失败哨兵（token 过期/无效）：清除会话回到未登录聊天页。
-                // 置于其它分类之前，避免被当作可展示错误误报。
+                // Client-made auth failure sentinel (token expired/invalid): clear the session and return to the logged-out chat page.
+                // Place before other categories to avoid being misreported as a displayable error.
                 if error == websocket_auth_sentinel() {
                     debug_log("WebSocket 认证失败，清除保存的会话并回到未登录聊天页");
                     Self::clear_saved_session();
@@ -1520,22 +1522,22 @@ impl App {
                     self.websocket_token = None;
                     return;
                 }
-                // 其余服务端错误文本按版本归类为领域信号，行为集中判定，散落字面量已收进接缝
+                // Remaining server error texts are categorized as domain signals by version; behavior is judged centrally, scattered literals have been absorbed into the seam
                 match self.connector.version().classify_server_error(&error) {
-                    // 撞上服务器残留活跃加密会话：发 encrypt_leave 清场，同时把错误展示给用户
+                    // Hit a lingering active encrypted session on the server: send encrypt_leave to clear the field, and display the error to the user
                     ServerSignal::StuckEncryptedSession => {
                         self.recover_stuck_encryption_sessions();
                         self.push_error(error);
                     }
-                    // 对端离线导致握手被拒：清理本地等待接受的僵死会话，并把排队的明文退回输入框
+                    // Peer offline causing handshake rejection: clean up the zombie session waiting for accept locally, and return queued plaintext to the input box
                     ServerSignal::PartnerOfflineHandshakeRejected => {
                         self.discard_rejected_handshakes();
                     }
-                    // /quit 批量清理对无会话房间发 leave：预期内，静默忽略
+                    // /quit batch cleanup of leave for rooms without sessions: expected, silently ignored
                     ServerSignal::NoActiveEncryptedSession => {}
-                    // 私聊退房后服务器报"非成员"：预期内，静默忽略
+                    // Server reports "not a member" after leaving a private chat: expected, silently ignored
                     ServerSignal::NotRoomMember => {}
-                    // 其它真实错误：展示给用户
+                    // Other genuine errors: display to the user
                     ServerSignal::Displayable => {
                         self.push_error(error);
                     }
@@ -1544,7 +1546,7 @@ impl App {
         }
     }
 
-    /// 对本端所有未激活的加密会话发送离开报文，促使服务器清理残留状态
+    /// Send leave messages to all inactive encrypted sessions locally, prompting the server to clean up residual state
     fn recover_stuck_encryption_sessions(&mut self) {
         let stuck_room_ids: Vec<String> = self
             .crypto
@@ -1561,10 +1563,10 @@ impl App {
         }
     }
 
-    /// 对端离线导致握手被拒时的善后：摘掉所有处于"等待对端接受"的会话（它们不可能再成功），
-    /// 并把其中排队未发的明文退回消息输入框。
-    /// 不退回的后果就是"消息发完立刻消失"：会话被删、排队内容随会话一起丢弃、输入框又已清空，
-    /// 用户既没发出去也看不到任何痕迹。只退回当前选中房间的那条，其余房间保持丢弃。
+    // Cleanup when peer offline causes handshake rejection: remove all sessions in "waiting for peer accept" state (they can no longer succeed):
+    // and return the queued unsent plaintext to the message input box.
+    /// The consequence of not returning is "message sent then immediately disappears": the session is deleted, queued content is discarded with the session, and the input box is already cleared,
+    /// so the user neither sent it nor sees any trace. Return only the one in the currently selected room; discard the rest.
     fn discard_rejected_handshakes(&mut self) {
         let selected_room_id = self.selected_room_id();
         let stuck_room_ids: Vec<String> = self
@@ -1587,7 +1589,7 @@ impl App {
             return;
         };
         let typed = self.input_collector.message_input_state.text();
-        // 输入框已被再次编辑时不覆盖用户的新内容，改为把未发内容接在最前面，两条都保住
+        // When the input box has been edited again, do not overwrite the user's new content; instead prepend the unsent content, keeping both
         let merged = if typed.is_empty() {
             content
         } else {
@@ -1597,15 +1599,15 @@ impl App {
         self.push_notification(self.t("notification_message_returned"));
     }
 
-    /// 处理对端发起的加密会话邀请：校验签名、协商密钥、回复接受与就绪
+    /// Handle encryption session invitation initiated by the peer: verify signature, negotiate key, reply with acceptance and readiness
     fn handle_encrypt_invitation(&mut self, handshake: EncryptHandshakeData) {
-        // 服务器把邀请广播给房间全体成员，inviter_id 等于自己即为自身请求的回声
+        // The server broadcasts the invitation to all room members, inviter_id equal to self is the echo of its own request
         if Some(&handshake.peer_id) == self.current_user_id.as_ref() {
             debug_log("invitation 早退：自身回声");
             return;
         }
-        // 对端有效邀请到达时，本端处于等待接受的旧会话说明双方同时发起（角色反转），
-        // 丢弃旧会话改走接受方流程；已激活或正在协商则忽略重复邀请
+        // When a valid peer invitation arrives, the old session on this side waiting for acceptance indicates both sides initiated simultaneously (role reversal),
+        // discard the old session and take the acceptance flow; if already active or negotiating, ignore duplicate invitations
         if let Some(existing) = self.crypto.sessions.get(&handshake.room_id) {
             if existing.phase != EncryptionPhase::AwaitingAcceptance {
                 debug_log("invitation 早退：已有非等待接受会话");
@@ -1623,7 +1625,7 @@ impl App {
             self.push_error(self.t("error_invitation_signature_invalid"));
             return;
         }
-        // 协商共享密钥：己方新临时私钥 × 对端临时公钥
+        // Negotiate shared key: our new ephemeral private key × peer's ephemeral public key
         let ephemeral_secret = crypto::generate_ephemeral_secret();
         let own_public_key = crypto::encode_x25519_public(&ephemeral_secret);
         let shared_key = match crypto::derive_shared_key(ephemeral_secret, &handshake.public_key) {
@@ -1636,7 +1638,7 @@ impl App {
                 return;
             }
         };
-        // 签名对象为己方临时公钥（服务端文档约定）
+        // The signing target is our ephemeral public key (per server documentation convention)
         let signature = match crypto::sign_public_key(&self.crypto.identity_key, &own_public_key) {
             Ok(signature) => signature,
             Err(e) => {
@@ -1677,9 +1679,9 @@ impl App {
         self.push_notification(self.t("notification_session_accepted"));
     }
 
-    /// 处理对端接受回应：校验签名、完成密钥协商并发送就绪
+    /// Handle peer acceptance response: verify signature, complete key negotiation, and send readiness
     fn handle_encrypt_accepted(&mut self, handshake: EncryptHandshakeData) {
-        // acceptor_id 等于自己即为自身 accept 的广播回声
+        // acceptor_id equal to self is the broadcast echo of its own accept
         if Some(&handshake.peer_id) == self.current_user_id.as_ref() {
             return;
         }
@@ -1737,7 +1739,7 @@ impl App {
         ));
     }
 
-    /// 处理收到的加密消息：解密后按当前选中房间与消息 id 去重显示
+    /// Handle received encrypted messages: display after decryption, deduplicated by current selected room and message id
     fn handle_encrypted_message(&mut self, info: EncryptedMessageInfo) {
         let selected_room_id = self.selected_room_id();
         let is_selected = selected_room_id.as_deref() == Some(info.room_id.as_str());
@@ -1751,13 +1753,13 @@ impl App {
             .sessions
             .get(&info.room_id)
             .and_then(|session| session.shared_key);
-        // 能解密则取明文用于通知预览，不能解密也不影响未读统计
+        // If decryption succeeds, take the plaintext for notification preview; if it fails, it doesn't affect unread statistics
         let plaintext =
             shared_key.and_then(|key| crypto::decrypt_message(&key, &info.ciphertext).ok());
 
         if !is_selected {
-            // 私聊在别的房间也会漏通知的修复：非当前查看房间同样累加未读并发系统通知，
-            // 该房间开启免打扰（或自己发出的回声）时抑制通知
+            // Fix for private chat missing notifications in other rooms: accumulate unread count and send desktop notifications even for non-currently-viewed rooms:
+            // Suppress notifications when the room has do-not-disturb enabled (or it's our own echo)
             *self.unread_counts.entry(info.room_id.clone()).or_insert(0) += 1;
             if !is_own && !self.muted_room_ids.contains(&info.room_id) {
                 let sender_name = self.sender_display_name(&info.sender_id);
@@ -1770,11 +1772,11 @@ impl App {
             return;
         }
 
-        // 当前查看房间：解密后追加显示
+        // Current viewing room: append for display after decryption
         match plaintext {
             Some(plaintext) => {
                 if !self.messages.iter().any(|existing| existing.id == info.id) {
-                    // 加密房间不落盘，这里只标脏也无害：落盘前还会按房间加密标志再挡一次
+                    // Encrypted rooms don't persist to disk, marking dirty here is harmless: it will be blocked again by the room encryption flag before persisting
                     self.mark_messages_dirty();
                     self.messages.push(MessageInfo {
                         id: info.id,
@@ -1798,7 +1800,7 @@ impl App {
         }
     }
 
-    /// 会话激活后发送一条排队中的明文消息（加密后发出）；返回是否确有消息被发送
+    /// After the session is active, send a queued plaintext message (sent after encryption); returns whether any message was actually sent
     fn flush_pending_encrypted_message(&mut self, room_id: &str) -> bool {
         let payload = {
             let session = match self.crypto.sessions.get_mut(room_id) {
@@ -1831,7 +1833,7 @@ impl App {
         true
     }
 
-    /// 发起加密会话握手；带待发内容时会话就绪后自动发送
+    /// Initiate an encryption session handshake; if there's pending content, it's automatically sent after the session is ready
     fn initiate_encryption(&mut self, room_id: &str, pending_content: Option<String>) {
         let ephemeral_secret = crypto::generate_ephemeral_secret();
         let public_key = crypto::encode_x25519_public(&ephemeral_secret);
@@ -1864,7 +1866,7 @@ impl App {
         );
     }
 
-    /// 发送加密握手邀请报文
+    /// Send encryption handshake invitation message
     fn send_encrypt_request(
         &mut self,
         room_id: &str,
@@ -1883,8 +1885,8 @@ impl App {
         ));
     }
 
-    /// 以会话中既有的密钥材料原样重发握手报文：
-    /// 等待接受则重发邀请（同一公钥），等待就绪则重发 ready（服务器幂等）
+    /// Resend handshake messages with existing key material from the session as-is:
+    /// Resend invitation (same public key) when awaiting acceptance, resend ready (server is idempotent) when awaiting readiness
     fn resend_handshake_if_needed(&mut self, room_id: &str) {
         let payload = {
             let session = match self.crypto.sessions.get_mut(room_id) {
@@ -1894,7 +1896,7 @@ impl App {
             match session.phase {
                 EncryptionPhase::AwaitingAcceptance => {
                     let identity_key = crypto::encode_identity_public(&self.crypto.identity_key);
-                    // 签名对象仍是同一份临时公钥，保证对端无论响应哪一次邀请都能协商一致
+                    // The signing object remains the same ephemeral public key, ensuring the peer can negotiate consistently regardless of which invitation they respond to
                     let signature = match crypto::sign_public_key(
                         &self.crypto.identity_key,
                         &session.own_public_key,
@@ -1926,12 +1928,12 @@ impl App {
         self.send_ws_payload(payload);
     }
 
-    /// 主循环周期调用：1) WebSocket 连接超过 60 秒时定期重建刷新房间订阅；
-    /// 2) 未激活握手超时重发；3) 清理超出衰减窗口的输入状态记录
+    // Called periodically by the main loop: 1) When the WebSocket connection exceeds 60 seconds, periodically rebuild and refresh room subscriptions;
+    // 2) Resend expired inactive handshakes; 3) Clean up input state records beyond the decay window
     pub fn handle_tick(&mut self) {
-        // 服务端订阅快照机制：subscribe_to_room 仅在连接建立时执行一次，
-        // 此后新加入的房间无法动态添加。定期重连确保订阅始终最新。
-        // 定期重建 WebSocket 以刷新房间订阅的间隔，由接缝按当前服务端版本给出
+        // Server subscription snapshot mechanism: subscribe_to_room is only executed once when the connection is established,
+        // afterward new rooms can't be dynamically added. Periodic reconnection ensures subscriptions are always up to date.
+        // The interval for periodic WebSocket rebuild to refresh room subscriptions, given by the seam based on the current server version
         let version = self.connector.version();
         if self.websocket_token.is_some()
             && self.websocket_connected_at.elapsed() >= version.subscription_refresh_interval()
@@ -1957,23 +1959,23 @@ impl App {
             self.resend_handshake_if_needed(&room_id);
         }
 
-        // 攒够批量窗口的消息变更一次性落盘（消息逐条到达时只置脏标记）
+        // Accumulate message changes for the batch window and persist at once (only set dirty marks when messages arrive one by one)
         self.flush_pending_message_cache();
 
-        // 服务端不广播"停止输入"，超时即视为已停止：定期摘掉过期记录，防止列表无限增长
+        // The server doesn't broadcast "stop typing", timeout means stopped: periodically remove expired records to prevent the list from growing indefinitely
         let display_window = version.typing_display_window();
         self.typing_members
             .retain(|(_, _, seen_at)| seen_at.elapsed() < display_window);
     }
 
-    /// 消息输入框内容发生变化的统一入口（普通按键、Ctrl+J、Ctrl+U、粘贴四处都经这里）：
-    /// 上报输入状态，并让与当前输入不符的旧搜索结果立即失效。
-    /// 快速搜索模式下随输入就地重扫已加载消息；普通搜索模式下关键词一改（含用退格删掉一段、
-    /// 或删掉井号前缀退出搜索模式），上次结果就不再成立，匹配列表、当前序号与定位一起清掉，
-    /// 标题随即回到"未执行搜索"，上下键也不再跳转旧结果。
+    // Unified entry point for when the message input box content changes (normal keys, Ctrl+J, Ctrl+U, paste all go through here):
+    // Report input status, and immediately invalidate old search results that don't match the current input.
+    // In quick search mode, rescan loaded messages in-place as you type; in normal search mode, once the keyword changes (including using backspace to delete a segment,
+    /// or delete the hash prefix to exit search mode), the previous result is no longer valid; the match list, current index, and position are all cleared,
+    /// the title returns to "search not executed", arrow keys no longer jump to old results.
     fn handle_message_input_changed(&mut self) {
         self.notify_typing_if_needed();
-        // 打出 "/profile " 这一刻把服务端全部用户捞回来，补全面板随后几帧就有内容
+        // Fetch all users from the server at the moment "/profile " is typed; the profile panel will have content in subsequent frames
         if self
             .input_collector
             .message_input_state
@@ -1995,9 +1997,9 @@ impl App {
         }
     }
 
-    /// 输入框文本变化后上报输入状态（增删均算，符合"2 秒内视作处于打字状态"的判定）。
-    /// 只在已登录、WebSocket 就绪、选中了房间、输入的是普通文本（非指令/搜索模式）时发送，
-    /// 并按接缝给出的间隔节流——服务端入站限流为 30 条/30 秒，逐字符上报会立即打满配额。
+    // Report input status after the input box text changes (both additions and deletions count, matching the judgment "considered typing within 2 seconds").
+    /// Only sent when logged in, WebSocket is ready, a room is selected, and ordinary text (not commands/search mode) is being typed,
+    /// and throttled at the interval given by the seam — the server's inbound rate limit is 30/30 seconds, per-character reporting would immediately fill the quota.
     fn notify_typing_if_needed(&mut self) {
         if !self.is_logged_in() || self.websocket_sender.is_none() {
             return;
@@ -2024,29 +2026,29 @@ impl App {
         ));
     }
 
-    /// 通过 WebSocket 命令通道发送一条完整的 WS JSON 载荷
+    /// Send a complete WS JSON payload through the WebSocket command channel
     fn send_ws_payload(&self, payload: serde_json::Value) {
         if let Some(sender) = &self.websocket_sender {
             let _ = sender.send(payload.to_string());
         }
     }
 
-    /// 追加一条信息类通知（标题"提示"、蓝色边框），存活时长按文本长度计算（基础 3 秒，每 20 个字符加 1 秒）
+    /// Append an information-type notification (title "Hint", blue border), lifetime calculated by text length (base 3 seconds, plus 1 second per 20 characters)
     fn push_notification(&mut self, message: String) {
         let lifetime = Duration::from_secs(3 + (message.chars().count() / 20) as u64);
-        // 新通知排在已有通知下方，把整列向下挤压
+        // New notifications are placed below existing ones, pushing the whole column down
         self.notifications
             .push((message, false, Instant::now() + lifetime));
     }
 
-    /// 追加一条错误类通知（客户端校验或接口报错，标题"错误"、红色边框）
+    /// Append an error-type notification (client validation or API error, title "Error", red border)
     fn push_error(&mut self, message: String) {
         let lifetime = Duration::from_secs(3 + (message.chars().count() / 20) as u64);
         self.notifications
             .push((message, true, Instant::now() + lifetime));
     }
 
-    /// 移除已超过过期时刻的通知
+    /// Remove notifications that have exceeded their expiration time
     fn remove_expired_notifications(&mut self) {
         let now = Instant::now();
         self.notifications
@@ -2055,7 +2057,7 @@ impl App {
 }
 
 impl App {
-    /// 从 config/languages/{lang}.json 加载语言字符串到 language_strings
+    // Load language strings from config/languages/{lang}.json into language_strings
     pub fn load_language(&mut self, lang: &str) {
         let path = paths::config_path(&format!("languages/{lang}.json"));
         match fs::read_to_string(&path) {
@@ -2081,14 +2083,14 @@ impl App {
         }
     }
 
-    /// 根据语言键名从 language_strings 中查找对应的本地化文本，未找到时返回键名本身
+    // Look up the corresponding localized text from language_strings by language key, return the key itself if not found
     pub fn t(&self, key: &str) -> String {
         self.language_strings
             .get(key)
             .cloned()
             .unwrap_or_else(|| key.to_string())
     }
-    /// 返回 config/languages/ 下所有可用的语言代码（去 .json 后缀）
+    /// Return all available language codes under config/languages/ (removing .json suffix)
     fn get_available_languages() -> Vec<String> {
         let dir = paths::config_directory().join("languages");
         fs::read_dir(dir)
@@ -2112,7 +2114,7 @@ impl App {
             .collect()
     }
 
-    /// 获取当前语言代码（从 preferences.json 读取）
+    // Get the current language code (read from preferences.json)
     pub fn current_language() -> String {
         let prefs_path = paths::readable_config_path("preferences.json");
         fs::read_to_string(&prefs_path)
@@ -2122,7 +2124,7 @@ impl App {
             .unwrap_or_else(|| "zh-CN".to_string())
     }
 
-    /// 保存语言设置到 preferences.json
+    /// Save language settings to preferences.json
     fn save_language_preference(lang: &str) {
         let prefs_path = paths::writable_config_path("preferences.json");
         let content = fs::read_to_string(&prefs_path).unwrap_or_default();
@@ -2134,8 +2136,8 @@ impl App {
         }
     }
 
-    /// 从 preferences.json 读取显示偏好（show_uid / time_with_date / server_address / sound_enabled /
-    /// appearance / read_state_manual），读不到时保持默认
+    // Read display preferences from preferences.json (show_uid / time_with_date / server_address / sound_enabled /
+    // appearance / read_state_manual), keep defaults when not found
     pub fn load_display_preferences(&mut self) {
         let prefs_path = paths::readable_config_path("preferences.json");
         if let Some(v) = fs::read_to_string(&prefs_path)
@@ -2163,7 +2165,7 @@ impl App {
             {
                 self.connector.set_base_url(addr);
             }
-            // 读取开启免打扰的房间 ID 列表
+            // Read the list of room IDs with do-not-disturb enabled
             self.muted_room_ids = v
                 .get("muted_rooms")
                 .and_then(serde_json::Value::as_array)
@@ -2173,7 +2175,7 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
-            // 读取外观名称并加载主题（未配置时沿用内置配色，不打扰用户）
+            // Read the appearance name and load the theme (use built-in colors when unconfigured, to not disturb the user)
             if let Some(name) = v.get("appearance").and_then(serde_json::Value::as_str)
                 && !name.is_empty()
             {
@@ -2182,9 +2184,9 @@ impl App {
         }
     }
 
-    /// 应用名为 name 的外观主题：加载 config/themes/{name}.json 并把结果写入 self.appearance。
-    /// 主题缺字段或多字段时按 TODO 约定明确标记（缺字段只报"不完整"、不列举具体项，多字段列出名称），
-    /// 缺项槽位由内置默认色兜底，保证界面永不出现无配色可用的情况。
+    // Apply the appearance theme named name: load config/themes/{name}.json and write the result to self.appearance.
+    /// When the theme is missing fields or has extra fields, mark explicitly per TODO convention (missing fields only report "incomplete" without listing specifics, extra fields list names),
+    /// Missing slots are covered by built-in default colors, ensuring the interface never runs out of available colors.
     fn apply_appearance(&mut self, name: &str) {
         let (appearance, has_missing_field, extra_fields) = Appearance::load(name);
         self.appearance = appearance;
@@ -2206,8 +2208,8 @@ impl App {
         }
     }
 
-    /// 用户主动切换外观的统一入口：应用主题、写回 preferences.json、给出结果提示。
-    /// 设置页浮层与 /appearance 命令共用，保证两条路径行为一致。
+    /// Unified entry point for the user to actively switch appearance: apply theme, write back to preferences.json, give result prompt.
+    /// The settings page overlay and /appearance command share this, ensuring both paths behave consistently.
     fn switch_appearance(&mut self, name: &str) {
         self.apply_appearance(name);
         self.save_appearance_preference();
@@ -2218,7 +2220,7 @@ impl App {
         );
     }
 
-    /// 将外观名称写入 preferences.json（配置项，与显示偏好同一文件同一写法）
+    /// Write the appearance name to preferences.json (configuration item, same file and notation as display preferences)
     fn save_appearance_preference(&self) {
         let prefs_path = paths::writable_config_path("preferences.json");
         let read_path = paths::readable_config_path("preferences.json");
@@ -2231,7 +2233,7 @@ impl App {
         }
     }
 
-    /// 将全部界面显示偏好写入 preferences.json（新增显示类开关只改这一处即可）
+    /// Write all display preferences to preferences.json (adding new display toggles only requires changing this one place)
     fn save_display_preferences(&self) {
         let prefs_path = paths::writable_config_path("preferences.json");
         let read_path = paths::readable_config_path("preferences.json");
@@ -2249,7 +2251,7 @@ impl App {
         }
     }
 
-    /// 将自定义服务器地址写入 preferences.json
+    /// Save the custom server address to preferences.json
     fn save_server_address(&self) {
         let prefs_path = paths::writable_config_path("preferences.json");
         let read_path = paths::readable_config_path("preferences.json");
@@ -2262,7 +2264,7 @@ impl App {
         }
     }
 
-    /// 发送系统通知（如果已启用）
+    /// Send a system notification (if enabled)
     fn send_system_notification(&self, title: &str, body: &str) {
         if !self.sound_enabled {
             debug_log("系统通知已禁用 (sound_enabled=false)");
@@ -2270,16 +2272,16 @@ impl App {
         }
         debug_log(&format!("发送系统通知: title={}, body={}", title, body));
 
-        // 在后台线程播放提示音，避免阻塞主线程
+        // Play the notification sound on a background thread to avoid blocking the main thread
         let sound_enabled = self.sound_enabled;
         std::thread::spawn(move || {
             if !sound_enabled {
                 return;
             }
-            // 在 macOS 上使用 afplay 播放系统声音
+            // Play system sound using afplay on macOS
             #[cfg(target_os = "macos")]
             {
-                // 使用最可靠的系统提示音文件
+                // Use the most reliable system alert sound file
                 const SOUND_FILE: &str = "/System/Library/Sounds/Ping.aiff";
                 match std::process::Command::new("afplay")
                     .arg(SOUND_FILE)
@@ -2290,7 +2292,7 @@ impl App {
                             debug_log(&format!("afplay 播放成功: {}", SOUND_FILE));
                         } else {
                             debug_log(&format!("afplay 退出码非零: {:?}", status));
-                            // 回退到 terminal bell
+                            // Fall back to terminal bell
                             let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\x07");
                             let _ = std::io::Write::flush(&mut std::io::stderr());
                         }
@@ -2302,7 +2304,7 @@ impl App {
                     }
                 }
             }
-            // 在其他系统上尝试使用 terminal bell
+            // Try terminal bell on other systems
             #[cfg(not(target_os = "macos"))]
             {
                 if let Err(e) = std::io::Write::write_all(&mut std::io::stderr(), b"\x07") {
@@ -2314,8 +2316,8 @@ impl App {
             }
         });
 
-        // 异步发送桌面通知：macOS 用 osascript（notify-rust 在终端 TUI 下常不可用），
-        // 其余平台仍用 notify-rust。
+        // Send desktop notification asynchronously: macOS uses osascript (notify-rust is often unavailable in terminal TUI),
+        // other platforms still use notify-rust.
         let title = title.to_string();
         let body = body.to_string();
         std::thread::spawn(move || {
@@ -2351,8 +2353,8 @@ impl App {
         });
     }
 
-    /// 将登录会话（JWT 与企业用户 ID）写入 preferences.json，供下次启动自动登录。
-    /// 令牌经静态加密后落盘，不保存明文密码或用户名。
+    /// Save the login session (JWT and corporate user ID) to preferences.json for auto-login on next startup.
+    /// Tokens are encrypted at rest before saving; plaintext passwords or usernames are not stored.
     fn save_session_preferences(token: &str, user_id: &str, contact: Option<&(String, String)>) {
         let prefs_path = paths::writable_config_path("preferences.json");
         let read_path = paths::readable_config_path("preferences.json");
@@ -2378,8 +2380,8 @@ impl App {
         }
     }
 
-    /// 读取上次退出时存下的邮箱与手机号（服务端没有"查自己的联系方式"接口，
-    /// 自动登录路径拿不到登录响应，只能靠本地会话记录还原资料卡这两行）。
+    /// Read the email and phone number saved at last exit (the server has no "query my contact info" interface,
+    /// auto-login path cannot get the login response, so it relies on local session records to restore these two lines of the profile card).
     fn load_saved_contact() -> Option<(String, String)> {
         let content = fs::read_to_string(paths::config_path("preferences.json")).ok()?;
         let prefs: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -2388,7 +2390,7 @@ impl App {
         Some((email, phone_number))
     }
 
-    /// 读取已保存的登录会话；令牌先解密，凭证缺失或解密失败时返回 None
+    /// Read the saved login session; the token is decrypted first, returns None if credentials are missing or decryption fails
     fn load_saved_session() -> Option<(String, String)> {
         let prefs_path = paths::readable_config_path("preferences.json");
         let content = fs::read_to_string(&prefs_path).ok()?;
@@ -2398,7 +2400,7 @@ impl App {
         Some((token, user_id.to_string()))
     }
 
-    /// 清除已保存的登录会话（token 失效或不再需要自动登录时调用）
+    /// Clear the saved login session (called when the token is invalid or auto-login is no longer needed)
     fn clear_saved_session() {
         let prefs_path = paths::writable_config_path("preferences.json");
         let read_path = paths::readable_config_path("preferences.json");
@@ -2416,11 +2418,11 @@ impl App {
         }
     }
 
-    /// 尝试用保存的会话自动登录：token 有效则进入聊天页并后台线程就绪，
-    /// 失效则清除会话并停留在登录页。返回是否成功自动登录。
+    // Try to auto-login with the saved session: if the token is valid, enter the chat page and prepare background threads,
+    // if invalid, clear the session and stay on the login page. Returns whether auto-login succeeded.
     pub fn try_auto_login(&mut self) -> bool {
         let Some((token, user_id)) = Self::load_saved_session() else {
-            // 无有效会话（可能遗留明文/损坏令牌）：清理陈旧会话字段
+            // No valid session (possibly leftover plaintext/corrupted token): clear stale session fields
             Self::clear_saved_session();
             return false;
         };
@@ -2436,15 +2438,15 @@ impl App {
         }
         self.update_connection_state(true);
         debug_log("JWT AUTO-LOGIN: list_rooms 成功，设置用户状态");
-        // 自动登录同样立即探测服务端版本（token 已 set），令后续线上决策匹配真实版本
+        // Auto-login also probes the server version immediately (token is set), so subsequent online decisions match the real version
         self.detect_and_apply_api_version();
         self.current_user_id = Some(user_id.clone());
-        // 自动登录没有登录响应，联系方式用上次退出时存下的那份
+        // Auto-login has no login response, contact info uses the one saved at last exit
         self.own_contact = Self::load_saved_contact();
-        // 服务端不会给自己广播 user_online，本端在线状态需自行登记
+        // The server doesn't broadcast user_online to itself, so the local presence status needs to be registered by itself
         self.presence_by_user.insert(user_id, true);
         self.focus_index = 0;
-        // 与普通登录保持完全一致的流程：先加载房间列表，再启动后台线程
+        // Keep exactly the same flow as normal login: load the room list first, then start background threads
         self.load_rooms();
         self.start_polling_thread();
         self.start_websocket_thread(&token, None);
@@ -2455,45 +2457,25 @@ impl App {
     }
 }
 
-/// 内置聊天命令表，元素为 (命令名, 描述的语言键名)。
-/// 扩展新命令时在此追加条目，并在 App::execute_chat_command 中增加对应执行分支即可。
+/// Built-in chat command table, elements are (command name, description language key).
+/// The table itself lives in shared code `baihua-core::commands`; the GUI reads the same one;
+/// When adding a new command, just add one entry to each execution branch (terminal version here and GUI).
 pub(crate) fn chat_commands() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("quit", "command_quit"),
-        ("exit", "command_quit"),
-        ("quit_group", "command_quit_group"),
-        ("kick", "command_kick"),
-        ("info", "command_info"),
-        ("list_users", "command_list_users"),
-        ("search_users", "command_search_users"),
-        ("profile", "command_profile"),
-        ("language", "command_language"),
-        ("appearance", "command_appearance"),
-        ("update", "command_update"),
-        ("logout", "command_logout"),
-        ("server_address", "command_server_address"),
-        ("add_member", "command_add_member"),
-        ("mute", "command_mute"),
-        ("login", "command_login"),
-        ("register", "command_register"),
-    ]
+    baihua_core::commands::chat_commands()
 }
 
-/// 按已输入的命令前缀过滤出可补全的命令表条目
+/// Filter the command table entries that match the entered command prefix
 fn command_completions(prefix: &str) -> Vec<(&'static str, &'static str)> {
-    chat_commands()
-        .into_iter()
-        .filter(|(name, _)| name.starts_with(prefix))
-        .collect()
+    baihua_core::commands::command_completions(prefix)
 }
 
-/// 判断群成员角色是否为群管理员或群主（服务端角色字符串不区分大小写）
+/// Determine if a group member role is group admin or owner (server role strings are case-insensitive)
 fn is_admin_role(role: &str) -> bool {
     let lowered = role.to_lowercase();
     lowered == "owner" || lowered == "admin"
 }
 
-/// 过滤不可见的房间：本地已关闭的加密私聊，以及成员不足两人的残留私聊空壳
+/// Filter invisible rooms: locally closed encrypted private chats, and leftover private chat shells with fewer than two members
 fn filter_visible_rooms(rooms: Vec<RoomInfo>, closed_room_ids: &HashSet<String>) -> Vec<RoomInfo> {
     rooms
         .into_iter()
@@ -2503,7 +2485,7 @@ fn filter_visible_rooms(rooms: Vec<RoomInfo>, closed_room_ids: &HashSet<String>)
         .collect()
 }
 
-/// 估算字符串在终端中的显示宽度，CJK 与全角字符按两列计
+/// Estimate the display width of a string in the terminal, CJK and full-width characters count as two columns
 fn display_width(text: &str) -> u16 {
     text.chars()
         .map(|character| {
@@ -2525,8 +2507,8 @@ fn display_width(text: &str) -> u16 {
         .sum()
 }
 
-/// 两批消息按 ID 合并成一批：先到的（本地已有，可能是解密后的明文）优先保留，
-/// 后到的只补新条目，最后按创建时间与服务端 ID 升序排列。
+/// Merge two batches of messages by ID: earlier arrived ones (already local, possibly decrypted plaintext) are preserved first,
+/// later ones only add new entries, finally sorted by creation time and server ID ascending.
 fn merge_messages_by_id(
     existing: Vec<MessageInfo>,
     incoming: Vec<MessageInfo>,
@@ -2542,9 +2524,9 @@ fn merge_messages_by_id(
     merged
 }
 
-/// 叠加层统一窗口边框：四边框加左上角标题，边框色一律取外观的 overlay_border。
-/// 所有浮层（表单、列表、卡片、输入框组）都从这里取窗口外观，
-/// 换主题或调风格只动这一处，不会再出现某个浮层跟着消息区边框色走的情况。
+/// Unified overlay window border: four borders plus top-left title, border color always takes the appearance's overlay_border.
+/// All overlays (forms, lists, cards, input groups) take their window appearance from here:
+/// Changing theme or style only affects this one place; no more will an overlay follow the message area border color.
 fn overlay_frame_block(appearance: &Appearance, title: &str) -> Block<'static> {
     Block::default()
         .title(format!(" {title} "))
@@ -2552,7 +2534,7 @@ fn overlay_frame_block(appearance: &Appearance, title: &str) -> Block<'static> {
         .border_style(Style::default().fg(appearance.overlay_border))
 }
 
-/// 无边框输入项：箭头行形态的表单用它，正文、光标、框选配色与方框输入框同源。
+/// Borderless input field: forms in arrow row style use this; body text, cursor, and selection colors come from the same source as boxed input fields.
 fn render_plain_field(
     appearance: &Appearance,
     frame: &mut Frame,
@@ -2575,12 +2557,12 @@ fn render_plain_field(
     input.render(area, frame.buffer_mut(), state);
 }
 
-/// 统一"方框输入框"：标签写在边框标题上，正文、光标、框选配色全部取自外观。
-/// 少于三个输入条目的浮层用它；三个及以上改用箭头行（见 render_form）。
-/// 取自由函数形式是为了让调用方同时持有外观的不可变借用与输入状态的可变借用。
-/// 边框色与标题样式都由调用方给出：登录/注册用聚焦态切换的选中色边框，表单浮层一律用
-/// 未选中色边框（见 Appearance::form_field_border），当前项改由标题加粗指示，
-/// 与箭头行形态的同类指示保持一致。
+/// Unified "boxed input field": label is written on the border title, body text, cursor, and selection colors all come from the appearance.
+/// Overlays with fewer than three input fields use this; three or more use the arrow row style (see render_form).
+/// Taking the free function form allows the caller to hold both an immutable borrow of the appearance and a mutable borrow of the input state.
+/// Border color and title style are both provided by the caller: login/register use the selected color border switched by focus state, form overlays uniformly use
+/// the unselected color border (see Appearance::form_field_border), the current item is indicated by bold title,
+/// consistent with the same indication in arrow row style.
 fn render_box_field(
     appearance: &Appearance,
     frame: &mut Frame,
@@ -2609,13 +2591,13 @@ fn render_box_field(
     input.render(area, frame.buffer_mut(), state);
 }
 
-/// 提示类文本的统一样式（快捷键说明、顶栏标签、表单提示行都用它）
+/// Unified style for hint text (keyboard shortcuts, status bar labels, form hint lines all use it)
 fn hint_style(color: Color) -> Style {
     Style::default().fg(color)
 }
 
-/// 把资料卡片里的 "标签: 值" 行按可用宽度折行，续行缩进到值的起始列。
-/// 窄终端上 UID、邮箱、头像链接这类长单行因此是换行显示，而不是被面板右边界切掉。
+/// Wrap "label: value" rows in the profile card to available width, continuation lines are indented to the start of the value column.
+/// On narrow terminals, long single lines like UID, email, and avatar links thus wrap instead of being cut off by the panel right edge.
 fn wrap_profile_fields(body: Text<'static>, available_width: u16) -> Text<'static> {
     if available_width == 0 {
         return body;
@@ -2638,7 +2620,7 @@ fn wrap_profile_fields(body: Text<'static>, available_width: u16) -> Text<'stati
             .unwrap_or_else(Style::default);
         let separator = match plain.find(": ") {
             Some(position) => position,
-            // 没有"标签: "结构的行（如关闭提示）整行按宽度折，不做缩进对齐
+            // Rows without a "label: " structure (like close prompts) are wrapped by width, no indentation alignment
             None => {
                 for piece in wrap_by_display_width(&plain, available_width) {
                     lines.push(Line::from(Span::styled(piece, style)));
@@ -2646,8 +2628,8 @@ fn wrap_profile_fields(body: Text<'static>, available_width: u16) -> Text<'stati
                 continue;
             }
         };
-        // 按字节切片：": " 是两个 ASCII 字符，切点必然落在字符边界上；
-        // 标签本身可能是多字节中文，所以不能用字符数去算切点
+        // Slice by bytes: ": " is two ASCII characters, the cut point must fall on a character boundary;
+        // the label itself might be multi-byte Chinese, so the character count can't be used to calculate the cut point
         let prefix = plain[..separator + 2].to_string();
         let value = plain[separator + 2..].to_string();
         let indent_columns = usize::from(display_width(&prefix));
@@ -2667,8 +2649,8 @@ fn wrap_profile_fields(body: Text<'static>, available_width: u16) -> Text<'stati
     Text::from(lines)
 }
 
-/// 头像还没取回、或该用户根本没设头像时的占位：在头像块左上角画一个按用户 ID 稳定取色的首字符。
-/// 占位与真图共用同一块区域，头像到位后只是把这块画满，文字位置不会跳动。
+/// Placeholder when the avatar hasn't been fetched or the user hasn't set one: draws the first character of the user ID with a stable color in the top-left of the avatar block.
+/// Placeholder and real image share the same area; once the avatar arrives it just fills this area, and the text position does not jump.
 fn paint_avatar_placeholder(
     frame: &mut Frame,
     area: Rect,
@@ -2691,12 +2673,12 @@ fn paint_avatar_placeholder(
     );
 }
 
-/// 多行文本里最宽一行的显示宽度（整段文本的总宽度不能用来定面板宽，会把多行提示算虚高）
+/// Display width of the widest line in multi-line text (the total width of the entire text cannot be used to set the panel width, as it would inflate multi-line hints)
 fn longest_line_width(text: &str) -> u16 {
     text.lines().map(display_width).max().unwrap_or(0)
 }
 
-/// 估算文本在给定内宽下会占多少渲染行：显式换行各算一行，每行再按显示宽度向上取整折行
+/// Estimate how many render lines the text will take at a given inner width: explicit newlines each count as one line, then each line is wrapped up by display width.
 fn estimated_wrapped_line_count(text: &str, inner_width: u16) -> u16 {
     if inner_width == 0 {
         return 1;
@@ -2707,7 +2689,7 @@ fn estimated_wrapped_line_count(text: &str, inner_width: u16) -> u16 {
         .max(1)
 }
 
-/// 在给定区域内算出居中的面板矩形（各浮层共用，避免每处重复写偏移）
+/// Calculate a centered panel rectangle within the given area (shared by all overlays, avoiding repeated offset calculations everywhere)
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -2719,9 +2701,9 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     )
 }
 
-/// 收到的那条请求是否仍在等自己处理。服务端 `GET /requests/pending` 只回仍是 pending 的行
-/// 且不返回状态字段，所以状态缺省即"仍在等"；本端处理过的条目会被就地写上结果状态。
-/// 自己发出的那侧服务端总给状态，按字面 `== "pending"` 判即可，不共用这个函数。
+/// Whether the received request is still waiting for you to handle it. The server's `GET /requests/pending` only returns rows that are still pending
+/// and does not return a status field, so the default status means "still waiting"; entries handled locally are written with their result status in place.
+/// The server always gives a status for the side that sent it, so just checking `== "pending"` literally works, this function is not shared.
 fn received_request_is_pending(request: &RoomRequestInfo) -> bool {
     request
         .status
@@ -2729,17 +2711,17 @@ fn received_request_is_pending(request: &RoomRequestInfo) -> bool {
         .is_none_or(|status| status == "pending")
 }
 
-/// 列表类浮层（设置菜单、语言、外观、本地头像）的统一排版：
-/// 面板宽度按"最宽一条 + 边框 + 高亮符号"定，但不超出可绘制区；
-/// 返回 (面板矩形, 条目可用宽度)，条目宽度由调用方交给 `wrapped_list_item` 折行。
+/// Unified layout for list overlays (settings menu, language, appearance, local avatar):
+/// Panel width is set by "widest item + border + highlight symbol" but does not exceed the drawable area;
+/// Returns (panel rect, item available width); the item width is passed to `wrapped_list_item` by the caller for wrapping.
 fn overlay_list_panel(labels: &[String], area: Rect) -> (Rect, u16) {
     let longest = labels
         .iter()
         .map(|label| display_width(label))
         .max()
         .unwrap_or(0);
-    // 边框 2 列 + 高亮符号 2 列 + 左右各 1 列余量；面板本身按内容定宽，
-    // 但既不留成一条窄缝也不铺满整屏，最后再让位给屏幕宽度
+    // Border 2 cols + highlight symbol 2 cols + 1 col margin on each side; the panel itself is sized by content,
+    // but neither left as a narrow slit nor full-screen, finally yielding to the screen width
     let wanted_width = (longest + 6).clamp(30, 60);
     let width_ceiling = area.width.saturating_sub(2).max(12);
     let panel_width = if wanted_width > width_ceiling {
@@ -2747,7 +2729,7 @@ fn overlay_list_panel(labels: &[String], area: Rect) -> (Rect, u16) {
     } else {
         wanted_width
     };
-    // 条目比"面板宽 − 边框 − 高亮符号"还长就折行，宁可多占一行也不在右边界切掉
+    // Items longer than "panel width − border − highlight symbol" are wrapped, preferring to take an extra row over being cut off at the right boundary
     let body_width = panel_width.saturating_sub(6).max(1);
     let line_count: u16 = labels
         .iter()
@@ -2763,8 +2745,8 @@ fn overlay_list_panel(labels: &[String], area: Rect) -> (Rect, u16) {
     (centered_rect(panel_width, panel_height, area), body_width)
 }
 
-/// 补全面板一条候选的行集合：说明与命令名同排放得下就同排，放不下时说明另起一行，
-/// 两截都按面板内宽折行。返回行数供调用方算面板高度。
+/// Row set for completing one candidate in the panel: description and command name are placed on the same row if they fit, otherwise the description goes on a new row,
+/// both parts are wrapped to the panel inner width. Returns the line count for the caller to calculate panel height.
 fn completion_lines(
     label: &str,
     description: &str,
@@ -2794,10 +2776,10 @@ fn completion_lines(
     lines
 }
 
-/// 把一段提示文本按可用宽度折成带样式的 Text。折点由本函数定死、渲染时不再让
-/// Paragraph 自己折，"预留几行"与"实际占几行"才必然一致（交给 Paragraph 按词边界折行时，
-/// 中英混排会比估算值多占一行，面板正好把尾行裁掉）。
-/// 行内优先在空格处断开，英文句子不会被从单词中间切开；纯中文按字折。
+/// Wrap a hint text into styled Text at available width. The wrap point is fixed by this function, rendering no longer lets
+/// Paragraph wrap itself, so "reserved lines" and "actually occupied lines" are necessarily consistent (when handing to Paragraph to wrap by word boundaries,
+/// mixed Chinese-English may take one more row than estimated, the panel just cuts off the last row).
+/// Within a line, prefer breaking at spaces; English sentences are not cut from the middle of words; pure Chinese breaks by character.
 fn wrapped_hint_text(hint: &str, style: Style, available_width: u16) -> Text<'static> {
     Text::from(
         wrap_preserving_words(hint, available_width)
@@ -2807,8 +2789,8 @@ fn wrapped_hint_text(hint: &str, style: Style, available_width: u16) -> Text<'st
     )
 }
 
-/// 按显示宽度折行，尽量在空格处断行：先按字塞满一行，再回退到本行最后一个空格。
-/// 找不到空格（中文整句、或单个超长词）就照字面宽度硬断，保证永不死循环。
+/// Wrap by display width, preferably breaking at spaces: first fill a row character by character, then retreat to the last space in the row.
+/// If no space is found (a whole Chinese sentence, or a single very long word), break hard by display width, guaranteeing no infinite loop.
 fn wrap_preserving_words(text: &str, limit: u16) -> Vec<String> {
     let limit = limit.max(1) as usize;
     let mut lines: Vec<String> = Vec::new();
@@ -2839,7 +2821,7 @@ fn wrap_preserving_words(text: &str, limit: u16) -> Vec<String> {
             let piece: String = characters[start..break_at].iter().collect();
             lines.push(piece.trim_end().to_string());
             start = if break_at > start { break_at } else { end };
-            // 断在空格上时把空格本身跳掉，下一行不会以空格开头
+            // When breaking at a space, skip the space itself so the next line doesn't start with a space
             while start < characters.len() && characters[start] == ' ' {
                 start += 1;
             }
@@ -2851,8 +2833,8 @@ fn wrap_preserving_words(text: &str, limit: u16) -> Vec<String> {
     lines
 }
 
-/// 一条列表文案折成 ListItem：续行补两个空格，与高亮符号 "> " 的宽度对齐，
-/// 选中与未选中的正文因此都在同一列上开始。
+/// A list label is wrapped into a ListItem: continuation lines are padded with two spaces, aligned with the highlight symbol "> " width,
+/// so selected and unselected body text both start in the same column.
 fn wrapped_list_item(label: &str, style: Style, body_width: u16) -> ListItem<'static> {
     ListItem::new(
         wrap_preserving_words(label, body_width)
@@ -2870,7 +2852,7 @@ fn wrapped_list_item(label: &str, style: Style, body_width: u16) -> ListItem<'st
     )
 }
 
-/// 表单浮层底部提示所用文案键（写明服务端对该表单的限制，避免用户提交后才吃一个 400）
+/// Hint text key for the bottom of the form overlay (states the server's restrictions on the form, to avoid the user getting a 400 after submitting)
 fn form_hint_key(action: &FormAction) -> String {
     match action {
         FormAction::UpdateProfile => "form_profile_hint".to_string(),
@@ -2880,32 +2862,32 @@ fn form_hint_key(action: &FormAction) -> String {
     }
 }
 
-/// 设置菜单每一项回车后的动作。渲染与按键分派共用同一张条目表，
-/// 菜单增删项时不必再去别处同步"第几项"的数字。
+/// The action for each setting menu item after Enter. Rendering and key dispatch share the same entry table,
+/// When adding/removing menu items, there is no need to sync "which number" elsewhere.
 #[derive(Debug, Clone, PartialEq)]
 enum SettingsAction {
-    /// 打开既有浮层（创建群聊、创建私聊、私聊管理、语言、外观、服务器地址、登录、注册）
+    // Open an existing overlay (create group, create private, private chat management, language, appearance, server address, login, register)
     OpenOverlay(DisplayingOverlay),
-    /// 打开表单浮层（设置个人资料、修改密码、修改头像、注销账户）
+    // Open form overlay (set profile, change password, change avatar, delete account)
     OpenForm(FormAction),
-    /// 拨动"显示用户UID"
+    // Toggle "show user UID"
     ToggleShowUid,
-    /// 拨动"时间显示含日期"
+    // Toggle "time display includes date"
     ToggleTimeWithDate,
-    /// 拨动"快速搜索"
+    // Toggle "quick search"
     ToggleQuickSearch,
-    /// 拨动"声音通知"
+    // Toggle "sound notification"
     ToggleSound,
-    /// 立即用已下载并校验的更新包开始更新
+    // Immediately start updating with the downloaded and verified package
     UpdateClient,
-    /// 退出登录
+    // Logout
     Logout,
 }
 
 impl SettingsAction {
-    /// 该条目是否必须有登录态才有意义：改自己账号的四项表单、要带令牌的服务端操作
-    /// （建房、发邀请、私聊请求管理）与退出登录都算。
-    /// 未登录时选中它们只提示"未登录"，不切换浮层，避免进去之后才发现做不了。
+    // Whether this item requires login to be meaningful: the four form items to change your own account, server operations requiring a token
+    /// (building rooms, sending invitations, private chat request management) and logout count.
+    /// When not logged in, selecting them only shows "not logged in", does not switch the overlay, avoiding discovering after entering that it can't be done.
     fn requires_login(&self) -> bool {
         match self {
             SettingsAction::OpenForm(_) | SettingsAction::Logout => true,
@@ -2925,8 +2907,8 @@ impl SettingsAction {
     }
 }
 
-/// 表单浮层标题与输入项定义：把四类表单的文案键集中一处，
-/// 打开表单与渲染表单都从这里取，避免两处字典漂移。
+/// Form overlay title and input field definitions: concentrate the four form types' text keys in one place,
+/// opening the form and rendering the form both take from here, avoiding drift in two dictionaries.
 fn form_definition(action: &FormAction) -> (String, Vec<(String, bool)>) {
     let (title_key, fields) = match action {
         FormAction::UpdateProfile => (
@@ -2957,7 +2939,7 @@ fn form_definition(action: &FormAction) -> (String, Vec<(String, bool)>) {
     (title_key.to_string(), fields)
 }
 
-/// 按显示宽度折行；至少推进一个字符避免超宽单字符导致死循环
+/// Wrap by display width; advance at least one character to avoid infinite loop from an overly wide single character
 fn wrap_by_display_width(text: &str, limit: u16) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
@@ -2978,9 +2960,9 @@ fn wrap_by_display_width(text: &str, limit: u16) -> Vec<String> {
     lines
 }
 
-/// 在文本中查找关键词出现的所有位置（不区分大小写），返回以字符为单位的 [起始, 结束) 区间列表。
-/// 命中后跳过整段，不统计重叠匹配。逐字符小写化对齐原串下标，
-/// 因此区间可直接用于切分含中日韩宽字符的原文，不会错位。
+/// Find all positions of a keyword in the text (case-insensitive), returning [start, end) intervals in character units.
+/// After a hit, skip the entire segment, overlapping matches are not counted. Lowercase per character aligns with the original string indices,
+/// so intervals can be directly used to split the original text containing CJK wide characters without misalignment.
 fn find_keyword_positions(text: &str, keyword: &str) -> Vec<(usize, usize)> {
     let haystack: Vec<char> = text
         .chars()
@@ -3006,8 +2988,8 @@ fn find_keyword_positions(text: &str, keyword: &str) -> Vec<(usize, usize)> {
     positions
 }
 
-/// 把一行文本按关键词命中位置切成 (文本片段, 片段样式) 序列：
-/// 命中片段套用搜索命中样式，其余套用正文样式；无命中时整行一个片段。
+/// Split a line of text into (text segment, segment style) sequences by keyword hit positions:
+/// Hit segments use search hit style, the rest use body text style; no hits means the whole line is one segment.
 fn split_line_by_keyword(
     line: &str,
     keyword: &str,
@@ -3036,9 +3018,9 @@ fn split_line_by_keyword(
     segments
 }
 
-/// 按显示宽度折行一组带样式片段，返回可直接渲染的行序列。
-/// 实现方式：把片段摊平成 (字符, 样式) 流后逐字累积，同一行内连续同样式字符合成一个 Span；
-/// 折行落在高亮区间内部时该区间会被自然切断并在新行续接，高亮不会丢失。
+/// Wrap a set of styled segments by display width, returning a sequence of directly renderable lines.
+/// Implementation: flatten segments into a (character, style) stream and accumulate character by character, consecutive same-style characters in a line are merged into one Span;
+/// when wrapping falls inside a highlight interval, that interval is naturally cut and continued on the new line, the highlight is not lost.
 fn wrap_styled_segments(segments: &[(String, Style)], limit: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
@@ -3051,7 +3033,7 @@ fn wrap_styled_segments(segments: &[(String, Style)], limit: u16) -> Vec<Line<'s
     {
         let character_width = display_width(&character.to_string()).max(1);
         let need_new_line = width + character_width > limit && width > 0;
-        // 样式切换或本行宽度不足时先收尾：把攒下的同样式文本落成 Span，必要时结束当前行
+        // When style switches or this row lacks width, wrap up first: convert accumulated same-style text into a Span, and end the current row if necessary
         if run_style != Some(style) || need_new_line {
             if let Some(closed_style) = run_style.take() {
                 spans.push(Span::styled(std::mem::take(&mut run), closed_style));
@@ -3079,8 +3061,8 @@ fn wrap_styled_segments(segments: &[(String, Style)], limit: u16) -> Vec<Line<'s
     lines
 }
 
-/// 按显示宽度从行文本里切出 [起始列, 结束列) 区间：与区间有任何重叠的双宽字符都整块纳入，
-/// 因此框选永远不会只复制到一个汉字的半个格子上，也不会因为起点落在字中间而丢字。
+/// Cut out [start column, end column) intervals from row text by display width: double-width characters with any overlap with the interval are included whole,
+/// so selection will never copy only half a character cell of a Chinese character, and will never lose characters because the start point falls in the middle of a character.
 fn slice_columns_by_display_width(row_text: &str, start_column: u16, end_column: u16) -> String {
     let mut text = String::new();
     let mut column = 0u16;
@@ -3097,9 +3079,9 @@ fn slice_columns_by_display_width(row_text: &str, start_column: u16, end_column:
     text
 }
 
-/// 将服务器下发的 RFC3339 UTC 时间戳格式化为本地时间显示字符串。
-/// with_date 为 true 时带日期（MM-DD HH:MM），否则仅显示时间（HH:MM）。
-/// 解析失败时返回 None（不渲染时间头）。
+/// Format the RFC3339 UTC timestamp from the server into a local time display string.
+/// When with_date is true, include the date (MM-DD HH:MM), otherwise show only the time (HH:MM).
+/// Returns None when parsing fails (don't render the time header).
 fn format_message_time(created_at: &str, with_date: bool) -> Option<String> {
     let local = DateTime::parse_from_rfc3339(created_at)
         .ok()?
@@ -3115,7 +3097,7 @@ fn format_message_time(created_at: &str, with_date: bool) -> Option<String> {
 impl App {
     fn max_focus_index(&self) -> usize {
         if matches!(self.displaying_overlay, DisplayingOverlay::Form) {
-            // 表单浮层的可聚焦项数由字段数量决定
+            // The number of focusable items in the form overlay is determined by the field count
             self.active_form
                 .as_ref()
                 .map(|(_, fields)| fields.len().saturating_sub(1))
@@ -3159,7 +3141,7 @@ impl App {
         } else if matches!(self.displaying_overlay, DisplayingOverlay::ServerAddress) {
             Some(&mut self.input_collector.server_address_state)
         } else if matches!(self.displaying_overlay, DisplayingOverlay::Form) {
-            // 通用表单浮层：字段数量随表单种类而变，聚焦位置直接落在对应输入项上
+            // General form overlay: the number of fields varies by form type, the focus position falls directly on the corresponding input item
             match &mut self.active_form {
                 Some((_, fields)) => fields
                     .get_mut(self.focus_index)
@@ -3172,16 +3154,16 @@ impl App {
                 | DisplayingOverlay::SettingsMenu
                 | DisplayingOverlay::ProfileCard
         ) {
-            // 列表、菜单与只读卡片类弹窗不聚焦任何输入框
+            // List, menu, and read-only card popups don't focus any input field
             None
         } else {
-            // 聊天页无弹窗时聚焦多行消息输入框，经 dispatch_focused_input_event 单独处理
+            // When on the chat page with no popup, focus the multi-line message input box, handled separately by dispatch_focused_input_event
             None
         }
     }
 
-    /// 将键盘/鼠标事件分发到当前聚焦的输入框：
-    /// 聊天页无弹窗时转发到多行消息输入框，其余页面/弹窗转发到单行输入框
+    /// Dispatch keyboard/mouse events to the currently focused input field:
+    /// When on the chat page with no popup, forward to the multi-line message input box; for other pages/popups, forward to the single-line input box
     fn dispatch_focused_input_event(&mut self, focus: bool, event: &Event) {
         if self.displaying_overlay == DisplayingOverlay::Nothing {
             let _ = text_area::handle_events(
@@ -3202,9 +3184,9 @@ impl App {
         }
     }
 
-    /// 探测并应用服务端 API 版本：登录成功、启动自动登录、切换服务器地址后调用。
-    /// 探测失败不致命（沿用当前/默认版本）；版本未识别时提示用户核对兼容性。
-    /// 探测结果决定 api 接缝内所有按版本 match 的线上行为（成功码、报文、事件名等）。
+    // Detect and apply the server API version: called after login success, auto-login startup, and switching server address.
+    /// Detection failure is not fatal (uses current/default version); prompts the user to check compatibility when the version is unrecognized.
+    /// The detection result determines all online behaviors matched by version in the API seam (success codes, messages, event names, etc.).
     fn detect_and_apply_api_version(&mut self) {
         match self.connector.probe_version() {
             Ok((version, raw)) => {
@@ -3219,7 +3201,7 @@ impl App {
         }
     }
 
-    /// 浮层登录提交：读取登录表单两个字段后执行登录。
+    /// Form overlay login submit: read the two login form fields and perform login.
     fn do_login(&mut self) {
         let username = self.input_collector.login_name_state.value.text().string();
         let password = self
@@ -3231,8 +3213,8 @@ impl App {
         self.perform_login(username, password);
     }
 
-    /// 执行登录核心流程，供登录浮层与 `/login <用户名> <密码>` 命令共用。
-    /// 密码经客户端确定性加密后传输；成功后启动轮询与 WebSocket 线程并关闭登录浮层。
+    /// Execute the core login flow, shared by the login overlay and the `/login <username> <password>` command.
+    /// Password is transmitted after client deterministic encryption; on success, start polling and WebSocket threads and close the login overlay.
     fn perform_login(&mut self, username: String, password: String) {
         if username.is_empty() || password.is_empty() {
             self.push_error(self.t("error_empty_credentials"));
@@ -3251,11 +3233,11 @@ impl App {
                     &data.token[..8.min(data.token.len())]
                 ));
                 self.current_user_id = Some(data.user.id.clone());
-                // 服务端不会给自己广播 user_online，本端在线状态需自行登记
+                // The server doesn't broadcast user_online to itself, so the local presence status needs to be registered by itself
                 self.presence_by_user.insert(data.user.id.clone(), true);
                 self.connector.set_token(&data.token);
                 let logged_username = data.user.username.clone();
-                // 登录后立即探测服务端版本，使后续所有线上决策匹配真实版本
+                // Probe the server version immediately after login, so all subsequent online decisions match the real version
                 self.detect_and_apply_api_version();
                 self.focus_index = 0;
                 self.displaying_overlay = DisplayingOverlay::Nothing;
@@ -3263,9 +3245,9 @@ impl App {
                 self.start_polling_thread();
                 self.start_websocket_thread(&data.token, None);
                 self.prepare_session_state(Some(logged_username));
-                // 登录响应里的完整用户对象是唯一能看到自己邮箱与手机号的地方，资料卡要用
+                // The complete user object in the login response is the only place to see own email and phone number, needed for the profile card
                 self.remember_own_profile(&data.user);
-                // 清空表单，避免凭据残留在输入框
+                // Clear the form to avoid credentials remaining in the input box
                 self.input_collector.login_name_state = TextInputState::default();
                 self.input_collector.login_password_state = TextInputState::default();
                 self.push_notification(self.t("login_success"));
@@ -3276,7 +3258,7 @@ impl App {
         }
     }
 
-    /// 浮层注册提交：读取注册表单三个字段后执行注册。
+    /// Form overlay registration submit: read the three registration form fields and perform registration.
     fn do_register(&mut self) {
         let username = self
             .input_collector
@@ -3299,8 +3281,8 @@ impl App {
         self.perform_register(username, email, password);
     }
 
-    /// 执行注册核心流程，供注册浮层与 `/register <用户名> <密码> <邮箱>` 命令共用。
-    /// 与登录使用同一确定性加密变换，成功后提示并（在浮层场景下）切换到登录浮层。
+    /// Execute the core registration flow, shared by the registration overlay and the `/register <username> <password> <email>` command.
+    /// Uses the same deterministic encryption transformation as login; on success, gives a prompt and (in overlay scenario) switches to the login overlay.
     fn perform_register(&mut self, username: String, email: String, password: String) {
         if username.is_empty() || email.is_empty() || password.is_empty() {
             self.push_error(self.t("error_empty_fields"));
@@ -3317,7 +3299,7 @@ impl App {
                 self.input_collector.register_name_state = TextInputState::default();
                 self.input_collector.register_email_state = TextInputState::default();
                 self.input_collector.register_password_state = TextInputState::default();
-                // 若从注册浮层发起，注册成功后引导用户进入登录浮层；命令直接注册则仅提示
+                // If initiated from the registration overlay, guide the user to the login overlay after successful registration; for direct command registration just prompt
                 if self.displaying_overlay == DisplayingOverlay::Register {
                     self.displaying_overlay = DisplayingOverlay::Login;
                     self.focus_index = 0;
@@ -3330,7 +3312,7 @@ impl App {
         }
     }
 
-    /// 直接刷新房间列表（UI 操作或接受请求等绕过轮询的路径调用），与轮询事件共用快照逻辑。
+    /// Directly refresh the room list (called by UI operations or accepting requests that bypass polling), sharing snapshot logic with polling events.
     fn load_rooms(&mut self) {
         match self.connector.list_rooms() {
             Ok(rooms) => self.apply_room_snapshot(rooms),
@@ -3340,25 +3322,25 @@ impl App {
         }
     }
 
-    /// 应用一份最新房间快照：检测被踢出群聊、按可见性过滤、恢复/回退选中房间并重载
-    /// 消息、对新出现房间触发 WebSocket 重连与成员名刷新。load_rooms 与轮询事件
-    /// RoomsUpdated 共用此唯一入口，确保两条路径行为完全一致。
+    // Apply a latest room snapshot: detect being kicked from a group, filter by visibility, restore/fallback the selected room and reload messages
+    /// messages, trigger WebSocket reconnection and member name refresh for newly appeared rooms. load_rooms and polling events
+    /// RoomsUpdated share this single entry point, ensuring both paths behave exactly identically.
     fn apply_room_snapshot(&mut self, rooms: Vec<RoomInfo>) {
-        // 检测相对当前列表新出现的房间：本连接未订阅它，必须重连才能收到推送。
-        // 僵尸单人间不算新房间，避免触发无谓重连
+        // Detect rooms newly appeared relative to the current list: this connection isn't subscribed to it, must reconnect to receive pushes.
+        // Single-person zombie rooms don't count as new rooms, avoiding triggering unnecessary reconnections
         let known_room_ids: HashSet<&str> =
             self.rooms.iter().map(|room| room.id.as_str()).collect();
         let has_new_room = rooms.iter().any(|room| {
             !known_room_ids.contains(room.id.as_str()) && (room.is_group || room.members.len() >= 2)
         });
-        // 记录相对旧列表新出现的房间 ID（持有所有权，供重赋值后判断"自动切换到新私聊"使用）
+        // Record room IDs newly appeared relative to the old list (holding ownership for post-reassignment judgment of "auto-switch to new private chat")
         let new_room_ids: HashSet<String> = rooms
             .iter()
             .filter(|room| !known_room_ids.contains(room.id.as_str()))
             .map(|room| room.id.clone())
             .collect();
         let previous_selected_id = self.selected_room_id();
-        // 记录当前可见的群聊：若群聊消失且非本客户端主动退出，则判定为被移出群聊
+        // Record currently visible group chats: if a group chat disappears and it wasn't actively left by this client, it's judged as kicked from the group
         let previous_groups: HashMap<String, String> = self
             .rooms
             .iter()
@@ -3386,21 +3368,21 @@ impl App {
         } else {
             let restored_index = previous_selected_id
                 .and_then(|id| self.rooms.iter().position(|room| room.id == id));
-            // 只要新出现了私聊房间（接受请求建房、或对端接受后本端轮询发现），自动切换到它
+            // Whenever a new private chat room appears (by accepting a request to create, or by polling after the peer accepts), automatically switch to it
             let new_private_index = self
                 .rooms
                 .iter()
                 .position(|room| !room.is_group && new_room_ids.contains(&room.id));
             let selected_index = new_private_index.or(restored_index).unwrap_or(0);
             self.rooms_state.select(Some(selected_index));
-            // 既非沿用原选中房、也非切到新私聊，说明原选中房已消失并回退到 0，需清旧消息防残留
+            // Neither retaining the original selected room nor switching to a new private chat means the original selected room disappeared and fell back to 0, need to clear old messages to prevent remnants
             if new_private_index.is_none() && restored_index.is_none() {
                 self.messages.clear();
             }
             self.load_messages_for_selected_room();
         }
         if has_new_room {
-            // 新房间本连接未订阅，需重连让服务器重新快照订阅；握手补发统一在 WebSocketConnected 进行
+            // The new room isn't subscribed by this connection, needs reconnection for the server to re-snapshot the subscription; handshake resend is unified at WebSocketConnected
             self.restart_websocket_thread();
             self.refresh_all_sender_names();
         }
@@ -3409,7 +3391,7 @@ impl App {
         }
     }
 
-    /// 拉取所有可见房间的成员名单并入发送者名称映射，确保拉入群聊等场景下成员名称正确显示
+    /// Fetch member lists of all visible rooms and populate the sender name mapping, ensuring member names display correctly when joining a group chat
     fn refresh_all_sender_names(&mut self) {
         let room_ids: Vec<String> = self.rooms.iter().map(|room| room.id.clone()).collect();
         for room_id in room_ids {
@@ -3422,7 +3404,7 @@ impl App {
         }
     }
 
-    /// 提示用户被移出某群聊：优先使用轮询捕获到的群聊名称，缺失时回退为群聊 ID
+    /// Prompt user that they were removed from a group: prefer the group name captured by polling; fall back to group ID if missing
     fn announce_kicked_from_group(&mut self, group_id: &str, known_name: &str) {
         let name = if known_name.is_empty() {
             group_id.to_string()
@@ -3433,8 +3415,8 @@ impl App {
     }
 
     fn load_messages_for_selected_room(&mut self) {
-        // 先取房间快照再往下走：本方法后半段要多次可变借用 self（合并消息、写缓存），
-        // 一路持有 self.rooms 的引用会让这些写操作无法进行
+        // Take a room snapshot first before proceeding: the latter half of this method needs to mutably borrow self multiple times (merge messages, write cache):
+        // Holding a reference to self.rooms throughout would make these writes impossible
         let Some(room) = self
             .rooms_state
             .selected()
@@ -3444,17 +3426,28 @@ impl App {
             return;
         };
         {
-            // 整房（重新）加载一律把滚动位置拉回最底部并配合下方重写消息列表：
-            // 本方法任何路径都会用最新消息整表替换 self.messages，旧的"距底部偏移"对新列表
-            // 已无意义——若残留较大偏移，会被夹取到顶部而误触发自动拉取、停在高位置。
-            // 因此切换群聊与同房刷新统一归零贴底，用户主动上滚后才会再次累积偏移
+            // Full room (re)load always resets scroll position to the bottom and rewrites the message list below:
+            // Every path in this method replaces self.messages with the latest messages in the entire table; the old "offset from bottom" for the new list
+            // is meaningless — if a large offset remains, it would be clamped to the top and accidentally trigger auto-pull, stopping at a high position.
+            // Therefore switching group chats and refreshing the same room uniformly reset to bottom; the user needs to actively scroll up before the offset accumulates again
             self.messages_scroll_from_bottom = 0;
             debug_log(&format!("整房加载 room={} 滚动偏移归零", room.id));
-            // 用户正在查看该房间，清零其未读消息计数
+            // The user is viewing this room, reset its unread message count to zero
             self.unread_counts.remove(&room.id);
-            // 先把本地缓存里该房间已看过的历史铺上屏幕：服务端第一页只有 50 条，
-            // 缓存里可能有几百条，先显示缓存再合并，切房时不会看到"历史突然变短"。
-            // 端到端加密房间不缓存，取不到缓存就是空
+            // Messages the local side already holds for this very room. In end-to-end encrypted private chats this copy is the plaintext
+            // this side decrypted, while the server returns an empty body for that history (the ciphertext only exists inside the session).
+            // The merge below keeps the local copy per message ID, so the plaintext is not replaced by the empty body;
+            // when the room changed (held messages belong elsewhere) they are dropped as before, so the previous room leaves nothing behind.
+            let mut local_messages: Vec<MessageInfo> = std::mem::take(&mut self.messages);
+            if local_messages
+                .first()
+                .is_none_or(|message| message.room_id != room.id)
+            {
+                local_messages.clear();
+            }
+            // First lay the history already viewed from the local cache on the screen: the server's first page only has 50 items,
+            // the cache might have hundreds, show the cache first then merge, switching rooms won't make "history suddenly appear shorter"
+            // End-to-end encrypted rooms don't cache; if the cache is unavailable, it's empty
             let cached_messages = if room.is_encrypted {
                 None
             } else {
@@ -3462,18 +3455,22 @@ impl App {
                     .as_ref()
                     .and_then(|cache| cache.load_room(&room.id))
             };
+            let base_messages: Vec<MessageInfo> = match cached_messages.clone() {
+                Some(cached) => merge_messages_by_id(cached.messages, local_messages),
+                None => local_messages,
+            };
+            self.messages = base_messages.clone();
             if let Some(cached) = cached_messages.clone() {
-                self.messages = cached.messages;
                 self.messages_older_cursor = cached.older_cursor;
             }
-            // 获取房间细节
+            // Fetch room details
             match self.connector.get_room(&room.id) {
                 Ok(room_detail) => {
                     for member in &room_detail.members {
                         self.sender_names
                             .insert(member.user_id.clone(), member.username.clone());
                     }
-                    // 添加当前用户
+                    // Add the current user
                     if let Some(ref user_id) = self.current_user_id {
                         self.sender_names
                             .insert(user_id.clone(), self.t("self_name"));
@@ -3487,18 +3484,15 @@ impl App {
             };
             match self.connector.get_messages(&room.id, 50, None) {
                 Ok(data) => {
-                    // 接口按最新在前返回，反转为旧消息在上、新消息在下，与实时追加方向一致
+                    // The API returns latest first, reversed to old messages on top and new at the bottom, consistent with the real-time append direction
                     let mut loaded = data.messages;
                     loaded.reverse();
-                    // 与服务端这一页按消息 ID 合并而不是整表替换：本地缓存里可能有这一页没有的
-                    // 更早消息，替换会把它们丢掉；合并时保留本地已有条目，也顺带避免加密私聊里
-                    // 已解密的明文被服务端返回的密文占位覆盖
-                    self.messages = match cached_messages.clone() {
-                        Some(cached) => merge_messages_by_id(cached.messages, loaded),
-                        None => loaded,
-                    };
-                    // 记录更早消息分页游标（服务器无更多时返回 None），供滚到顶部时自动翻页；
-                    // 缓存里已握有更早消息时沿用缓存的游标，翻页从本地已知位置接着往回走
+                    // Merge with the server's page by message ID instead of replacing the entire table: the local cache might have items not on this page
+                    // older messages; replacing would lose them; merging preserves local items and also keeps in encrypted private chats
+                    // the decrypted plaintext from being overwritten by the empty history body returned from the server
+                    self.messages = merge_messages_by_id(base_messages, loaded);
+                    // Record the older message pagination cursor (returns None when the server has no more), for auto-paging when scrolled to the top;
+                    // when the cache already has earlier messages, use the cache's cursor; paging continues from the locally known position going backward
                     self.messages_older_cursor = cached_messages
                         .as_ref()
                         .and_then(|cached| cached.older_cursor.clone())
@@ -3506,25 +3500,25 @@ impl App {
                 }
                 Err(e) => {
                     self.push_error(format!("{}: {e}", self.t("error_get_messages_failed")));
-                    // 拉取失败时保留已有内容（缓存或内存里的），这正是本地缓存的意义：
-                    // 服务端暂时连不上也还能翻看历史
+                    // When fetching fails, keep existing content (from cache or memory); this is precisely the meaning of local caching:
+                    // You can still browse history even when the server is temporarily unreachable
                     if cached_messages.is_none() && self.messages.is_empty() {
                         self.messages_older_cursor = None;
                     }
                 }
             }
             self.messages_reloaded_at = Instant::now();
-            // 整表替换后旧的命中消息 ID 可能已不在列表里，重扫保证搜索跳转有效
+            // After replacing the entire table, old hit message IDs might no longer be in the list; rescanning ensures search jumps remain valid
             self.refresh_search_matches();
             let loaded_room_id = room.id.clone();
             self.cache_loaded_messages(&loaded_room_id);
         }
     }
 
-    /// 用户滚到消息显示区顶部时自动向上翻页：按 messages_older_cursor 拉取一批（50 条）
-    /// 更早消息并前插到消息列表头部。游标为空表示已无更早消息或上次拉取失败，直接返回；
-    /// 成功后游标更新为响应的 next_cursor（无更多时为 None，翻页自然停止）；
-    /// 失败时清空游标并弹错，避免每帧重试打爆服务端
+    // Auto-page up when the user scrolls to the top of the message display area: fetch a batch (50 items) by messages_older_cursor
+    // earlier messages and insert at the head of the message list. An empty cursor means no earlier messages or the last fetch failed, return directly;
+    /// on success the cursor is updated to the response's next_cursor (None when no more, paging naturally stops);
+    /// on failure clear the cursor and show an error, avoiding retry every frame and overwhelming the server
     fn load_older_messages(&mut self) {
         let Some(cursor) = self.messages_older_cursor.clone() else {
             return;
@@ -3539,8 +3533,8 @@ impl App {
         };
         match self.connector.get_messages(&room.id, 50, Some(&cursor)) {
             Ok(data) => {
-                // 接口按最新在前返回，反转后整批前插；"距底部偏移"滚动模型下
-                // 偏移不变而总行数增大，视口停留在原内容上，用户可继续上滑进入新拉取的历史
+                // The API returns newest-first; after reversing, insert the whole batch at the front; under the "offset from bottom" scroll model
+                // offset unchanged while total rows increase, the viewport stays on the original content, the user can continue scrolling up to enter newly pulled history
                 let mut older = data.messages;
                 older.reverse();
                 debug_log(&format!(
@@ -3561,12 +3555,12 @@ impl App {
         }
     }
 
-    /// 当前是否已登录（持有用户身份）。登录/注册改为命令式后，以此取代独立登录页的存在判断。
+    // Whether currently logged in (holding user identity). After login/registration changed to command-based, this replaces the existence judgment of a separate login page.
     pub fn is_logged_in(&self) -> bool {
         self.current_user_id.is_some()
     }
 
-    /// 受登录保护的操作统一入口：未登录时弹出提示并返回 false，调用方据此中止。
+    /// Unified entry point for login-protected operations: pops a prompt and returns false when not logged in, the caller aborts accordingly.
     fn require_login(&mut self) -> bool {
         if self.is_logged_in() {
             return true;
@@ -3575,8 +3569,8 @@ impl App {
         false
     }
 
-    /// 启动时若未登录（无有效会话），弹一次提示引导用 /login 登录或 /register 注册；
-    /// 聊天窗口正常显示，不遮盖。
+    // When not logged in at startup (no valid session), pop a prompt once guiding the user to /login or /register;
+    // the chat window displays normally, not covered.
     pub fn notify_signed_out(&mut self) {
         self.push_notification(self.t("logged_out_hint"));
     }
@@ -3599,7 +3593,7 @@ impl App {
             return;
         };
 
-        // 私聊一律走端到端加密途径（创建请求时已强制约定加密）
+        // Private chats always use end-to-end encryption (encryption is mandatory when the request is created)
         if !room.is_group {
             self.send_encrypted_message(&room.id, content);
             return;
@@ -3609,7 +3603,7 @@ impl App {
             self.push_error(self.t("error_ws_not_ready"));
             return;
         }
-        // 消息通过 WebSocket 线程发送，服务器确认后由回显事件去重显示
+        // Messages are sent via the WebSocket thread; after server confirmation, they are deduplicated and displayed via echo events
         self.send_ws_payload(outbound_ws_payload(
             self.connector.version(),
             WsCommand::SendMessage {
@@ -3620,7 +3614,7 @@ impl App {
         self.input_collector.message_input_state.set_text("");
     }
 
-    /// 加密途径发送消息：会话激活则加密发出，握手中则排队等待就绪后自动发送
+    /// Send via encryption: if the session is active, encrypt and send; if in handshake, queue and wait to send automatically after ready
     fn send_encrypted_message(&mut self, room_id: &str, content: String) {
         let session_phase = self
             .crypto
@@ -3656,8 +3650,8 @@ impl App {
             }
             Some(EncryptionPhase::AwaitingAcceptance)
             | Some(EncryptionPhase::AwaitingSessionReady) => {
-                // 握手进行中新消息一律排队，就绪后按序自动发出；
-                // 此处不做任何握手重置，避免覆盖正在进行的密钥协商
+                // New messages during an ongoing handshake are all queued and automatically sent in order when ready;
+                // Do not perform any handshake reset here to avoid overwriting the in-progress key negotiation
                 let session = self
                     .crypto
                     .sessions
@@ -3716,7 +3710,7 @@ impl App {
         }
     }
 
-    /// 发起私密聊天：搜索对方用户取得 ID 后发送聊天请求，等待对方接受后房间自动出现
+    /// Initiate a private chat: search for the target user to get their ID, then send a chat request; the room appears automatically after the peer accepts
     fn create_private_chat(&mut self) {
         if !self.require_login() {
             return;
@@ -3740,7 +3734,7 @@ impl App {
                 return;
             }
         };
-        // 优先精确匹配用户名，其次取第一条搜索结果
+        // Prioritize exact username match, then take the first search result
         let target = search_result
             .iter()
             .find(|user| user.username == username)
@@ -3754,7 +3748,7 @@ impl App {
             return;
         }
 
-        // 私聊一律以加密房间建立，无需运行时开关
+        // Private chats are always established as encrypted rooms, no runtime toggle needed
         let request_message = self.t("private_request_message");
         match self
             .connector
@@ -3773,7 +3767,7 @@ impl App {
         }
     }
 
-    /// 接受选中的待处理聊天请求，成功后刷新房间列表与请求列表
+    /// Accept the selected pending chat request, refreshing the room list and request list on success
     fn accept_selected_request(&mut self) {
         let Some(request_id) = self.selected_request_id() else {
             return;
@@ -3790,7 +3784,7 @@ impl App {
         }
     }
 
-    /// 拒绝选中的待处理聊天请求
+    /// Decline the selected pending chat request
     fn decline_selected_request(&mut self) {
         let Some(request_id) = self.selected_request_id() else {
             return;
@@ -3806,10 +3800,10 @@ impl App {
         }
     }
 
-    /// 本端处理完一条收到的请求后就在地把结果状态写上，条目继续留在"收到的"区里。
-    /// 不能摘掉：服务端 `GET /requests/pending` 只回仍是 pending 的行，摘掉就等于
-    /// 把这段历史永久丢了（发出侧没这问题，因为 `/requests/sent` 回全部状态）。
-    /// 也不额外发一次列表请求 —— 两处来源先后写同一个列表会互相覆盖。
+    // After locally handling a received request, write the result status in place, the entry stays in the "received" area.
+    // Can't remove: the server's `GET /requests/pending` only returns rows that are still pending, removing them means
+    /// permanently losing this history (the sender side doesn't have this problem because `/requests/sent` returns all statuses).
+    /// Also no extra list request is sent — two sources writing the same list in sequence would overwrite each other.
     fn mark_pending_request_handled(&mut self, request_id: &str, status: &str) {
         if let Some(request) = self
             .pending_requests
@@ -3820,8 +3814,8 @@ impl App {
         }
     }
 
-    /// 轮询带回的"收到的请求"与服务端对齐：服务端列表里没有已处理的行，
-    /// 因此把本端已记下结果的条目接回列表末尾，历史才不会处理一次就清空。
+    /// Align the "received requests" brought back by polling with the server: the server's list has no rows for already-processed items,
+    /// so the entries the local side has recorded with results are reattached to the end of the list, so history isn't cleared after being processed once.
     fn apply_received_requests(&mut self, polled: Vec<RoomRequestInfo>) {
         let handled: Vec<RoomRequestInfo> = self
             .pending_requests
@@ -3833,7 +3827,7 @@ impl App {
         self.pending_requests = polled.into_iter().chain(handled).collect();
     }
 
-    /// 把发出的请求就地标成已撤回，同样等轮询确认
+    /// Mark sent requests as cancelled in place, also waiting for polling confirmation
     fn mark_sent_request_cancelled(&mut self, request_id: &str) {
         if let Some(request) = self
             .sent_requests
@@ -3851,19 +3845,19 @@ impl App {
             .map(|request| request.id.clone())
     }
 
-    /// 处理终端事件；返回 true 表示应用请求退出（由聊天命令或退出快捷键触发）
+    // Handle terminal events; returns true indicating the application requests exit (triggered by chat commands or exit shortcuts)
     pub fn handle_event(&mut self, event: &Event) -> bool {
-        // 括号粘贴最先处理：浮层分支会对任何事件提前返回，放在后面就收不到粘贴内容。
-        // 未启用括号粘贴时，粘贴被拆成逐字符按键事件，其中的换行等同于按 Enter，
-        // 于是"复制多行文本再粘贴"会连着发出多条单行消息。
+        // Bracketed paste is handled first: the overlay branch returns early for any event, if placed later it wouldn't receive the pasted content.
+        // When bracketed paste is not enabled, paste is split into per-character key events, where the newline is equivalent to pressing Enter,
+        // so "copying multiple lines of text then pasting" would send multiple single-line messages in sequence.
         if let Event::Paste(pasted_text) = event {
             self.handle_pasted_text(pasted_text);
             return false;
         }
 
-        // 整屏框选排在浮层分派之前：浮层、通知、顶栏之上的文字同样要能被选中复制。
-        // 拖拽与松手由框选独占（返回真值表示本事件已处理完），按下只登记起点并继续
-        // 走原有的点击聚焦分发，不抢输入框自己的选区逻辑
+        // Full-screen selection is handled before overlay dispatch: text above overlays, notifications, and the status bar can also be selected and copied.
+        // Drag and release are exclusive to selection (returning true means the event is fully consumed); pressing only records the start point and continues
+        // following the original click-focus dispatch, not competing with the input box's own selection logic
         if let Event::Mouse(mouse) = event
             && self.handle_screen_selection_mouse(*mouse)
         {
@@ -3877,7 +3871,7 @@ impl App {
                 {
                     match key.code {
                         KeyCode::Esc => {
-                            // 先逐级上移焦点，位于第一个输入框时退回设置菜单
+                            // Move focus up level by level; when at the first input box, fall back to the settings menu
                             if self.focus_index == 1 {
                                 self.focus_index = 0;
                             } else {
@@ -3939,8 +3933,8 @@ impl App {
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                 {
-                    // 收到的与已发出的请求拼成一条扁平序列，上下键跨区连续移动，
-                    // 因此环绕按条目总数而不是单一列表长度计算
+                    // Received and sent requests are concatenated into a flat sequence, arrow keys move continuously across areas,
+                    // therefore wrap around by total entry count instead of a single list length
                     let entries = self.request_entries();
                     match key.code {
                         KeyCode::Esc => {
@@ -3961,7 +3955,7 @@ impl App {
                             return false;
                         }
                         KeyCode::Enter => {
-                            // 接受只对仍在等的收到请求有意义：发出项与已处理过的历史都什么都不做
+                            // Acceptance only makes sense for received requests still waiting: sent items and processed history do nothing
                             if matches!(
                                 self.request_list_state
                                     .selected()
@@ -3977,7 +3971,7 @@ impl App {
                             return false;
                         }
                         KeyCode::Char('d') => {
-                            // 同一枚按键在两个区里的语义分别是"拒绝"与"撤回"
+                            // The same key has different semantics in the two areas: "decline" and "cancel"
                             match self
                                 .request_list_state
                                 .selected()
@@ -3986,7 +3980,7 @@ impl App {
                                 Some((false, request)) if received_request_is_pending(request) => {
                                     self.decline_selected_request();
                                 }
-                                // 已结束的邀请撤不回，这里什么都不做（不再弹"能不能撤"的提示）
+                                // Ended invitations can't be recalled, nothing is done here (no longer prompting "can it be recalled")
                                 Some((true, request))
                                     if request.status.as_deref() == Some("pending") =>
                                 {
@@ -4009,7 +4003,7 @@ impl App {
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                 {
-                    // 列表只在本地目录有图片时才会打开，条目数在这里重读一次磁盘
+                    // The list only opens when there are images in the local directory, the entry count is re-read from disk here
                     let count = local_avatar_files().len();
                     match key.code {
                         KeyCode::Esc => {
@@ -4030,7 +4024,7 @@ impl App {
                             self.apply_local_avatar();
                             return false;
                         }
-                        // 只有在这个浮层里 Ctrl+U 才改作"填网络链接"，消息输入框里仍是删整行
+                        // Only in this overlay does Ctrl+U switch to "enter a network link"; in the message input box it still deletes the entire line
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             self.open_declared_form(&FormAction::ChangeAvatar);
                             return false;
@@ -4045,7 +4039,7 @@ impl App {
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                 {
-                    // 上下键与 Tab 一样切换当前输入项：长表单里逐个 Tab 太绕
+                    // Arrow keys switch the current input item like Tab: going through items one by one in a long form via Tab is too cumbersome
                     if matches!(key.code, KeyCode::Up | KeyCode::Down) {
                         self.cycle_form_focus(key.code == KeyCode::Up);
                         return false;
@@ -4080,7 +4074,7 @@ impl App {
             }
 
             DisplayingOverlay::ProfileCard => {
-                // 只读卡片：Esc 关掉回到聊天页（它由 /profile 指令打开，不属于设置菜单链路）
+                // Read-only card: Esc closes and returns to the chat page (it was opened by the /profile command, not part of the settings menu chain)
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                     && key.code == KeyCode::Esc
@@ -4093,8 +4087,8 @@ impl App {
             }
 
             DisplayingOverlay::SettingsMenu => {
-                // 菜单项与动作由 settings_menu_entries 一处定义，渲染与分派读同一张表，
-                // 增删菜单项不需要再手工同步"第几项"的数字
+                // Menu items and actions are defined in one place (settings_menu_entries); rendering and dispatch read the same table:
+                // Adding/removing menu items does not require manually syncing "which number" again
                 let entries = self.settings_menu_entries();
                 let menu_count = entries.len().max(1);
                 if let Event::Key(key) = event
@@ -4121,7 +4115,7 @@ impl App {
                                 return false;
                             };
                             let action = action.clone();
-                            // 未登录要改账号或做服务端操作：给一条提示，浮层保持停在设置菜单
+                            // Not logged in but wants to change account or perform server operations: show a prompt, keep the overlay on the settings menu
                             if action.requires_login() && !self.require_login() {
                                 return false;
                             }
@@ -4148,7 +4142,7 @@ impl App {
                                     self.restore_chat_focus();
                                 }
                                 SettingsAction::UpdateClient => {
-                                    // 更新成功会挂起安装进程并由主循环退出；失败则留在设置菜单里看提示
+                                    // Successful update suspends the installation process and exits via the main loop; on failure stay in the settings menu to see the prompt
                                     self.start_downloaded_update();
                                 }
                                 SettingsAction::OpenForm(form_action) => {
@@ -4270,15 +4264,15 @@ impl App {
                                 self.push_notification(self.t("error_server_address_empty"));
                                 return false;
                             }
-                            // 测试连通性
+                            // Test connectivity
                             let test_connector = Connector::new(&new_addr);
                             match test_connector.greet() {
                                 Ok(_) => {
                                     self.connector.set_base_url(&new_addr);
                                     self.save_server_address();
-                                    // 切换服务器后重新探测版本，使线上决策匹配新服务端
+                                    // After switching server, re-probe the version so online decisions match the new server
                                     self.detect_and_apply_api_version();
-                                    // 可达性探测也要改探新地址
+                                    // Connectivity probing should also target the new address
                                     self.start_reachability_watch();
                                     self.push_notification(self.t("server_address_saved"));
                                     self.displaying_overlay = DisplayingOverlay::SettingsMenu;
@@ -4309,7 +4303,7 @@ impl App {
                     let max_index = self.max_focus_index();
                     match key.code {
                         KeyCode::Esc => {
-                            // 与创建群聊一致：先逐级上移焦点，位于第一个输入框时再关闭浮层
+                            // Consistent with creating a group: first move focus up level by level, close the overlay when at the first input field
                             if self.focus_index > 0 {
                                 self.focus_index -= 1;
                             } else {
@@ -4350,16 +4344,16 @@ impl App {
 
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                // 搜索模式下的上下键语义被整体接管：不再移动输入框光标、也不再切房间，
-                // 一律切换匹配项。放在修饰键分支之前并用"任意修饰键"匹配，
-                // 是因为不同终端对 Ctrl/Ctrl+Shift+方向键的上报差异极大（Terminal.app 甚至不区分），
-                // 只认某一种组合键会表现为按了完全没反应、只剩输入框光标在动。
+                // In search mode, the up/down key semantics are fully taken over: they no longer move the input box cursor or switch rooms,
+                // always switch matches. Placed before the modifier key branches and matched with "any modifier",
+                // because different terminals report Ctrl/Ctrl+Shift+arrow keys very differently (Terminal.app doesn't even distinguish),
+                // only recognizing one combination key would manifest as pressing and having no reaction, only the input box cursor moving.
                 if matches!(key.code, KeyCode::Up | KeyCode::Down) && self.in_search_mode() {
                     debug_log(&format!("搜索切换匹配项: {key:?}"));
                     self.navigate_search_result(key.code == KeyCode::Up);
                     return false;
                 }
-                // Ctrl+L 请求整屏重绘（由主循环执行 terminal.clear，用于修回终端侧滚动造成的错位）
+                // Ctrl+L requests full screen repaint (executed by the main loop via terminal.clear, used to fix the misalignment caused by terminal-side scrolling)
                 if matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
@@ -4368,7 +4362,7 @@ impl App {
                     return false;
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    // 聊天页 Ctrl+P 打开设置菜单（创建群聊/私聊与待处理请求入口）
+                    // Ctrl+P on the chat page opens the settings menu (entry for create group/private chat and pending requests)
                     if let KeyCode::Char('p') = key.code {
                         self.displaying_overlay = DisplayingOverlay::SettingsMenu;
                         self.menu_list_state.select(Some(0));
@@ -4380,7 +4374,7 @@ impl App {
                     KeyCode::Up | KeyCode::Down => {
                         let input_text = self.input_collector.message_input_state.text();
                         if let Some(command_prefix) = input_text.strip_prefix('/') {
-                            // 补全列表开启时上下键选择命令，禁用群聊切换
+                            // When the completion list is on, arrow keys select commands, room switching is disabled
                             let candidate_count = self.completion_candidates(command_prefix).len();
                             if candidate_count > 0 {
                                 let current = self.command_list_state.selected().unwrap_or(0);
@@ -4392,7 +4386,7 @@ impl App {
                                 self.command_list_state.select(Some(next));
                             }
                         } else {
-                            // 多行文本时上下键移动光标，到达首/末行才切换群聊
+                            // When multi-line text, arrow keys move the cursor, switch rooms only when reaching the first/last row
                             let state = &mut self.input_collector.message_input_state;
                             let before = state.cursor();
                             if key.code == KeyCode::Up {
@@ -4401,8 +4395,8 @@ impl App {
                                 state.move_down(1, false);
                             }
                             let after = state.cursor();
-                            // 光标未移动说明已在边界，执行群聊切换；
-                            // 带 Ctrl 的组合键不用于切房，避免与搜索等组合键语义混淆
+                            // If the cursor didn't move, it's already at the boundary, execute room switching;
+                            // Ctrl-combined keys are not used for room switching, to avoid confusion with search and other key combinations
                             if before == after
                                 && !self.rooms.is_empty()
                                 && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -4423,54 +4417,54 @@ impl App {
                     KeyCode::Esc => {
                         let input_text = self.input_collector.message_input_state.text();
                         if input_text.starts_with('/') {
-                            // 清空前缀即退出 command 模式
+                            // Clearing the prefix exits command mode
                             self.input_collector.message_input_state.set_text("");
                             return false;
                         }
                         if input_text.starts_with('#') {
-                            // 搜索模式同样以前缀清空作为退出条件，并连带清掉高亮与定位
+                            // Search mode also uses prefix clearing as the exit condition, and clears highlighting and positioning together
                             self.exit_search_mode();
                             return false;
                         }
                         self.dispatch_focused_input_event(true, event);
                     }
                     KeyCode::Enter => {
-                        // Enter 发送消息
+                        // Enter sends the message
                         return self.handle_chat_submit();
                     }
                     KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+J 插入换行
+                        // Ctrl+J inserts a newline
                         self.input_collector.message_input_state.insert_newline();
                         self.handle_message_input_changed();
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+U 删除光标所在整行
+                        // Ctrl+U deletes the entire line where the cursor is
                         self.input_collector.message_input_state.delete_line();
                         self.handle_message_input_changed();
                     }
                     _ => {
                         self.dispatch_focused_input_event(true, event);
-                        // 输入变化后命令选择回到第一项；由组件自身完成插入以保持光标位置
+                        // After input changes, the command selection returns to the first item; the component itself completes the insertion to maintain cursor position
                         let input_text = self.input_collector.message_input_state.text();
                         if input_text.starts_with('/') {
                             self.command_list_state.select(Some(0));
                         }
-                        // 文本增删即视为处于打字状态，按需上报输入状态（内部已节流）；
-                        // 同时让与当前输入不符的旧搜索结果失效（快速搜索则就地重扫）
+                        // Text addition/deletion is considered typing status, report input status as needed (internally throttled);
+                        // also let old search results that don't match the current input become invalid (quick search rescan in-place)
                         self.handle_message_input_changed();
                     }
                 }
             }
             Event::Mouse(mouse) => {
-                // 聊天页无弹窗时滚轮控制消息显示区滚动，其余界面忽略滚轮
+                // When on the chat page with no popup, the scroll wheel controls the message display area scroll; other interfaces ignore the scroll wheel
                 if matches!(
                     mouse.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) {
                     if self.displaying_overlay == DisplayingOverlay::Nothing {
-                        // 整房加载（切群/同房刷新）同步阻塞主线程期间产生的滚轮事件会在
-                        // 系统队列积压、加载完成后迟到补处理，把新房间视图"自动"顶上去并
-                        // 可能误触顶拉取；加载完成后的静默窗口内一律丢弃滚轮事件消除这些迟到输入
+                        // Mouse events generated during synchronous blocking of the main thread for full room loading (switching groups/same room refresh) will
+                        // pile up in the system queue, after loading completes they're processed late, pushing the new room view "automatically" up and
+                        // may accidentally trigger top-pull; within the quiet window after loading completes, mouse events are all discarded to eliminate these late inputs
                         if self.messages_reloaded_at.elapsed() < Duration::from_millis(500) {
                             debug_log("整房加载后静默窗口内丢弃迟到的滚轮事件");
                             return false;
@@ -4490,9 +4484,9 @@ impl App {
                     }
                     return false;
                 }
-                // 整屏框选本身已提到 handle_event 开头（浮层之上也要能框选）；
-                // 这里只保留输入框内由控件自己维护的选区
-                // 输入框内的框选仍由控件自身维护，松开时复制控件选区文本
+                // Full-screen selection is already mentioned at the start of handle_event (can also be selected above overlays);
+                // here only the selection area maintained by the control itself within the input box is retained
+                // Selection within the input box is still maintained by the control itself, copying the control's selection text on release
                 if self.displaying_overlay == DisplayingOverlay::Nothing
                     && mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 {
@@ -4529,9 +4523,9 @@ impl App {
         false
     }
 
-    /// 计算命令输入的补全候选列表，返回 (补全后写入输入框的文本, 列表展示文本, 描述文本)。
-    /// /kick 后带空格时列出当前群聊成员（仅群聊且当前用户为管理员/群主才提示），
-    /// /language 后带空格时列出可用语言；其余情况为命令名补全。
+    // Calculate the completion candidates for command input, returning (text to insert into the input box, list display text, description text).
+    /// When /kick is followed by a space, list current group members (only for group chats where the current user is admin/owner);
+    /// when /language is followed by a space, list available languages; otherwise it's command name completion.
     fn completion_candidates(
         &self,
         raw_command_after_slash: &str,
@@ -4561,7 +4555,7 @@ impl App {
             if !is_admin {
                 return Vec::new();
             }
-            // 提取空格后的输入用于过滤
+            // Extract the input after the space for filtering
             let filter_text = raw_command_after_slash.strip_prefix("kick ").unwrap_or("");
             return detail
                 .members
@@ -4577,7 +4571,7 @@ impl App {
                 .collect();
         }
         if raw_command_after_slash.starts_with("language ") {
-            // 提取空格后的输入用于过滤
+            // Extract the input after the space for filtering
             let filter_text = raw_command_after_slash
                 .strip_prefix("language ")
                 .unwrap_or("");
@@ -4588,7 +4582,7 @@ impl App {
                 .collect();
         }
         if raw_command_after_slash.starts_with("appearance ") {
-            // /appearance 后打出空格即列出 config/themes 下全部可用外观，可继续输入前缀过滤
+            // When a space is entered after /appearance, list all available appearances under config/themes, can continue typing a prefix to filter
             let filter_text = raw_command_after_slash
                 .strip_prefix("appearance ")
                 .unwrap_or("");
@@ -4599,8 +4593,8 @@ impl App {
                 .collect();
         }
         if raw_command_after_slash.starts_with("profile ") {
-            // /profile 后打出空格即列出全部注册用户；条目文本按 "<用户名> - <UID>" 呈现，
-            // 回车补全进输入框的是用户名（服务端资料接口用户名与 UID 都认）
+            // When a space is entered after /profile, list all registered users; entry text is displayed as "<username> - <UID>",
+            // the username is inserted into the input box on Enter (the server's profile interface recognizes both username and UID)
             let filter_text = raw_command_after_slash
                 .strip_prefix("profile ")
                 .unwrap_or("");
@@ -4629,7 +4623,7 @@ impl App {
             )];
         }
         if raw_command_after_slash.starts_with("add_member ") {
-            // add_member 命令只需要提示输入用户名，不提供具体补全
+            // The /add_member command only needs to prompt for a username, no specific completion
             return vec![(
                 "/add_member <username>".to_string(),
                 "<username>".to_string(),
@@ -4637,7 +4631,7 @@ impl App {
             )];
         }
         if raw_command_after_slash.starts_with("mute ") {
-            // /mute <bool> 补全 true/false
+            // /mute <bool> completes to true/false
             let filter_text = raw_command_after_slash.strip_prefix("mute ").unwrap_or("");
             return ["true", "false"]
                 .into_iter()
@@ -4653,10 +4647,10 @@ impl App {
             .collect()
     }
 
-    /// 处理聊天页回车提交；返回 true 表示应用请求退出
+    /// Handle chat page Enter submission; returns true indicating the application requests exit
     fn handle_chat_submit(&mut self) -> bool {
         let input_text = self.input_collector.message_input_state.text();
-        // 搜索模式：Enter 执行/重执行搜索，绝不把 "#关键词" 当消息发出去
+        // Search mode: Enter executes/re-executes the search, never sends "#keyword" as a message
         if input_text.starts_with('#') {
             self.execute_message_search();
             return false;
@@ -4670,11 +4664,11 @@ impl App {
             .strip_prefix('/')
             .and_then(|rest| rest.split_whitespace().next())
             .unwrap_or("");
-        // /kick all 是内置批量操作（非成员名），不参与成员补全，直接走命令执行
+        // /kick all are built-in batch operations (not member names), so they do not participate in member completion and go straight to command execution
         let kick_argument = trimmed.split_whitespace().nth(1).unwrap_or("");
         let is_kick_all = name == "kick" && kick_argument.eq_ignore_ascii_case("all");
-        // 命令后带空格即进入参数补全：列群成员、语言、外观、服务器地址、注册用户，
-        // 按 Enter 把选中项补进输入框，再次 Enter（此时已是完整命令）才执行
+        // When a command is followed by a space, enter argument completion: list group members, languages, appearance, server address, registered users,
+        // press Enter to insert the selected item into the input box, press Enter again (when it's now a complete command) to execute
         let argument_completion_commands = [
             "kick",
             "language",
@@ -4687,12 +4681,12 @@ impl App {
         {
             let raw_prefix = input_text.strip_prefix('/').unwrap_or("");
             let candidates = self.completion_candidates(raw_prefix);
-            // 检查当前输入是否已经精确匹配某个补全候选，如果是则直接执行
+            // Check if the current input already exactly matches a completion candidate, and execute directly if so
             let exact_match = candidates
                 .iter()
                 .any(|(insert_text, _, _)| insert_text == &input_text);
             if !exact_match {
-                // 当前输入不是完整命令，尝试插入选中的补全项
+                // Current input is not a complete command; try inserting the selected completion
                 if let Some(selected_index) = self.command_list_state.selected()
                     && let Some((insert_text, _, _)) =
                         candidates.get(selected_index.min(candidates.len().saturating_sub(1)))
@@ -4708,10 +4702,10 @@ impl App {
                 }
                 return false;
             }
-            // 如果是精确匹配，继续往下执行命令
+            // If it is an exact match, continue to execute the command
         }
-        // 登录与注册不接受任何形式的参数：口令不该留在命令行与屏幕回滚历史里。
-        // 这里既不执行也不清空输入框，让用户自己把参数删掉或改用浮层
+        // Login and registration don't accept any form of arguments: passwords shouldn't be left in the command line and scrollback history.
+        // here neither executes nor clears the input box, letting the user delete the arguments themselves or switch to an overlay
         if matches!(name, "login" | "register")
             && !trimmed
                 .strip_prefix(&format!("/{name}"))
@@ -4721,7 +4715,7 @@ impl App {
         {
             return false;
         }
-        // 命令名已是完整已知命令时直接执行（含带参数的 /kick name、/language code）
+        // When the command name is already a complete known command, execute directly (including /kick name, /language code with parameters)
         let is_known = chat_commands().iter().any(|(known, _)| *known == name);
         if is_known {
             let should_exit = self.execute_chat_command(trimmed);
@@ -4730,7 +4724,7 @@ impl App {
             }
             return should_exit;
         }
-        // 命令名尚未补全为完整命令时，按 Enter 将选中命令补全到输入框，再次 Enter 才执行
+        // When the command name hasn't been completed to a full command, press Enter to complete the selected command into the input box, press Enter again to execute
         let candidates = self.completion_candidates(name);
         if !candidates.is_empty() {
             let selected = self.command_list_state.selected().unwrap_or(0);
@@ -4738,7 +4732,7 @@ impl App {
             if let Some((insert_text, _, _)) = candidates.get(index) {
                 let full = insert_text.clone();
                 self.input_collector.message_input_state.set_text(&full);
-                // 将光标移动到补全文本末尾，便于用户直接补充参数或回车执行
+                // Move the cursor to the end of the completion text, making it convenient for the user to add parameters or press Enter to execute
                 self.input_collector.message_input_state.set_cursor(
                     TextPosition::new(full.chars().count().try_into().unwrap(), 0),
                     false,
@@ -4749,8 +4743,8 @@ impl App {
         false
     }
 
-    /// 执行以 / 开头的聊天命令；返回 true 表示应用请求退出。
-    /// 扩展新命令：在 chat_commands 表追加条目，并在此处的 match 中增加分派分支。
+    /// Execute chat commands starting with /; returns true indicating the application requests exit.
+    /// To add a new command: append an entry to the chat_commands table and add a dispatch branch in the match here.
     fn execute_chat_command(&mut self, command_line: &str) -> bool {
         let Some(name) = command_line
             .strip_prefix('/')
@@ -4772,7 +4766,7 @@ impl App {
             );
             return false;
         }
-        // 未登录时仅放行登录/注册/退出/quit/语言/外观/服务器地址，其余聊天操作先弹提示拒绝
+        // When not logged in, only allow login/register/exit/quit/language/appearance/server_address; other chat operations first show a prompt and reject
         let allowed_signed_out = matches!(
             name,
             "login"
@@ -4799,7 +4793,7 @@ impl App {
                 false
             }
             "mute" => {
-                // /mute <bool>：对当前选中房间开/关消息免打扰并持久化到 preferences.json
+                // /mute <bool>: turn message do-not-disturb on/off for the currently selected room and persist in preferences.json
                 let argument = command_line
                     .strip_prefix("/mute")
                     .unwrap_or("")
@@ -4849,7 +4843,7 @@ impl App {
                 false
             }
             "language" => {
-                // /language 无参 → 打开语言选择浮层；/language <语言码> → 直接切换
+                // /language without arguments → open the language selection overlay; /language <language code> → switch directly
                 let argument = command_line
                     .strip_prefix("/language")
                     .unwrap_or("")
@@ -4885,7 +4879,7 @@ impl App {
                     .trim()
                     .to_string();
                 if argument.is_empty() {
-                    // 无参数 → 打开服务器地址设置浮层，预填当前地址供编辑
+                    // No parameter → open the server address settings overlay, pre-filling the current address for editing
                     self.input_collector
                         .server_address_state
                         .set_text(self.connector.base_url());
@@ -4893,13 +4887,13 @@ impl App {
                     self.displaying_overlay = DisplayingOverlay::ServerAddress;
                     return false;
                 }
-                // 有参数时直接测试并保存
+                // With a parameter, test and save directly
                 let test_connector = Connector::new(&argument);
                 match test_connector.greet() {
                     Ok(_) => {
                         self.connector.set_base_url(&argument);
                         self.save_server_address();
-                        // 切换服务器后重新探测版本，使线上决策匹配新服务端
+                        // After switching server, re-probe the version so online decisions match the new server
                         self.detect_and_apply_api_version();
                         self.push_notification(self.t("server_address_saved"));
                     }
@@ -4919,12 +4913,12 @@ impl App {
                     self.push_notification(self.t("error_add_member_usage"));
                     return false;
                 }
-                // 获取当前选中的房间
+                // Get the currently selected room
                 let Some(room_id) = self.selected_room_id() else {
                     self.push_error(self.t("error_no_room_selected"));
                     return false;
                 };
-                // 检查是否是群聊
+                // Check if it is a group chat
                 let room_is_group = self
                     .rooms
                     .iter()
@@ -4935,7 +4929,7 @@ impl App {
                     self.push_error(self.t("error_not_group"));
                     return false;
                 }
-                // 调用 API 添加成员
+                // Call the API to add a member
                 let usernames = vec![argument];
                 match self.connector.add_members(&room_id, &usernames) {
                     Ok(_) => {
@@ -4948,7 +4942,7 @@ impl App {
                 false
             }
             "appearance" => {
-                // /appearance 无参 → 打开外观选择浮层；/appearance <外观名> → 直接应用
+                // /appearance without arguments → open the appearance selection overlay; /appearance <appearance name> → apply directly
                 let argument = command_line
                     .strip_prefix("/appearance")
                     .unwrap_or("")
@@ -4981,8 +4975,8 @@ impl App {
                 false
             }
             "login" | "register" => {
-                // 带参数的情况已在提交入口拦掉（见 handle_chat_submit），这里只会收到无参调用：
-                // 直接打开对应浮层填写
+                // Cases with arguments were already blocked at the submit entry (see handle_chat_submit), here only no-argument calls are received:
+                // directly open the corresponding overlay for filling
                 self.displaying_overlay = if name == "login" {
                     DisplayingOverlay::Login
                 } else {
@@ -5005,7 +4999,7 @@ impl App {
                 false
             }
             "profile" => {
-                // 无参看自己，带参看指定用户；参数可以是用户名或 UID
+                // No argument shows yourself, with argument shows a specific user; the parameter can be a username or UID
                 let argument = command_line
                     .strip_prefix("/profile")
                     .unwrap_or("")
@@ -5026,7 +5020,7 @@ impl App {
         }
     }
 
-    /// 退出登录：停止后台线程、清除持久化会话与聊天状态，回到登录页以便重新登录
+    /// Logout: stop background threads, clear persisted sessions and chat state, return to the login page to log in again
     fn logout(&mut self) {
         if let Some(running_flag) = self.websocket_running.take() {
             running_flag.store(false, Ordering::Relaxed);
@@ -5036,7 +5030,7 @@ impl App {
         }
         self.websocket_sender = None;
         self.websocket_token = None;
-        // 攒着未落盘的消息先写出去，缓存按用户 ID 分目录，退出登录后仍可被下次自动登录复用
+        // Messages accumulated but not yet persisted are written out first; the cache is by user ID directory, can still be reused by next auto-login after logout
         if let Some(room_id) = self.selected_room_id() {
             let room_id = room_id.clone();
             self.cache_loaded_messages(&room_id);
@@ -5069,7 +5063,7 @@ impl App {
         self.notifications.clear();
         self.displaying_overlay = DisplayingOverlay::Nothing;
         self.focus_index = 0;
-        // 清空登录/注册表单，回到未登录聊天页（显示登录提示）
+        // Clear the login/registration form and return to the logged-out chat page (showing the login prompt)
         self.input_collector.login_name_state = TextInputState::default();
         self.input_collector.login_password_state = TextInputState::default();
         self.input_collector.register_name_state = TextInputState::default();
@@ -5077,19 +5071,19 @@ impl App {
         self.input_collector.register_password_state = TextInputState::default();
     }
 
-    /// /quit 退出清理：对所有私聊先发 encrypt_leave 促使服务器清理加密会话
-    /// 并让在线对端同步隐藏界面，等待 5 秒后逐一退出房间，完成后经事件通道通知退出。
-    /// 客户端无法探测对端是否在线，故统一等待；对端离线时仅表现为退出延迟。
+    // /quit exit cleanup: send encrypt_leave to all private chats first to prompt the server to clean up encryption sessions
+    /// and let the online peer synchronize hiding the interface, wait 5 seconds then exit rooms one by one, notify exit via the event channel when done.
+    /// The client cannot detect whether the peer is online, so it waits uniformly; when the peer is offline, it only manifests as a delayed exit.
     fn begin_quit_cleanup(&mut self) {
         if self.quit_ready {
             return;
         }
-        // 退出前把攒着未落盘的消息写进本地缓存，避免最后几秒收到的内容丢在内存里
+        // Before quitting, write the accumulated but not-yet-persisted messages into the local cache, avoiding content received in the last few seconds being lost in memory
         if let Some(room_id) = self.selected_room_id() {
             let room_id = room_id.clone();
             self.cache_loaded_messages(&room_id);
         }
-        // 退出前持久化登录会话（JWT 与企业用户 ID、自己才可见的联系方式），供下次自动登录
+        // Before quitting, persist the login session (JWT and corporate user ID, contact info only visible to oneself), for next auto-login
         if let (Some(token), Some(user_id)) =
             (self.websocket_token.clone(), self.current_user_id.clone())
         {
@@ -5107,7 +5101,7 @@ impl App {
             return;
         }
 
-        // 先经 WebSocket 请求服务器清理各房间的加密会话（失败不影响后续退房）
+        // First request the server via WebSocket to clean up encryption sessions in each room (failure doesn't affect subsequent room exits)
         for room_id in &private_room_ids {
             self.send_ws_payload(outbound_ws_payload(
                 self.connector.version(),
@@ -5129,7 +5123,7 @@ impl App {
         };
 
         thread::spawn(move || {
-            // 等待在线对端完成结束事件的处理与界面更新
+            // Wait for the online peer to complete processing the end event and updating the interface
             thread::sleep(Duration::from_secs(5));
             for room_id in &private_room_ids {
                 let _ = connector.remove_member(room_id, &user_id);
@@ -5138,8 +5132,8 @@ impl App {
         });
     }
 
-    /// 主循环查询退出清理是否已完成
-    /// 取出并复位"整屏重绘"请求：主循环每帧调用一次，为真时执行 terminal.clear()。
+    // Main loop queries whether exit cleanup is complete
+    // Take and reset the "full screen repaint" request: called once per frame by the main loop, when true executes terminal.clear().
     pub fn take_full_repaint_request(&mut self) -> bool {
         std::mem::take(&mut self.full_repaint_requested)
     }
@@ -5148,7 +5142,7 @@ impl App {
         self.quit_ready
     }
 
-    /// 离开当前选中的聊天（群聊或私聊均可）：移除自己、发送加密告别并清理本地会话
+    /// Leave the currently selected chat (group or private): remove self, send encrypted goodbye and clean up local session
     fn quit_current_group(&mut self) {
         let Some(room_id) = self.selected_room_id() else {
             self.push_error(self.t("error_no_room_selected"));
@@ -5161,8 +5155,8 @@ impl App {
             .map(|room| room.is_group)
             .unwrap_or(false);
         if !is_group {
-            // 退出私聊前先经 WebSocket 请求服务器清理加密会话，
-            // 让在线对端同步收到结束事件关闭界面，再移除自己退房
+            // Before leaving a private chat, first request the server via WebSocket to clean up the encrypted session:
+            // so the online peer receives the end event synchronously and closes the interface, then remove yourself to leave the room
             self.send_ws_payload(outbound_ws_payload(
                 self.connector.version(),
                 WsCommand::EncryptLeave {
@@ -5175,7 +5169,7 @@ impl App {
         self.leave_room(&room_id);
     }
 
-    /// 以当前用户身份退出指定房间并刷新房间列表；身份缺失或请求失败给出通知
+    /// Exit the specified room as the current user and refresh the room list; notify when identity is missing or request fails
     fn leave_room(&mut self, room_id: &str) {
         let Some(user_id) = self.current_user_id.clone() else {
             self.push_error(self.t("error_no_user_id"));
@@ -5183,7 +5177,7 @@ impl App {
         };
         match self.connector.remove_member(room_id, &user_id) {
             Ok(_) => {
-                // 记录主动退出的房间，避免后续轮询判为“被移出群聊”而误报被踢提示
+                // Record the voluntarily left room to avoid subsequent polling misreporting it as "removed from group"
                 self.left_room_ids.insert(room_id.to_string());
                 if self.selected_room_id().as_deref() == Some(room_id) {
                     self.messages.clear();
@@ -5192,11 +5186,11 @@ impl App {
                 self.push_notification(self.t("left_chat"));
             }
             Err(e) => {
-                // 房间已被服务器或对端先行删除/主动离开已生效时无需提示，静默完成本地刷新；
-                // 私聊退房先发 encrypt_leave 已促使服务器移除成员，随后 remove_member 会报"非成员"
+                // When the room has already been deleted by the server or the peer has left, no prompt is needed, silently complete the local refresh;
+                // For private chat exits, sending encrypt_leave first has already prompted the server to remove the member, then remove_member will report "not a member"
                 let error_text = format!("{e}");
                 self.left_room_ids.insert(room_id.to_string());
-                // "房间不存在/非成员"类预期错误的判定表由接缝按版本集中给出
+                // The table of "room does not exist / not a member" expected-error judgments is given centrally by the seam by version
                 let is_expected_gone = self
                     .connector
                     .version()
@@ -5212,7 +5206,7 @@ impl App {
         }
     }
 
-    /// 获取当前选中房间的 ID
+    /// Get the ID of the currently selected room
     fn selected_room_id(&self) -> Option<String> {
         self.rooms_state
             .selected()
@@ -5220,8 +5214,8 @@ impl App {
             .map(|room| room.id.clone())
     }
 
-    /// 取私聊房间里"对方"的用户 ID（成员中不是自己的那一个）。
-    /// 群聊没有单一对端、或房间内除自己外没有其它成员时返回 None，调用方据此不显示对端状态。
+    /// Get the user ID of the "other party" in a private chat room (the member who isn't yourself).
+    /// Returns None for group chats which have no single peer, or when no other members exist in the room besides self; the caller doesn't display peer status accordingly.
     fn chat_peer_id_of(&self, room: &RoomInfo) -> Option<String> {
         if room.is_group {
             return None;
@@ -5232,9 +5226,9 @@ impl App {
             .cloned()
     }
 
-    /// 浮层 Esc / 操作完成后的统一退路：所有浮层都从设置菜单进入，
-    /// 因此一律退回设置菜单，只有设置菜单自身才退回无浮层状态，
-    /// 保证 Esc 是层层回退而不是直接把整层界面关掉。
+    // Unified fallback after overlay Esc/operation complete: all overlays enter from the settings menu,
+    /// so all return to the settings menu, only the settings menu itself returns to the no-overlay state,
+    /// ensuring Esc is a layered fallback rather than closing the entire interface at once.
     fn dismiss_overlay_back(&mut self) {
         self.displaying_overlay =
             if matches!(self.displaying_overlay, DisplayingOverlay::SettingsMenu) {
@@ -5245,17 +5239,17 @@ impl App {
         self.restore_chat_focus();
     }
 
-    /// 退回聊天页时把焦点交还消息输入框。
-    /// 浮层期间 focus_index 指的是浮层里的输入项或列表位置，
-    /// 关浮层后不重置的话，键盘输入会落到一个谁都不持有的 0 号上，表现为"打字没反应"。
+    // Return focus to the message input box when returning to the chat page.
+    /// During the overlay, focus_index refers to input items or list positions within the overlay,
+    /// if not reset after closing the overlay, keyboard input would fall on a 0 that nobody holds, manifesting as "typing has no response".
     fn restore_chat_focus(&mut self) {
         if self.displaying_overlay == DisplayingOverlay::Nothing {
             self.focus_index = 8;
         }
     }
 
-    /// 本地软关闭一个加密私聊：仅从界面隐藏并清理会话，
-    /// 不通知服务器退房，避免对端重连后看到只有一人的残留房间
+    /// Soft-close an encrypted private chat locally: only hide from the interface and clear the session,
+    /// don't notify the server to exit the room, avoiding the peer seeing a single-person residual room after reconnecting
     fn close_local_room(&mut self, room_id: &str) {
         self.closed_room_ids.insert(room_id.to_string());
         self.crypto.sessions.remove(room_id);
@@ -5291,21 +5285,21 @@ impl App {
     }
 
     pub fn ui(&mut self, frame: &mut Frame) {
-        // 最底行留给终端，避免任何写入触发滚动（见 drawable_area）
+        // Leave the bottom row for the terminal to avoid any write triggering scroll (see drawable_area)
         let area = drawable_area(frame.area());
 
-        // 先整屏铺一层外观背景色：ratatui 的各组件只会"打补丁"式覆盖自身样式
-        // （Cell::set_style 仅写入 Some 的字段），因此先铺底即可让所有未显式指定背景的
-        // 文本与空白区域统一继承外观里的应用背景色。
+        // First paint a layer of appearance background color across the full screen: ratatui's components only "patch" their own styles
+        // (Cell::set_style only writes Some fields), so painting the base first allows all not-explicitly-specified backgrounds to
+        // text and blank areas uniformly inherit the application background color from the appearance.
         paint_background(frame, area, self.appearance.app_background);
 
-        // 顶栏固定占一行，聊天页、浮层与通知都在它下方绘制；
-        // 行文本快照仍按整屏采集，顶栏上的文字同样可以被框选复制
+        // The status bar is fixed at one row, the chat page, overlays, and notifications are drawn below it;
+        // the row text snapshot is still collected from the full screen, text on the status bar can also be selected and copied
         let [bar_area, body_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
         self.render_status_bar(frame, bar_area);
 
-        // 应用恒为单一聊天页：登录/注册改为命令打开的浮层；未登录时聊天页居中显示登录提示。
+        // The application is always a single chat page: login/register becomes an overlay opened by command; when not logged in, the chat page shows a login prompt centered.
         self.render_chat_page(frame, body_area);
 
         match self.displaying_overlay {
@@ -5324,16 +5318,16 @@ impl App {
             DisplayingOverlay::Nothing => {}
         }
 
-        // 渲染前先移除已到期的通知，再在右上角显示剩余通知
+        // Before rendering, first remove expired notifications, then display remaining notifications in the top-right
         self.remove_expired_notifications();
         if !self.notifications.is_empty() {
             self.render_notifications(frame, body_area);
         }
 
-        // 在全部元素绘制完成后采集整屏行文本快照，框选松开时才能复制到任意位置的文本
+        // After all elements are drawn, collect the full-screen row text snapshot, text can be copied from any position when selection is released
         self.screen_text_rows = collect_screen_text_rows(&*frame.buffer_mut(), area);
 
-        // 框选高亮最后绘制，保证它盖在浮层与通知之上依然可见
+        // Draw the selection highlight last, ensuring it remains visible over overlays and notifications
         if let Some(selection_start) = self.input_collector.selection_start {
             let selection_end = self
                 .input_collector
@@ -5348,23 +5342,23 @@ impl App {
             );
         }
 
-        // 将硬件光标定位到当前聚焦输入框处
+        // Position the hardware cursor at the currently focused input field
         self.place_cursor(frame);
     }
 
-    /// 将终端硬件光标定位到当前聚焦的输入框光标处；
-    /// rat-text 仅在输入框标记为聚焦时返回可见光标位置，故先置位聚焦标志
+    /// Position the terminal hardware cursor at the cursor of the currently focused input field;
+    /// rat-text only returns a visible cursor position when the input field is marked as focused, so first set the focus flag
     fn place_cursor(&mut self, frame: &mut Frame) {
         let screen_area = drawable_area(frame.area());
-        // 钳制到屏幕内：光标位置一旦落到缓冲区之外（长文本把 caret 顶过最后一行等），
-        // 终端会因越界写自动上滚一行，而渲染缓冲区并不跟着滚动，整块界面就此错位且不再恢复
+        // Clamp to screen: once the cursor position falls outside the buffer (long text pushing caret past the last row, etc.):
+        // the terminal will auto-scroll up one row due to out-of-bounds write, but the render buffer does not scroll with it, so the whole interface becomes misaligned and never recovers
         let clamp_position = |position: Position| {
             Position::new(
                 position.x.min(screen_area.width.saturating_sub(1)),
                 position.y.min(screen_area.height.saturating_sub(1)),
             )
         };
-        // 聊天页无弹窗时聚焦多行消息输入框，单独经 TextAreaState 处理
+        // When on the chat page with no popup, focus the multi-line message input box, handled separately by TextAreaState
         if self.displaying_overlay == DisplayingOverlay::Nothing {
             self.input_collector.message_input_state.focus.set(true);
             if let Some((x, y)) = self.input_collector.message_input_state.screen_cursor() {
@@ -5383,22 +5377,22 @@ impl App {
     fn copy_message_selection(&mut self) {
         let cursor = self.input_collector.message_input_state.cursor();
         let selected = self.input_collector.message_input_state.selected_text();
-        // 仅在实际框选了非空文本时尝试写入系统剪贴板并提示
+        // only attempt to write to the system clipboard and show a prompt when actual non-empty text has been selected
         if !selected.is_empty()
             && let Ok(mut clipboard) = arboard::Clipboard::new()
             && clipboard.set_text(selected).is_ok()
         {
             self.push_notification(self.t("copied_to_clipboard"));
         }
-        // 复制后取消框选：将锚点移回光标处，使选中高亮消失
+        // cancel the selection after copying: move the anchor back to the cursor position, making the selection highlight disappear
         self.input_collector
             .message_input_state
             .set_cursor(cursor, false);
     }
 
-    /// 处理一次括号粘贴：把整段文本原样插入当前聚焦的输入框，
-    /// 消息输入框按行插入（换行保持为框内多行，绝不触发发送），
-    /// 其余单行输入框只取首行内容。
+    // Handle a bracketed paste: insert the entire text as-is into the currently focused input field,
+    /// the message input box inserts by line (newlines stay as multi-line within the box, never trigger sending),
+    /// other single-line input fields only take the first line of content.
     fn handle_pasted_text(&mut self, pasted_text: &str) {
         if pasted_text.is_empty() {
             return;
@@ -5419,7 +5413,7 @@ impl App {
             self.handle_message_input_changed();
             return;
         }
-        // 单行输入框（登录、注册、建群等）不保留换行，只取粘贴内容的首行插到光标处
+        // Single-line input fields (login, register, create group, etc.) don't retain newlines, only take the first line of the pasted content and insert at the cursor
         let first_line = pasted_text.lines().next().unwrap_or_default();
         if let Some(state) = self.get_focused_state() {
             let insert_position = state.value.cursor();
@@ -5427,13 +5421,13 @@ impl App {
         }
     }
 
-    /// 复制整屏框选矩形内的文本到系统剪贴板并清除框选高亮。
-    /// 文本取自上一帧采集的整屏行文本快照，因此浮层、通知、房间列表等任意位置都可复制；
-    /// 按显示宽度切列，双宽字符整块保留，行尾空格与整行为空的首尾行会被去掉。
-    /// 整屏框选的鼠标处理：起点在消息输入框之外时开始记录，拖拽更新终点，松开即复制。
-    /// 因为本方法在浮层分派之前被调用，所以房间列表、消息区、顶栏、任何浮层与通知
-    /// 之上的文字都能框选复制；显示区的边框不算文字（见 `is_content_character`），
-    /// 既不会被高亮也不会进剪贴板。返回真值表示事件已被框选消费（拖拽与松手）。
+    // Copy text from the full-screen selection rectangle to the system clipboard and clear the selection highlight.
+    // Text is taken from the full-screen row text snapshot collected in the previous frame, so it can be copied from any position including overlays, notifications, room lists;
+    // Split columns by display width, keep double-width characters as whole units; trailing spaces and fully-empty leading/trailing rows are removed.
+    // Mouse handling for full-screen selection: start recording when the start point is outside the message input box, update the endpoint while dragging, copy on release.
+    // Because this method is called before overlay dispatch, the room list, message area, status bar, any overlay and notification
+    /// above them can all be selected and copied; the display area's border is not considered text (see `is_content_character`),
+    /// neither highlighted nor enters the clipboard. Returning true means the event was consumed by the selection (drag and release).
     fn handle_screen_selection_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
         let pointer = (mouse.column, mouse.row);
         match mouse.kind {
@@ -5442,8 +5436,8 @@ impl App {
                     .message_input_area
                     .contains(ratatui::layout::Position::new(mouse.column, mouse.row)) =>
             {
-                // 只记下起点，事件继续走原有的点击聚焦分发；
-                // 起点与终点重合时尚不构成框选，松手也不会触发复制
+                // Only record the starting point; the event continues with the original click-focus dispatch;
+                // when start and end points coincide, it doesn't constitute a selection, releasing doesn't trigger copying
                 self.input_collector.selection_start = Some(pointer);
                 self.input_collector.selection_end = Some(pointer);
                 false
@@ -5465,7 +5459,7 @@ impl App {
                 if dragged {
                     self.copy_screen_selection();
                 } else {
-                    // 原地按下没拖动：只清掉框选起点，不复制、不提示
+                    // pressed without dragging: only clear the selection start point, no copying, no prompt
                     self.input_collector.selection_start = None;
                     self.input_collector.selection_end = None;
                 }
@@ -5502,26 +5496,26 @@ impl App {
         }
     }
 
-    /// 清空浮层区域并立刻在该区域重铺应用背景色。
-    /// Clear 会把区域内单元格样式复位，不补这一层时浮层内部会露出终端默认底色，与主题不一致。
+    /// Clear the overlay area and immediately repaint the application background color in that area.
+    /// Clear resets the cell styles in the area, without this layer the inside of the overlay would show the terminal's default background color, inconsistent with the theme.
     fn clear_overlay_area(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
         paint_background(frame, area, self.appearance.app_background);
     }
 
-    /// 渲染顶栏：左侧连接状态与当前用户，右侧服务端版本与客户端版本。
-    /// 连接标记同时承担"连不上服务器"的持续提示（报错只在状态跳变时弹一次），
-    /// 未登录不显示当前用户，未连上服务端不显示服务端版本。
+    // Render the status bar: connection status and current user on the left, server version and client version on the right.
+    /// The connection marker also serves as a persistent prompt for "can't reach the server" (errors only pop once on status change),
+    /// when not logged in the current user isn't shown, when the server isn't reached the server version isn't shown.
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let online = self.connection_ready.unwrap_or(false);
         let (connection_label, mark, user_text, right_text) = self.status_bar_texts();
-        // 左侧整段的纯文本先拼出来，量宽度用（下面的分栏要按两段的实际宽度决定谁让位）
+        // First concatenate the pure text of the left segment to measure width (the following split decides who yields based on the actual widths of both segments)
         let left_plain_text = format!("{connection_label} {mark}{user_text}");
-        // 标记紧跟"连接"二字并单独着色：用户名一长就把圆点推到行尾的话，
-        // 它就再也表示不了连接状态，所以这里固定按"标签 标记 用户段"的顺序拼
+        // The marker is placed right after "connection" and colored separately: if the username is long and pushes the dot to the end of the row,
+        // it can't represent the connection state anymore, so here it's fixed to concatenate in the order of "label marker user_segment"
         let left_line = Line::from(vec![
             Span::styled(
                 format!("{connection_label} "),
@@ -5543,8 +5537,8 @@ impl App {
             right_text.clone(),
             hint_style(self.appearance.hint_text),
         ));
-        // 一行放不下两段时优先保左侧：连接标记与"当前用户"表示的是现在能不能用、
-        // 以什么身份在用，版本信息只是参考。原先按右侧定尺会让窄终端把用户名整段挤掉。
+        // When one row can't fit both segments, prioritize the left side: the connection marker and "current user" represent whether it's usable now and
+        // what identity it's using, version info is just a reference. Previously sizing by the right side would squeeze the entire username off on narrow terminals.
         let left_width = display_width(&left_plain_text);
         let right_width = display_width(&right_text) + 1;
         let left_reserve = if left_width + right_width <= area.width {
@@ -5566,10 +5560,10 @@ impl App {
         );
     }
 
-    /// 顶栏四段文本：(连接标签, 连接标记, 当前用户段, 右侧版本信息)。
-    /// 拆成四段是为了把标记夹在"连接"与用户名之间并单独着色，
-    /// 也便于在没有真实服务端的情况下断言显示规则：
-    /// 未登录不显示用户名，未连上服务端不显示服务端版本，客户端版本始终显示。
+    // Four-segment status bar text: (connection label, connection marker, current user segment, right version info).
+    // Splitting into four segments is to place the marker between "connection" and the username and color it separately,
+    /// also makes it easy to assert display rules in the absence of a real server:
+    /// when not logged in the username isn't shown, when not connected to the server the server version isn't shown, the client version is always shown.
     fn status_bar_texts(&self) -> (String, String, String, String) {
         let online = self.connection_ready.unwrap_or(false);
         let mark = if online { "●" } else { "○" };
@@ -5602,14 +5596,14 @@ impl App {
         )
     }
 
-    /// 渲染通用表单浮层：标题一行一个字段，左侧标签、右侧输入框，最后一项回车提交。
-    /// 四类表单（个人资料、修改密码、修改头像、注销账户）字段数量不同，
-    /// 面板高度按字段数算，标签列宽按当前语言里最宽的标签算，避免出现横向滚动或截断。
-    /// 渲染通用表单浮层。窗口风格与其它浮层一致（同一 overlay_border）。
-    /// 输入条目不少于三个时用 `> 标签 内容` 的箭头行（昵称/手机号/简介、旧密码/新密码/确认）；
-    /// 一两个条目的（修改头像、删除账户）沿用原来的方框输入框。
+    // Render the general form overlay: one field per row in the title, label on the left, input box on the right, Enter on the last item to submit.
+    // The four form types (profile, change password, change avatar, delete account) have different field counts,
+    // panel height is calculated by field count, label column width is based on the widest label in the current language, avoiding horizontal scrolling or truncation.
+    // Render the generic form overlay. The window style is consistent with other overlays (same overlay_border).
+    /// When there are three or more input items, use the arrow row `> label content` (nickname/phone/bio, old password/new password/confirm);
+    /// For one or two items (change avatar, delete account), keep the original box input.
     fn render_form(&mut self, frame: &mut Frame, area: Rect) {
-        // 先把需要读 self 的内容取成自有值，渲染期要可变借用表单字段状态
+        // First take the content that needs to read self as owned values, the render period needs mutable borrow of form field states
         let Some((action, fields)) = &self.active_form else {
             return;
         };
@@ -5623,9 +5617,9 @@ impl App {
         let hint = self.t(&form_hint_key(action));
         let appearance = self.appearance.clone();
         let focused = self.focus_index;
-        // 三个及以上条目走箭头行：一行一项，比三个方框叠起来省一半高度
+        // Three or more entries use the arrow row: one item per row, saving half the height compared to three boxes stacked
         let arrow_rows = field_count >= 3;
-        // 先把面板宽度定死（含夹到屏幕内），提示的折行与面板高度都按这个宽度算
+        // First fix the panel width (clamped to the screen), hint wrapping and panel height are both calculated based on this width
         let panel_width = 60u16
             .min(area.width.saturating_sub(2))
             .max(30)
@@ -5656,7 +5650,7 @@ impl App {
             self.render_arrow_form_rows(frame, &labels, &secret_flags, inner, hint_text);
             return;
         }
-        // 方框形态：每个输入框占三行，框间留一行，最后一行给提示
+        // Box form: each input box takes three rows, one blank row between boxes, last row for the prompt
         let rows = Layout::vertical(
             (0..field_count)
                 .map(|_| Constraint::Length(3))
@@ -5666,7 +5660,7 @@ impl App {
         )
         .split(inner);
         for index in 0..field_count {
-            // 与箭头行形态同一口径：当前项用正文色加粗，其余用提示色，都不碰选中色
+            // Same caliber as arrow row style: current item uses body text color bold, the rest use hint color, neither touches the selection color
             let field_style = if index == focused {
                 Style::default()
                     .fg(appearance.input_text)
@@ -5697,8 +5691,8 @@ impl App {
         }
     }
 
-    /// 箭头行形态的表单主体：左侧 `> 标签`（当前项选中色加粗，其余用提示色），
-    /// 右侧同一行是无边框输入区。上下方向键与 Tab 都用来切换当前项。
+    /// Arrow-row form body: left side `> label` (current item bold in selection color, rest in prompt color),
+    /// right side same row is the borderless input area. Up/down arrow keys and Tab are all used to switch the current item.
     fn render_arrow_form_rows(
         &mut self,
         frame: &mut Frame,
@@ -5732,7 +5726,7 @@ impl App {
                     .areas(rows[index]);
             let is_focused = self.focus_index == index;
             let marker = if is_focused { ">" } else { " " };
-            // 当前项用输入正文色加粗，其余用提示色；都不使用"选中文本色"
+            // Current item bold in input text color, rest in prompt color; do not use "selected text color"
             let label_style = if is_focused {
                 Style::default()
                     .fg(appearance.input_text)
@@ -5769,10 +5763,10 @@ impl App {
         }
     }
 
-    /// 渲染个人资料卡片：左侧头像块（半块字符真色绘制），右侧依次是
-    /// 真名、昵称（没有就整行不显示）、UID、在线状态、邮箱、手机号、简介、头像；
-    /// 后四项没有值时显示"无"。头像若是服务端上传得到的相对路径，按规范显示成"本地"。
-    /// 邮箱与手机号只有查自己且登录响应给过时才有值 —— 别人的资料接口不返回这两项。
+    // Render the profile card: left side avatar block (drawn in true color with half-character), right side sequentially is
+    // real name, nickname (if none, the whole row is hidden), UID, online status, email, phone, bio, avatar;
+    /// the last four show "none" when they have no value. If the avatar is a relative path obtained from server upload, display it as "Local" per spec.
+    /// Email and phone only have values when looking at yourself and the login response provided them — other users' profile APIs do not return these two fields.
     fn render_profile_card(&mut self, frame: &mut Frame, area: Rect) {
         let Some(profile) = self.profile_view.clone() else {
             return;
@@ -5786,7 +5780,7 @@ impl App {
             Some(false) => self.t("presence_offline"),
             None => self.t("presence_unknown"),
         };
-        // 邮箱与手机号只在"看自己且登录响应给过"时可得，其余一律按"无"处理
+        // Email and phone are only available when "looking at yourself and login response provided them"; all others are treated as "none"
         let (email, phone_number) = match (&self.own_contact, is_self) {
             (Some(contact), true) => (contact.0.clone(), contact.1.clone()),
             _ => (String::new(), String::new()),
@@ -5801,7 +5795,7 @@ impl App {
         let avatar_text = match profile.avatar.clone() {
             None => none_text.clone(),
             Some(path) if path.is_empty() => none_text.clone(),
-            // 服务端把上传的头像存成 /static/avatars/xxx.png 这类相对路径
+            // The server stores uploaded avatars as relative paths like /static/avatars/xxx.png
             Some(path) if path.starts_with('/') => self.t("profile_avatar_local"),
             Some(path) => path,
         };
@@ -5837,18 +5831,18 @@ impl App {
         )));
         let body = Text::from(body_lines);
 
-        // 面板宽度只能压到屏幕以内，正文再按可用宽度折行：
-        // 原先固定 40 列下限且不折行，窄终端上 UID、邮箱、头像链接这类长单行会被右边界切掉
+        // Panel width can only be compressed within the screen; then body text wraps by available width:
+        // Previously a fixed 40-column minimum with no wrapping, so long single lines like UID, email, and avatar links were cut off by the right boundary on narrow terminals
         let appearance = self.appearance.clone();
         let screen_width = area.width.saturating_sub(2);
-        // 面板宽度下限要能容下"满格头像 + 一栏正文"：否则昵称/简介一短，
-        // 面板就跟着变窄，头像被降档到很小的一块（正文长时不受影响）
+        // The panel width minimum must fit "full avatar + one column of text": otherwise if nickname/bio is short,
+        // the panel gets narrower and the avatar is downgraded to a very small block (long text is unaffected)
         let text_minimum = 24u16;
         let width_floor = (max_avatar_columns as u16 + 5 + text_minimum + 4)
             .min(screen_width.max(1))
             .max(24u16.min(screen_width.max(1)));
         let panel_width = (body.width() as u16 + 4).clamp(width_floor, screen_width.max(1));
-        // 头像列最多占面板一半，且必须"列 = 2×行"：窄面板上整体降档，不把圆脸压成竖条
+        // Avatar column takes at most half the panel, and must satisfy "columns = 2×rows": downgrade the whole thing on narrow panels, do not squash round faces into vertical strips
         let (avatar_columns, avatar_rows) = avatar_grid_within(
             (panel_width / 2).max(2),
             area.height.saturating_sub(4).max(1),
@@ -5877,14 +5871,14 @@ impl App {
             Constraint::Fill(1),
         ])
         .areas(inner);
-        // 图片按网格自身的行数画，多余的高度留给下面（画满 inner 会把比例再拉歪一次）
+        // Draw the image according to the grid's own row count; extra height is left for below (filling inner would distort the ratio again)
         let picture_area = Rect::new(
             picture_area.x,
             picture_area.y,
             avatar_columns as u16,
             avatar_rows,
         );
-        // 头像占位与真图共用同一块区域：图片到位后只是把这块画满，右侧文字位置不动
+        // Avatar placeholder and real image share the same area: once the image arrives it just fills this area, and the text position to the right does not move
         match pixels {
             Some(pixels) => pixels.paint(frame, picture_area, appearance.app_background),
             None => paint_avatar_placeholder(
@@ -5901,8 +5895,8 @@ impl App {
         );
     }
 
-    /// 居中渲染登录浮层：用户名与密码（星号遮蔽）两个输入框。
-    /// 浮层只保留输入框与提交，Tab/Enter/Esc 属通用键，按快捷键提示规范不再单独占一行提示。
+    /// Center-render the login overlay: username and password (masked with asterisks) input boxes.
+    /// The overlay keeps only the input box and submit; Tab/Enter/Esc are universal keys, so per the shortcut prompt spec they no longer get their own prompt line.
     fn render_login_modal(&mut self, frame: &mut Frame, area: Rect) {
         let panel_rect = centered_rect(
             50u16.min(area.width.saturating_sub(4)).max(30),
@@ -5939,13 +5933,13 @@ impl App {
         frame.render_widget(overlay_frame_block(&appearance, &title), panel_rect);
     }
 
-    /// 居中渲染注册浮层：用户名、邮箱、密码（星号遮蔽）三个输入框。
-    /// 同登录浮层，Tab/Enter/Esc 属通用键不再提示，故去掉底部提示行并收窄面板。
+    /// Center-render the registration overlay: username, email, password (masked with asterisks) input boxes.
+    /// Same as login overlay, Tab/Enter/Esc are universal keys and need no prompt, so remove the bottom prompt line and narrow the panel.
     fn render_register_modal(&mut self, frame: &mut Frame, area: Rect) {
         let panel_rect = centered_rect(50, 14, area);
         self.clear_overlay_area(frame, panel_rect);
 
-        // 输入框正文文本颜色由外观给出
+        // Input box body text color comes from the appearance
         let input_text_style = Style::default().fg(self.appearance.input_text);
         let block = Block::default()
             .title(format!(" {} ", self.t("page_register")))
@@ -6027,8 +6021,8 @@ impl App {
         let chunks = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
             .split(area);
 
-        // 未登录时聊天窗口照常显示（不遮盖），仅通过一次性弹窗提示登录/注册，
-        // 并在各受保护操作入口拒绝未登录调用。
+        // When logged out, the chat window displays normally (not obscured), only prompting login/registration via a one-time popup:
+        // and reject unauthenticated calls at all protected operation entry points.
         self.render_room_list(frame, chunks[0]);
         self.render_chat_area(frame, chunks[1]);
     }
@@ -6055,15 +6049,15 @@ impl App {
                 } else {
                     Style::default().fg(self.appearance.message_text)
                 };
-                // 非选中房间若有未读消息，在名称后追加红色 (数量)
+                // If a non-selected room has unread messages, append red (count) after the name
                 let unread = if self.rooms_state.selected() == Some(i) {
                     0
                 } else {
                     self.unread_counts.get(&room.id).copied().unwrap_or(0)
                 };
                 let mut spans = vec![Span::styled(name, style)];
-                // 私聊在名称后标注对端在线状态：实心点在线、空心点离线，
-                // 服务端从未广播过该成员（无在线名单基线）时不标注，避免把未知显示成离线
+                // Private chat annotates the peer's online status after the name: solid dot = online, hollow dot = offline,
+                // do not annotate when the server has never broadcast that member (no online roster baseline), to avoid displaying the unknown as offline
                 if let Some(peer_id) = self.chat_peer_id_of(room) {
                     let presence_mark = match self.presence_by_user.get(&peer_id) {
                         Some(true) => {
@@ -6077,7 +6071,7 @@ impl App {
                     }
                 }
                 if unread > 0 {
-                    // 免打扰房间未读数一律显示为点（·），其余显示具体数量（超过 99 显示 99+）
+                    // Do-not-disturb rooms always show unread count as a dot (·); all others show the specific count (99+ above 99)
                     let suffix = if self.muted_room_ids.contains(&room.id) {
                         "(·)".to_string()
                     } else if unread > 99 {
@@ -6117,13 +6111,13 @@ impl App {
         self.render_messages(frame, chunks[0]);
         self.render_message_input(frame, chunks[1]);
 
-        // 输入以 / 开头时在输入框上方显示命令自动补全面板
+        // When input starts with /, show the command auto-completion panel above the input box
         let input_text = self.input_collector.message_input_state.text();
         if let Some(command_prefix) = input_text.strip_prefix('/') {
             self.render_command_completions(frame, chunks[1], command_prefix);
         }
 
-        // 快捷键提示随输入模式切换：组合键必须提示，Tab/Enter/Esc 这类通用键不再提示
+        // Shortcut prompts switch with input mode: modifier combinations must be prompted; Tab/Enter/Esc as universal keys are no longer prompted
         let hint_key = if input_text.starts_with('#') {
             "search_hint"
         } else if input_text.starts_with('/') {
@@ -6137,7 +6131,7 @@ impl App {
         frame.render_widget(hint, chunks[2]);
     }
 
-    /// 在输入框上方渲染命令补全列表，上下键选择、回车插入选中项
+    /// Render the command completion list above the input box; arrow keys to select, Enter to insert the selected item
     fn render_command_completions(
         &mut self,
         frame: &mut Frame,
@@ -6155,7 +6149,7 @@ impl App {
         {
             self.command_list_state.select(Some(0));
         }
-        // 成员/语言/外观等参数补全列表可能较长，允许更高面板；命令名补全保持紧凑
+        // Parameter completion lists for members/languages/appearance may be long; allow taller panels; command name completion stays compact
         let max_height = if raw_prefix.starts_with("kick ")
             || raw_prefix.starts_with("language ")
             || raw_prefix.starts_with("appearance ")
@@ -6166,7 +6160,7 @@ impl App {
             7
         };
         let popup_width = input_area.width.saturating_sub(2);
-        // 边框 2 列 + 高亮符号 2 列
+        // 2 columns for border + 2 columns for highlight symbol
         let body_width = popup_width.saturating_sub(6).max(1);
         let candidate_lines: Vec<Vec<Line<'static>>> = candidates
             .iter()
@@ -6209,7 +6203,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("► ");
-        // 缓冲区为叠加式渲染，先清空面板区域防止下层文字透出
+        // The buffer is layered rendering; first clear the panel area to prevent lower-layer text from showing through
         self.clear_overlay_area(frame, popup_rect);
         frame.render_widget(popup_block, popup_rect);
         frame.render_stateful_widget(
@@ -6222,7 +6216,7 @@ impl App {
         );
     }
 
-    /// 渲染消息显示区：按显示宽度预折行，右侧滚动条，滚轮与贴底跟随由反向滚动偏移驱动
+    /// Render the message display area: pre-wrap by display width, scrollbar on the right, wheel-follow and stick-to-bottom driven by reverse scroll offset
     fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
         let mut title_spans: Vec<Span> = match self
             .rooms_state
@@ -6238,16 +6232,16 @@ impl App {
             }
             None => vec![Span::raw(format!(" {} ", self.t("chat_history")))],
         };
-        // 输入状态指示：把本房间 2 秒衰减窗口内的成员名追加到消息区标题栏，
-        // 不占用消息行也不打断阅读（客户端只在标题栏这一处显示输入状态）
+        // Typing indicator: append member names within the 2-second decay window of this room to the message area title bar,
+        // Doesn't occupy a message line nor interrupt reading (the client only shows input status in this one place on the title bar)
         let selected_room_id = self.selected_room_id();
         let mut typing_names: Vec<String> = Vec::new();
         for (room_id, username, _) in &self.typing_members {
             if Some(room_id) != selected_room_id.as_ref() {
                 continue;
             }
-            // 同名成员（多账号或重连产生的重复记录）只显示一次，
-            // 否则标题会先出现两个相同名字、过期一条后再变回一个
+            // members with the same name (duplicate records from multiple accounts or reconnects) are shown only once,
+            // otherwise the title would show two identical names first, then revert to one after one expires
             if !typing_names.contains(username) {
                 typing_names.push(username.clone());
             }
@@ -6274,7 +6268,7 @@ impl App {
             vertical: 1,
             horizontal: 1,
         });
-        // 右侧留一列绘制滚动条
+        // Leave a column on the right for drawing the scrollbar
         let text_width = inner.width.saturating_sub(1).max(1);
         let scroll_area = Rect {
             x: inner.x + inner.width.saturating_sub(1),
@@ -6288,8 +6282,8 @@ impl App {
         let visible_height = inner.height.max(1);
         let max_scroll_y = total_lines.saturating_sub(visible_height);
 
-        // 搜索模式切换匹配项后把命中消息滚入视口：顶部对齐并留一行余量，再按可滚范围夹取。
-        // 消息在列表中的下标可能因"更早消息"前插而变化，故按消息 ID 定位而非缓存下标。
+        // When switching match items in search mode, scroll the matched message into view: align to top with one row of margin, then clamp to the scrollable range.
+        // The index of a message in the list may change due to "earlier message" prepending, so locate by message ID rather than a cached index.
         let mut scrolled_to_match = false;
         if let Some(target_id) = self.pending_scroll_message_id.take() {
             let target_index = self
@@ -6305,15 +6299,15 @@ impl App {
                 scrolled_to_match = true;
             }
         }
-        // 反向偏移夹取到可滚动范围并回写，0 表示贴底跟随最新消息
+        // Clamp the reverse offset to the scrollable range and write back; 0 means stick to bottom following the latest message
         self.messages_scroll_from_bottom = self.messages_scroll_from_bottom.min(max_scroll_y);
         let scroll_y = max_scroll_y - self.messages_scroll_from_bottom;
 
-        // 用户滚到消息显示区顶部（偏移离开底部且已抵到最大可滚位置）且服务器仍有更早消息时，
-        // 自动拉取一批；前插后总行数增大使 scroll_y 离开顶部，天然避免逐帧重复拉取。
-        // 守卫：消息列表必须确实属于当前选中房间（切房加载未完成/失败时列表与选中可能错位），
-        // 防止拿旧房间的残留偏移与游标误拉他房更早历史；本帧刚定位过匹配项时不拉取，
-        // 否则前插会使行号整体位移，定位结果被冲掉
+        // When the user scrolls to the top of the message display area (offset leaves the bottom and has reached the maximum scrollable position) and the server still has earlier messages,
+        // automatically fetch a batch; after prepending, the increased total row count moves scroll_y away from the top, naturally avoiding per-frame repeated fetching.
+        // Guard: the message list must belong to the currently selected room (when room-switch loading is incomplete/failed, the list and selection may be misaligned):
+        // preventing using the residual offset and cursor of an old room to erroneously fetch earlier history from another room; do not fetch when a match item was just positioned this frame,
+        // otherwise prepending shifts all row numbers and the positioning result is washed out
         let selected_room_id = self.selected_room_id();
         let list_matches_room = self
             .messages
@@ -6349,14 +6343,14 @@ impl App {
         frame.render_widget(block, area);
     }
 
-    /// 构建消息显示区的渲染行。
-    /// 返回 (渲染行列表, 每条消息首行在列表中的行号)，两个向量的消息顺序一一对应；
-    /// 行号供搜索模式把命中消息滚入视口使用（只有这里能算出折行后的真实行号）。
-    /// 处于搜索模式且关键词生效时，命中片段套用外观里的搜索命中背景色。
+    // Build the render rows for the message display area.
+    // Returns (list of render rows, row index of first line for each message in the list); the message order of the two vectors corresponds one-to-one;
+    /// The row indices are used by search mode to scroll matched messages into view (only here can the real row number after wrapping be computed).
+    /// When in search mode and the keyword is active, matched fragments use the search-match background color from the appearance.
     fn build_message_lines(&self, text_width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
         let current_user_id = self.current_user_id.as_deref().unwrap_or("");
         let keyword = self.active_search_keyword();
-        // 当前定位到的那一条匹配项：命中的那条消息用另一个背景色，与其余命中区分开
+        // The currently positioned match item: the matched message uses another background color, distinguishing it from other matched areas
         let current_match_message_id: Option<String> = keyword.as_ref().and_then(|_| {
             self.search_result
                 .as_ref()
@@ -6377,7 +6371,7 @@ impl App {
         let mut message_first_lines: Vec<usize> = Vec::new();
         let mut last_time_key: Option<String> = None;
         for message in &self.messages {
-            // 时间头：与上一条消息同分钟则隐藏，跨分钟才插入居中时间条
+            // Time header: hide if same minute as the previous message; insert a centered time bar only when crossing a minute boundary
             if let Some(time_text) = format_message_time(&message.created_at, self.time_with_date)
                 && last_time_key.as_deref() != Some(time_text.as_str())
             {
@@ -6396,7 +6390,7 @@ impl App {
             } else {
                 self.sender_display_name(&message.sender_id)
             };
-            // 注销过的发言人没有 ID 可展示，只留"未知用户"
+            // A speaker whose account was deleted has no ID to display; only show "unknown user"
             let display_sender = if self.show_uid && !sender_name.is_empty() {
                 format!("{} ({})", sender_name, message.sender_id)
             } else {
@@ -6414,8 +6408,8 @@ impl App {
             } else {
                 Alignment::Left
             };
-            // 行号向量记录的是首行正文：复制选区与搜索定位都按"正文块"划分，
-            // 把用户名行算进去会改变它们的边界
+            // The row index vector records the first text line: copy selection and search positioning are divided by "text block",
+            // including the username row would change their boundaries
             for piece in wrap_by_display_width(&display_sender, text_width) {
                 lines.push(Line::from(Span::styled(piece, name_style)).alignment(alignment));
             }
@@ -6425,7 +6419,15 @@ impl App {
             } else {
                 match_style
             };
-            for source_line in message.content.split('\n') {
+            // In an encrypted private chat the server has no body to give (the ciphertext only exists inside the session):
+            // the seam reports "this history message has no readable body" as an empty string, and the interface fills in
+            // the placeholder text from the language table.
+            let body: String = if message.content.is_empty() {
+                self.t("message_encrypted_history_unavailable")
+            } else {
+                message.content.clone()
+            };
+            for source_line in body.split('\n') {
                 let segments = match keyword.as_deref() {
                     Some(keyword) => {
                         split_line_by_keyword(source_line, keyword, body_style, message_match_style)
@@ -6440,9 +6442,9 @@ impl App {
         (lines, message_first_lines)
     }
 
-    /// 当前生效的搜索关键词：仅当输入框处于搜索模式（以 # 开头）、已执行过搜索，
-    /// 且输入框里的关键词与已执行的那次一致时才返回。用户改动关键词后旧结果立刻停止高亮，
-    /// 避免出现与当前输入不符的残留高亮。
+    // Currently active search keyword: only when the input box is in search mode (starts with #) and a search has been executed,
+    /// Only return when the keyword in the input box matches the one just executed. When the user changes the keyword, old results immediately stop highlighting,
+    /// to avoid residual highlighting that does not match the current input.
     fn active_search_keyword(&self) -> Option<String> {
         let typed = self.input_collector.message_input_state.text();
         let typed_keyword = typed.strip_prefix('#')?;
@@ -6453,7 +6455,7 @@ impl App {
         Some(executed_keyword.clone())
     }
 
-    /// 当前是否处于搜索模式：判定方式与指令模式一致，输入框内容以 # 开头。
+    /// Whether currently in search mode: the judgment method is the same as command mode — the input box content starts with #.
     fn in_search_mode(&self) -> bool {
         self.input_collector
             .message_input_state
@@ -6461,14 +6463,14 @@ impl App {
             .starts_with('#')
     }
 
-    /// 退出搜索模式：清空输入框与全部搜索结果状态（高亮、命中列表、定位一并复位）
+    /// Exit search mode: clear the input box and all search result state (highlight, match list, positioning all reset)
     fn exit_search_mode(&mut self) {
         self.input_collector.message_input_state.set_text("");
         self.search_result = None;
         self.pending_scroll_message_id = None;
     }
 
-    /// 按关键词扫描当前已加载消息，返回命中消息的 ID 列表（保持消息显示顺序，不区分大小写）
+    /// Scan currently loaded messages by keyword, returning a list of matched message IDs (keeping message display order, case-insensitive)
     fn messages_matching_keyword(&self, keyword: &str) -> Vec<String> {
         self.messages
             .iter()
@@ -6479,10 +6481,10 @@ impl App {
             .collect()
     }
 
-    /// 执行消息搜索（搜索模式下按 Enter 触发）。
-    /// 服务端消息接口只有 limit/before 游标、没有关键词检索参数，故先把当前房间的历史消息
-    /// 整房拉到本地（load_full_room_history），再在完整列表里扫描关键词。
-    /// 命中后默认定位到最后一个匹配项（即最近一条命中），未命中时结果列表为空、标题显示未找到。
+    // Execute message search (triggered by Enter in search mode).
+    // The server message API only has limit/before cursors, not keyword search parameters, so first pull the current room's history messages
+    /// into local (load_full_room_history), then scan for keywords in the complete list.
+    /// After matching, default to positioning at the last match (i.e., the most recent hit); when no match, the result list is empty and the title shows "not found".
     fn execute_message_search(&mut self) {
         let Some(typed) = self
             .input_collector
@@ -6498,7 +6500,7 @@ impl App {
             self.exit_search_mode();
             return;
         }
-        // 只在服务端仍报告有更早消息时才整房拉取，重复按 Enter 不会反复翻页
+        // Only fetch the whole room when the server still reports earlier messages; repeatedly pressing Enter does not repeatedly page
         if self.messages_older_cursor.is_some() {
             self.push_notification(self.t("search_loading_history"));
             self.load_full_room_history();
@@ -6506,9 +6508,9 @@ impl App {
         self.apply_search_keyword(&keyword);
     }
 
-    /// 快速搜索：搜索模式下输入文本每次变化都即时扫描已加载消息，无需按 Enter。
-    /// 刻意不做整房翻页拉取——逐字符翻页会打爆消息接口，完整历史仍由 Enter 触发。
-    /// 关键词清空时直接清掉结果，标题回到未搜索态。
+    // Quick search: in search mode, every text change instantly scans loaded messages, no Enter needed.
+    /// Deliberately not doing whole-room page fetching — per-character paging would overwhelm the message API; the full history is still triggered by Enter.
+    /// When the keyword is cleared, directly clear the results and the title returns to the unsearched state.
     fn apply_quick_search(&mut self) {
         let Some(typed) = self
             .input_collector
@@ -6528,9 +6530,9 @@ impl App {
         self.apply_search_keyword(&keyword);
     }
 
-    /// 按关键词在已加载消息里扫描命中项并写入搜索结果状态：
-    /// 默认定位到最后一个匹配项（最近一条命中），无命中时命中列表为空、标题显示未找到。
-    /// 正式搜索与快速搜索共用，差别只在于调用前是否先拉全历史。
+    // Scan for matched items in loaded messages by keyword and write into search result state:
+    /// Default to positioning at the last match (most recent hit); when no match, the match list is empty and the title shows "not found".
+    /// Formal search and quick search share this; the only difference is whether the full history is pulled before calling.
     fn apply_search_keyword(&mut self, keyword: &str) {
         let matched = self.messages_matching_keyword(keyword);
         let selected = matched.len().saturating_sub(1);
@@ -6539,10 +6541,10 @@ impl App {
         self.pending_scroll_message_id = target_id;
     }
 
-    /// 把当前选中房间的历史消息按游标翻页全部拉到本地，供全量关键词搜索使用。
-    /// 单次请求 100 条（服务端 limit 的硬上限），服务端返回 has_more 且游标推进时才继续，
-    /// 游标不前进立即停止，杜绝死循环。已在本地的消息按 ID 去重保留：
-    /// 加密私聊里本端已解密的明文条目不能被服务端返回的占位密文覆盖掉。
+    // Pull all paginated history messages of the currently selected room into local, for full keyword search use.
+    // Single request fetches 100 messages (the hard server limit of limit); continue only when the server returns has_more and the cursor advances;
+    /// if the cursor does not advance, stop immediately to prevent infinite loops; messages already local are deduplicated and kept:
+    /// plaintext entries already decrypted locally in encrypted private chats must not be overwritten by placeholder ciphertext returned by the server.
     fn load_full_room_history(&mut self) {
         let Some(room) = self
             .rooms_state
@@ -6564,7 +6566,7 @@ impl App {
                     let has_more = page.has_more;
                     let next_cursor = page.next_cursor;
                     fetched.extend(page.messages);
-                    // 游标缺失或没有前进都视为已到尽头，立即停止，避免服务端异常时循环打爆接口
+                    // A missing cursor or no advancement is treated as reaching the end; stop immediately to prevent looping and overwhelming the API when the server is abnormal
                     if !has_more
                         || next_cursor.is_none()
                         || next_cursor == cursor
@@ -6583,7 +6585,7 @@ impl App {
         if fetched.is_empty() {
             return;
         }
-        // 接口按最新在前返回，反转成旧在上、新在下后再合并
+        // The API returns newest-first; reverse to oldest-on-top, newest-on-bottom, then merge
         fetched.reverse();
         let existing_ids: HashSet<String> = self
             .messages
@@ -6606,16 +6608,16 @@ impl App {
         self.messages.extend(fresh);
         let merged_room_id = room.id.clone();
         self.cache_loaded_messages(&merged_room_id);
-        // RFC3339 时间戳的字典序即时间序，稳定排序保持同一时刻消息的原有相对顺序
+        // RFC3339 timestamps' lexicographic order is time order; stable sort preserves the original relative order of messages at the same moment
         self.messages
             .sort_by(|left, right| left.created_at.cmp(&right.created_at));
-        // 已无更早消息可翻，关闭触顶自动翻页，避免搜索后再去拉一遍重复历史
+        // No earlier messages left to fetch, so close the top-reached auto-paging to avoid pulling duplicate history again after searching
         self.messages_older_cursor = None;
     }
 
-    /// 消息列表整体变化（切房重载、全量拉取、更早消息前插）后重新校验搜索结果：
-    /// 按已执行的关键词在当前列表里重扫命中项，并把当前匹配项序号夹回有效范围。
-    /// 不重扫的话命中 ID 会指向已不存在的消息，切换匹配项时表现为"跳不动"。
+    // Re-verify search results after the message list changes overall (room switch reload, full fetch, earlier message prepend):
+    /// Rescan for matches in the current list by the already-executed keyword, and clamp the current match index back into the valid range.
+    /// Without rescanning, matched IDs would point to non-existent messages, and switching match items would appear "stuck".
     fn refresh_search_matches(&mut self) {
         let Some((keyword, _, selected)) = self.search_result.clone() else {
             return;
@@ -6629,9 +6631,9 @@ impl App {
         self.search_result = Some((keyword, refreshed, bounded));
     }
 
-    /// 在搜索结果中切换匹配项：to_previous 为真取上一个（已在第一个时回绕到最后一个），
-    /// 否则取下一个（已在最后一个时回绕到第一个），并把目标消息登记为待定位。
-    /// 匹配项为 0 个或 1 个时不动作，避免无意义抖动滚动位置。
+    // Switch match items in search results: to_previous true means take the previous one (wrap to last when already at the first),
+    /// otherwise take the next one (wrap to first when already at the last), and register the target message as pending positioning.
+    /// Do nothing when there are 0 or 1 match items, to avoid meaningless jitter of the scroll position.
     fn navigate_search_result(&mut self, to_previous: bool) {
         let Some((keyword, matched, selected)) = self.search_result.clone() else {
             return;
@@ -6654,13 +6656,13 @@ impl App {
         self.search_result = Some((keyword, matched, next_index));
     }
 
-    /// 消息输入框的标题文本与边框颜色：按指令模式 / 搜索模式 / 普通模式三态给出。
-    /// 搜索模式标题要体现"未搜索""第 i/n 个匹配项""未找到"三种进度，未找到时标题标红。
+    /// Message input box title text and border color: given by three states — command mode / search mode / normal mode.
+    /// The search mode title should reflect three progress states: "unsearched", "match i/n", "not found"; the title is red when not found.
     fn message_input_title(&self) -> (Line<'static>, Color) {
         let input_text = self.input_collector.message_input_state.text();
         if self.in_search_mode() {
-            // 输入框里的关键词与上次执行的不一致（含用退格删改），上次结果就已经不成立了：
-            // 标题回到"未执行搜索"，不再显示旧的匹配进度，避免看着有结果其实早已失效
+            // The keyword in the input box differs from the last executed one (including backspace edits); the last result is already invalid:
+            // The title returns to "unexecuted search", no longer showing old match progress, to avoid looking like there are results when they have long since expired
             let title = match (self.active_search_keyword(), self.search_result.as_ref()) {
                 (None, _) | (_, None) => {
                     Line::from(Span::raw(format!(" {} ", self.t("search_mode"))))
@@ -6693,7 +6695,7 @@ impl App {
     }
 
     fn render_message_input(&mut self, frame: &mut Frame, area: Rect) {
-        // 记下本帧输入框位置：落在其内的拖拽交给控件自己选词，其外的拖拽才启动整屏框选
+        // Record the input box position this frame: drags within it are delegated to the widget for text selection; drags outside start a full-screen box selection
         self.message_input_area = area;
         let cursor_style = Style::default().fg(self.appearance.own_username_text);
         let (title, border_color) = self.message_input_title();
@@ -6723,10 +6725,10 @@ impl App {
     }
 
     fn render_create_group_modal(&mut self, frame: &mut Frame, area: Rect) {
-        // 面板尺寸先按内容要，再夹到可绘制区以内：窄终端上超出的部分过去会被终端整列切掉
+        // Panel size first by content requirement, then clamp to the drawable area: on narrow terminals, the excess used to be cut off by the terminal column
         let panel_rect = centered_rect(60, 18, area);
 
-        // 仅清空并覆盖弹窗自身区域，避免破坏底层群聊列表与聊天记录的边框
+        // Only clear and cover the popup's own area to avoid breaking the border of the underlying group list and chat records
         self.clear_overlay_area(frame, panel_rect);
 
         let focus_style = Style::default()
@@ -6738,7 +6740,7 @@ impl App {
             .fg(contrasting_foreground(self.appearance.selection_background))
             .bg(self.appearance.selection_background);
 
-        // 输入框正文文本颜色由外观给出
+        // Input box body text color comes from the appearance
         let input_text_style = Style::default().fg(self.appearance.input_text);
         let block = Block::default()
             .title(format!(" {} ", self.t("create_group_title")))
@@ -6812,7 +6814,7 @@ impl App {
     fn render_create_private_modal(&mut self, frame: &mut Frame, area: Rect) {
         let panel_rect = centered_rect(50, 14, area);
 
-        // 仅清空并覆盖弹窗自身区域，避免破坏底层群聊列表与聊天记录的边框
+        // Only clear and cover the popup's own area to avoid breaking the border of the underlying group list and chat records
         self.clear_overlay_area(frame, panel_rect);
 
         let focus_style = Style::default()
@@ -6824,7 +6826,7 @@ impl App {
             .fg(contrasting_foreground(self.appearance.selection_background))
             .bg(self.appearance.selection_background);
 
-        // 输入框正文文本颜色由外观给出
+        // Input box body text color comes from the appearance
         let input_text_style = Style::default().fg(self.appearance.input_text);
         let block = Block::default()
             .title(format!(" {} ", self.t("create_private_title")))
@@ -6886,7 +6888,7 @@ impl App {
             return;
         }
         let room_id = room.id.clone();
-        // /kick 仅限群管理员/群主；非管理员即使目标是自己也不允许用其移除成员
+        // /kick only for group admins/owners; non-admins cannot use it to remove members even if the target is themselves
         let detail = match self.connector.get_room(&room_id) {
             Ok(detail) => detail,
             Err(error) => {
@@ -6925,7 +6927,7 @@ impl App {
             .remove_member(&room_id, &target_member.user_id)
         {
             Ok(_) => {
-                // 若移除的是自己则记入主动退出集合，避免被误判为"被移出群聊"
+                // If removing oneself, record in the voluntary exit set to avoid being misjudged as "removed from group"
                 if self.current_user_id.as_deref() == Some(target_member.user_id.as_str()) {
                     self.left_room_ids.insert(room_id.clone());
                 }
@@ -6960,7 +6962,7 @@ impl App {
         for member_id in &other_ids {
             let _ = self.connector.remove_member(room_id, member_id);
         }
-        // 移除自己时记入主动退出集合，避免被误判为"被移出群聊"
+        // When removing yourself, record in the voluntary exit set to avoid being misjudged as "removed from group"
         self.left_room_ids.insert(room_id.to_string());
         let _ = self.connector.remove_member(room_id, &own_id);
         self.load_rooms();
@@ -6987,9 +6989,9 @@ impl App {
                 return;
             }
         };
-        // 成员名册改走专用的成员接口：房间详情里的成员数组是附带字段，
-        // 成员接口才是服务端给出的权威名册（带 count 与完整 role/joined_at），
-        // 两者都取到才拼出完整信息；成员接口失败时退回详情里那份，不至于什么都显示不出
+        // The member roster now uses the dedicated member API: the member array in room details is an incidental field,
+        // the member API is the authoritative roster given by the server (with count and complete role/joined_at),
+        // Both need to be obtained to form complete information; when the member interface fails, fall back to the detail version, not showing nothing at all
         let roster = self.connector.list_members(&room_id).ok();
         let room_name = detail
             .name
@@ -7006,7 +7008,7 @@ impl App {
             .unwrap_or(&detail.members)
             .iter()
             .map(|member| {
-                // 成员后跟在线标记（与服务端广播一致的 ●/○），未知状态不显示标记
+                // Members followed by an online marker (●/○ consistent with server broadcasts); unknown status shows no marker
                 let presence_mark = match self.presence_by_user.get(&member.user_id) {
                     Some(true) => "●",
                     Some(false) => "○",
@@ -7057,9 +7059,9 @@ impl App {
         self.push_notification(info);
     }
 
-    /// 发送者的显示名：先查用户名映射，查不到退回用户 ID。
-    /// 账号注销后服务端会把 `messages.sender_id` 置为 null（`ON DELETE SET NULL`），
-    /// 接缝把 null 收敛成空串，此时既没有名字也没有 ID，统一显示"未知用户"。
+    // Display name of the sender: look up the username mapping first; fall back to user ID if not found.
+    /// After account deletion, the server sets `messages.sender_id` to null (`ON DELETE SET NULL`),
+    /// the seam collapses null into an empty string; at this point there is neither name nor ID, so uniformly display "unknown user" (unknown user).
     fn sender_display_name(&self, sender_id: &str) -> String {
         if sender_id.is_empty() {
             return self.t("unknown_user");
@@ -7070,15 +7072,23 @@ impl App {
             .unwrap_or_else(|| sender_id.to_string())
     }
 
-    /// 设置菜单条目表：(标签, 文字颜色, 回车动作)。
-    /// 浮层渲染与按键分派都读这一张表，菜单增删项只改这里一处。
-    /// 注销账户按 TODO 要求用红字标出，退出登录同样是破坏性操作故也用红字。
+    // Settings menu entry table: (label, text color, enter action).
+    /// Overlay rendering and key dispatch both read this table; adding/removing menu items only changes this one place.
+    /// Account deletion is marked in red as per TODO; logging out is also a destructive operation so it is also in red.
     fn settings_menu_entries(&self) -> Vec<(String, Color, SettingsAction)> {
-        let on_off = |enabled: bool| if enabled { "ON" } else { "OFF" };
+        // Switch state in the settings menu goes through the language table like every other wording:
+        // a hardcoded "ON"/"OFF" would stay English inside a Chinese interface.
+        let on_off = |enabled: bool| {
+            if enabled {
+                self.t("switch_on")
+            } else {
+                self.t("switch_off")
+            }
+        };
         let plain_text = self.appearance.message_text;
         let danger_text = self.appearance.notice_error_border;
-        // 数字只提示"待处理"条数：收到的都是待处理（接口只返回 pending），
-        // 自己发出的只有还是 pending 的才算，已接受/已拒绝/已过期的旧邀请不计
+        // The number only shows "pending" count: everything received is pending (the API only returns pending),
+        // only your own that are still pending count; old invitations already accepted/rejected/expired do not count
         let request_count = self
             .pending_requests
             .iter()
@@ -7207,8 +7217,8 @@ impl App {
         ]
     }
 
-    /// 打开一个既有浮层，顺带完成各自需要的初始化：列表类浮层把选中项摆到当前生效条目，
-    /// 服务器地址浮层预填现有地址，表单与输入类浮层把焦点回到第一项。
+    /// Open an existing overlay while completing the initialization each needs: list overlays set the selected item to the currently active entry,
+    /// the server address overlay pre-fills the existing address, and form/input overlays return focus to the first item.
     fn open_overlay(&mut self, overlay: DisplayingOverlay) {
         self.focus_index = 0;
         match overlay {
@@ -7239,7 +7249,7 @@ impl App {
             DisplayingOverlay::AvatarSelect => {
                 ensure_avatar_source_directory();
                 if local_avatar_files().is_empty() {
-                    // 目录里还没图片：不摆空面板，直接给原来的链接输入表单
+                    // No images in the directory: do not show an empty panel; just give the original link input form
                     self.open_declared_form(&FormAction::ChangeAvatar);
                     return;
                 }
@@ -7250,8 +7260,8 @@ impl App {
         self.displaying_overlay = overlay;
     }
 
-    /// 按表单声明打开表单浮层。个人资料表单额外按服务端当前值预填昵称与简介；
-    /// 手机号没有任何只读接口能取回（登录响应之外不给），故留空表示"不改这一项"。
+    /// Open the form overlay as declared by the form spec. The profile form additionally pre-fills nickname and bio from the current server values;
+    /// phone numbers have no read-only interface to retrieve (not provided beyond the login response), so leave empty meaning "do not change this item".
     fn open_declared_form(&mut self, action: &FormAction) {
         let (_, declared) = form_definition(action);
         let mut prefilled: Vec<String> = Vec::new();
@@ -7286,8 +7296,8 @@ impl App {
         self.open_form(action.clone(), fields);
     }
 
-    /// 渲染设置菜单浮层：条目、颜色与动作全部来自 settings_menu_entries，
-    /// 面板高度按条目数算，超出屏幕时由列表自身随选中项滚动。
+    /// Render the settings menu overlay: entries, colors, and actions all come from settings_menu_entries,
+    /// panel height is calculated by item count; when exceeding the screen, the list scrolls by the selected item itself.
     fn render_settings_menu(&mut self, frame: &mut Frame, area: Rect) {
         let entries = self.settings_menu_entries();
         let labels: Vec<String> = entries.iter().map(|(label, _, _)| label.clone()).collect();
@@ -7316,7 +7326,7 @@ impl App {
         frame.render_stateful_widget(list, panel_rect, &mut self.menu_list_state);
     }
 
-    /// 渲染语言选择浮层：列出 config/languages 下的全部语言文件，回车切换并写回 preferences.json
+    /// Render the language selection overlay: list all language files under config/languages, press Enter to switch and write back to preferences.json
     fn render_language_select(&mut self, frame: &mut Frame, area: Rect) {
         let languages = Self::get_available_languages();
         let current = Self::current_language();
@@ -7360,8 +7370,8 @@ impl App {
         frame.render_stateful_widget(list, panel_rect, &mut self.language_list_state);
     }
 
-    /// 渲染外观选择浮层：列出 config/themes 下的全部主题文件名（去 .json 后缀），
-    /// 回车即应用并写回 preferences.json 的 appearance 字段。
+    /// Render the appearance selection overlay: list all theme file names under config/themes (stripping .json suffix),
+    /// press Enter to apply and write back to the appearance field of preferences.json.
     fn render_appearance_select(&mut self, frame: &mut Frame, area: Rect) {
         let names = Appearance::available_names();
         let labels: Vec<String> = names
@@ -7404,14 +7414,14 @@ impl App {
         frame.render_stateful_widget(list, panel_rect, &mut self.appearance_list_state);
     }
 
-    /// 本地头像选择浮层：窗口、列表、高亮符号与语言/外观选择完全一致，
-    /// 条目是 `<客户端目录>/config/avatars` 里的图片文件名。
+    /// Local avatar selection overlay: window, list, and highlight symbol are exactly the same as the language/appearance selection,
+    /// the items are image file names in `<client directory>/config/avatars`.
     fn render_avatar_select(&mut self, frame: &mut Frame, area: Rect) {
         let files = local_avatar_files();
         let labels: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
         let hint = self.t("hint_avatar_select");
         let (base_rect, body_width) = overlay_list_panel(&labels, area);
-        // 提示按条目同一内宽折行，行数超出面板自带的两行余量时才把面板加高
+        // Prompts wrap at the same inner width per item; only increase the panel height when the row count exceeds the panel's built-in two-row margin
         let hint_block =
             wrapped_hint_text(&hint, hint_style(self.appearance.hint_text), body_width);
         let hint_rows = hint_block.lines.len().max(1) as u16;
@@ -7455,7 +7465,7 @@ impl App {
         );
     }
 
-    /// 用选中的本地图片换头像：文件名来自头像目录。
+    /// Replace the avatar with the selected local image: the file name comes from the avatar directory.
     fn apply_local_avatar(&mut self) {
         let index = self.avatar_list_state.selected().unwrap_or(0);
         let files = local_avatar_files();
@@ -7465,9 +7475,9 @@ impl App {
         self.upload_local_avatar(path);
     }
 
-    /// 把一张本地图片交给服务端的 multipart 上传接口（列表选择与表单填路径两条入口共用）。
-    /// 服务端存不下文件时按它给的报错原样显示：存放目录由服务端自己在启动时建，
-    /// 客户端不去碰服务端的数据目录；要传链接版头像请用浮层里的 Ctrl+U。
+    // Hand a local image to the server's multipart upload interface (two entry points share this: list selection and form path entry).
+    /// When the server cannot store the file, display the error as-is: the storage directory is created by the server itself at startup,
+    /// the client does not touch the server's data directory; to upload a link-based avatar use Ctrl+U in the overlay.
     fn upload_local_avatar(&mut self, path: &std::path::Path) {
         let Some((file_name, content_type, bytes)) = read_local_image(path) else {
             self.push_error(self.t("error_avatar_local_file_unusable"));
@@ -7484,9 +7494,9 @@ impl App {
         }
     }
 
-    /// 渲染服务器地址浮层：单输入框，回车测试连通性并保存。
+    /// Render the server address overlay: single input box, press Enter to test connectivity and save.
     fn render_server_address(&mut self, frame: &mut Frame, area: Rect) {
-        // 提示与输入框都要放得下：面板宽度先夹到屏幕内，提示按最终内宽折行后再定高度
+        // Both the prompt and input box need to fit: panel width is first clamped to the screen; the prompt wraps to the final inner width before determining height
         let panel_width = 50u16.min(area.width.max(1));
         let label = wrapped_hint_text(
             &self.t("server_address_label"),
@@ -7498,7 +7508,7 @@ impl App {
 
         self.clear_overlay_area(frame, panel_rect);
 
-        // 输入框正文文本颜色由外观给出
+        // Input box body text color comes from the appearance
         let input_text_style = Style::default().fg(self.appearance.input_text);
         let block = Block::default()
             .title(format!(" {} ", self.t("server_address_title")))
@@ -7535,21 +7545,21 @@ impl App {
         frame.render_widget(block, panel_rect);
     }
 
-    /// 渲染私聊管理浮层：上半区是别人发给自己的请求（可接受/拒绝），
-    /// 下半区是自己发出的请求（可撤回，并显示服务端回报的当前状态）。
-    /// 两个区拼成一条扁平序列用同一个选中下标导航，因此这里手工画每行、
-    /// 只给可选项计数，标题行不参与选中。
-    /// 渲染私聊管理浮层：上半区是别人发给自己的请求（可接受/拒绝），
-    /// 下半区是自己发出的请求（可撤回，并显示服务端回报的当前状态）。
-    /// 两个区拼成一条扁平序列用同一个选中下标导航，标题行不参与选中，
-    /// 因此这里手工逐行绘制并自己算滚动偏移。邀请正文按面板宽度折行完整显示，
-    /// 长度超出面板时随选中项滚动，不会像之前那样只显示一行。
+    // Render the private chat management overlay: the upper half is requests others sent to you (accept/reject),
+    // the lower half is requests you sent (revocable, showing the current status returned by the server).
+    // The two areas are combined into a flat sequence navigated by the same selected index, so here each row is drawn manually,
+    // only countable options are counted, the title row is not part of the selection.
+    // Render the private chat management overlay: the upper half is requests others sent to you (accept/reject),
+    // the lower half is requests you sent (revocable, showing the current status returned by the server).
+    // The two areas are combined into a flat sequence navigated by the same selected index, the title row is not part of the selection,
+    /// so here each row is drawn by hand and the scroll offset is computed manually. The invitation body is displayed in full wrapped by the panel width,
+    /// and when longer than the panel it scrolls with the selected item, instead of showing just one row as before.
     fn render_pending_requests(&mut self, frame: &mut Frame, area: Rect) {
         let entries = self.request_entries();
         let received_count = self.pending_requests.len();
         let selected = self.request_list_state.selected().unwrap_or(0);
         let panel_width = area.width.saturating_sub(4).clamp(40, 88);
-        // 正文可用宽度：减去边框、选中标记与缩进
+        // Body available width: minus border, selection marker, and indentation
         let body_width = panel_width.saturating_sub(8).max(20) as usize;
         let appearance = self.appearance.clone();
         let empty_text = self.t("no_pending_requests");
@@ -7560,7 +7570,7 @@ impl App {
         let panel_title = self.t("pending_requests_title");
         let hint_text = self.t("hint_pending_requests");
 
-        // 第一遍只算行：每个条目可能占多行（正文折行），面板高度与滚动都要用它
+        // First pass counts rows only: each item may span multiple lines (body wrapping); both panel height and scrolling need it
         let mut rows: Vec<(Option<usize>, Line)> = Vec::new();
         if entries.is_empty() {
             rows.push((
@@ -7603,8 +7613,8 @@ impl App {
             }
             .map(|peer| peer.username.clone())
             .unwrap_or_else(|| unknown_text.clone());
-            // 发出侧服务端总给状态；收到侧只有本端处理过的那几条有状态（历史条目），
-            // 仍在等的收到条目状态缺省，不跟后缀
+            // The sending side always has a status from the server; the receiving side only has status for the ones processed locally (history items),
+            // received items still waiting have a default status, no suffix
             let status_suffix = match request.status.as_deref() {
                 Some(status) if *is_sent || status != "pending" => {
                     format!(" [{}]", self.request_status_label(status))
@@ -7631,8 +7641,8 @@ impl App {
                 &format!("{}{encryption_mark}", request.message),
                 body_width as u16,
             );
-            // 人名与状态本身可能宽过正文区：放不下就让它先独占若干行，正文顺延到下一行，
-            // 否则整条邀请会被裁得看不见
+            // Names and status themselves may be wider than the body area: if it doesn't fit, let it take several rows alone first, the body continues on the next row,
+            // Otherwise the entire invitation would be clipped and invisible
             let label_text = format!("{peer_name}{status_suffix}：");
             let label_width = usize::from(display_width(&label_text));
             let label_pieces: Vec<String> = if label_width > body_width {
@@ -7653,7 +7663,7 @@ impl App {
                     ]),
                 ));
             }
-            // 与人名同排时正文按人名宽度缩进；人名另起一行时正文顶格
+            // When on the same row as the name, the body is indented by the name width; when the name is on its own row, the body is flush left
             let same_row_label = label_pieces.is_empty();
             let indentation = if same_row_label { label_width } else { 0 };
             for (line_index, message_line) in message_lines.iter().enumerate() {
@@ -7679,7 +7689,7 @@ impl App {
             }
         }
 
-        // 底部提示同样按面板内宽折行，并把占用的真实行数算进面板高度（英文文案比面板还宽时会被裁）
+        // The bottom prompt also wraps at the panel inner width, and the actual row count it occupies is counted into the panel height (it gets clipped when the English text is wider than the panel)
         let hint_block = wrapped_hint_text(
             &hint_text,
             hint_style(appearance.hint_text),
@@ -7699,7 +7709,7 @@ impl App {
         let [list_area, hint_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(hint_rows)]).areas(inner);
         let visible_rows = usize::from(list_area.height.max(1));
-        // 选中条目不在可视范围时把它滚到最后一行；标题行不算条目，所以按行的条目归属查找
+        // When the selected item is not in the visible range, scroll it to the last row; the title row is not an item, so look up the item ownership by row
         let selected_row = rows
             .iter()
             .position(|(entry_index, _)| *entry_index == Some(selected));
@@ -7718,14 +7728,14 @@ impl App {
         .style(Style::default().bg(appearance.app_background));
         frame.render_widget(list, list_area);
 
-        // 只提示 d 这个非通用键位（Enter/Esc 属通用键，按快捷键提示规范不再列出）
+        // Only prompt the non-universal key d (Enter/Esc are universal keys, no longer listed per the shortcut prompt spec)
         frame.render_widget(
             Paragraph::new(hint_block).alignment(Alignment::Center),
             hint_area,
         );
     }
 
-    /// 请求状态的本地化文案：服务端给的是小写英文状态串，未知状态原样显示。
+    /// Localized text for request status: the server gives lowercase English status strings; unknown statuses are shown as-is.
     fn request_status_label(&self, status: &str) -> String {
         let key = match status {
             "pending" => "request_status_pending",
@@ -7738,39 +7748,39 @@ impl App {
         self.t(key)
     }
 
-    /// 在右上角渲染通知弹窗列，每条一个带边框小面板，依次向下堆叠
+    /// Render the notification popup column in the top-right corner, each notification a small bordered panel stacked downward
     fn render_notifications(&self, frame: &mut Frame, area: Rect) {
         let margin_between = 1u16;
-        // 列宽按"所有提示里最宽的那一行"折算：此前用的是整段文本的总宽度
-        // （多行提示会把宽度算得虚高），且上限只有半屏，结果单行长文本既撑不开面板、
-        // 又因为高度算错被整条丢弃，小屏幕上就看不到内容。
+        // Column width is calculated by "the widest row among all prompts": previously it used the total width of the entire text
+        // (multi-line prompts would inflate the width), and the cap is only half the screen, so long single-line text neither opens the panel wide enough,
+        // nor is it tall enough due to the wrong height calculation, and on small screens the content is not visible.
         let longest_line = self
             .notifications
             .iter()
             .map(|(text, _, _)| longest_line_width(text))
             .max()
             .unwrap_or(0);
-        // 允许用到屏宽三分之二（至少 28 列），窄终端上也至少给一行的容身之处
+        // Allow up to two-thirds of screen width (at least 28 columns), narrow terminals also get at least one row of space
         let preferred_width = area.width.saturating_sub(2).clamp(28, 60);
         let column_width = (longest_line + 4).clamp(28u16.min(preferred_width), preferred_width);
         let inner_width = column_width.saturating_sub(2).max(1);
         let mut next_top = area.y + 1;
 
         for (text, is_error, _) in &self.notifications {
-            // 逐行按显示宽度估行：显式换行与折行都要计入，否则多行提示会被裁切
+            // Count rows per line by display width: both explicit line breaks and wrapping must be counted, otherwise multi-line prompts would be clipped
             let line_count = estimated_wrapped_line_count(text, inner_width);
-            // 额外留一行：按词边界折行可能早于列宽上限换行
+            // Reserve an extra row: word-boundary wrapping may break earlier than the column width limit
             let needed_height = line_count + 3;
             let available_height = (area.y + area.height).saturating_sub(next_top);
             if available_height < 3 {
-                // 连最小的带框面板都放不下，剩下的旧提示本轮就不显示（到期会自动清除）
+                // If even the smallest bordered panel cannot fit, the remaining old prompts are not displayed this round (they will be automatically cleared when they expire)
                 break;
             }
             let panel_height = needed_height.min(available_height);
             let panel_x = area.x + area.width.saturating_sub(column_width + 1);
             let panel_rect = Rect::new(panel_x, next_top, column_width, panel_height);
 
-            // 错误类边框用外观的报错边框色，信息类用提示边框色；标题同步取色
+            // Error type border uses the appearance's error border color, info type uses the prompt border color; the title takes the color synchronously
             let (title_text, border_color) = if *is_error {
                 (
                     format!(" {} ", self.t("error_title")),
@@ -7795,10 +7805,10 @@ impl App {
             let message = Paragraph::new(Text::raw(text.as_str()))
                 .style(Style::default().fg(self.appearance.message_text))
                 .wrap(ratatui::widgets::Wrap { trim: true });
-            // 缓冲区为叠加式渲染，必须先清空面板区域（并重铺主题背景），否则下层文字会透出造成混乱
+            // The buffer is layered rendering; the panel area must be cleared first (and the theme background re-laid), otherwise lower-layer text will show through causing chaos
             self.clear_overlay_area(frame, panel_rect);
             frame.render_widget(panel_block, panel_rect);
-            // 文字必须限制在上下边框之内，避免段落样式把边框染成白色
+            // Text must be confined within the top and bottom borders to avoid paragraph styles turning the border white
             frame.render_widget(
                 message,
                 panel_rect.inner(ratatui::layout::Margin {
@@ -7812,61 +7822,30 @@ impl App {
     }
 }
 
-// ==================== 顶栏连接状态、消息缓存、头像、账户资料与更新 ====================
+// ==================== Top bar connection status, message cache, avatar, account info and updates ====================
 
-/// 头像原始文件的本地缓存路径。图片本身可再生（服务端那份才是正本），
-/// 存在 `<客户端目录>/cache/avatar/<用户 ID>.img`，卸载时可一并清掉。
-fn avatar_cache_path(user_id: &str) -> Option<PathBuf> {
-    let safe_name: String = user_id
-        .chars()
-        .map(|character| match character {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => character,
-            _ => '_',
-        })
-        .collect();
-    Some(paths::avatar_directory()?.join(format!("{safe_name}.img")))
-}
+// The four entry points for avatar byte cache (read, write, delete, path calculation) are all in the shared layer `baihua_core::config`:
+// The path rule is `<client root directory>/cache/avatar/<user ID>.img` (path separators in user ID are replaced with underscores).
+// The terminal edition previously copied this rule on its own, while the graphical edition uses the shared layer; having two separate implementations risks "the same person having avatars stored separately in two interfaces",
+// Here we changed to use the same implementation as the graphical edition; "one cache shared by two interfaces" is structurally sound (see AGENTS.md's configuration and cache sharing notes).
 
-/// 读已缓存的头像字节
-fn load_cached_avatar(user_id: &str) -> Option<Vec<u8>> {
-    fs::read(avatar_cache_path(user_id)?).ok()
-}
-
-/// 删掉某个用户的头像字节：换头像之后旧字节就是错的，只能重新拉
-fn drop_cached_avatar(user_id: &str) {
-    if let Some(path) = avatar_cache_path(user_id) {
-        let _ = fs::remove_file(path);
-    }
-}
-
-/// 写头像缓存（目录建不出来或磁盘写失败都只影响下次要多下载一次，不报错给用户）
-fn store_cached_avatar(user_id: &str, bytes: &[u8]) {
-    let Some(path) = avatar_cache_path(user_id) else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, bytes);
-}
-
-/// 头像网格的最大尺寸（单元格列数、行数）。一格用半块字符 `▀` 承载上下两个像素，
-/// 而终端单元格本身约是 1:2 的宽高比，所以列数取行数两倍时画出来才是正方形：
-/// 32 列 × 16 行即 32×32 像素。卡片是专门看人的地方，尺寸要给到能辨认脸型与配色；
-/// 消息区不再画头像，因此这个尺寸只影响卡片一处。
+/// Maximum size of the avatar grid (cell columns and rows). One cell holds two pixels top and bottom using the half-character `▀`,
+/// and the terminal cell itself is approximately 1:2 aspect ratio, so the grid is square when columns = 2×rows:
+/// columns × 16 rows = 32×32 pixels. The card is specifically for viewing people, so the size should be large enough to recognize face shape and color;
+/// the message area no longer draws avatars, so this size only affects the card.
 fn profile_avatar_cells() -> (usize, usize) {
     (32, 16)
 }
 
-/// 在给定可用区里定头像网格：始终保证"列数 = 行数的两倍"，只整体降档不改比例。
-/// 源图先被裁成正方形再按"列 × 行×2"像素重采样，所以列数不等于行数两倍时
-/// （老做法：面板一变窄就只裁列数、行数仍按 16 走）圆脸就会被压成竖长方形。
+/// Determine the avatar grid within the given available area: always guarantee "columns = 2×rows", only downgrade the whole thing without changing the ratio.
+/// The source image is first cropped to a square then resampled to "columns × rows×2" pixels, so when columns ≠ 2×rows
+/// the old way: when the panel narrows only the columns are cropped and rows stay at 16) round faces get squashed into vertical rectangles.
 fn avatar_grid_within(columns_available: u16, rows_available: u16) -> (u16, u16) {
     let (wanted_columns, wanted_rows) = profile_avatar_cells();
     let wanted_columns = wanted_columns as u16;
     let wanted_rows = wanted_rows as u16;
-    // 一行单元格装上下两个像素，所以"列 = 行 × 2"才对应正方形像素块：
-    // 先用可用宽度与可用高度夹出行数，列数再由行数推出，比例恒定
+    // One row of cells holds two pixels top and bottom, so "columns = rows × 2" corresponds to a square pixel block:
+    // First clamp the row count with available width and height, then derive columns from rows; the ratio stays constant
     let rows = wanted_rows
         .min(wanted_columns.min(columns_available.max(2)) / 2)
         .min(rows_available.max(1))
@@ -7875,18 +7854,18 @@ fn avatar_grid_within(columns_available: u16, rows_available: u16) -> (u16, u16)
 }
 
 impl App {
-    /// 客户端版本：编译期取自本包的 Cargo.toml，顶栏与 `--version` 共用同一来源。
+    // Client version: at compile time taken from this package's Cargo.toml, the top bar and `--version` share the same source.
     pub fn client_version() -> String {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    /// 核心库版本：与客户端版本各自独立演进，顶栏与 `--version` 一并报出便于定位问题。
+    // Core library version: evolves independently of the client version; the top bar and `--version` both report it for easier problem location。
     pub fn core_version() -> String {
         baihua_core::core_version().to_string()
     }
 
-    /// 顶栏连接标记与"连不上服务器只提示一次"共用这一处状态更新：
-    /// 跳变为断开时弹一条错误、由断到通时弹一条恢复提示，持续态只反映在顶栏上，不再重复弹框。
+    /// The top bar connection flag and the "server unreachable only prompt once" share this one state update:
+    /// pop an error when it flips to disconnected, pop a recovery prompt when it goes from disconnected to connected; the persistent state is only reflected in the top bar, no repeated popups.
     fn update_connection_state(&mut self, online: bool) {
         let previous = self.connection_ready;
         if previous == Some(online) {
@@ -7894,7 +7873,7 @@ impl App {
         }
         self.connection_ready = Some(online);
         if online {
-            // 只有"此前明确断开过"才报恢复；首次探测到连通不打扰用户（登录另有提示）
+            // Only report recovery when "previously explicitly disconnected"; first-time connectivity detection does not disturb the user (login has its own prompt)
             if previous == Some(false) {
                 self.push_notification(self.t("connection_restored"));
             }
@@ -7903,8 +7882,8 @@ impl App {
         }
     }
 
-    /// 启动时探测一次服务端：既为顶栏取到服务端版本串（未登录也要能显示），
-    /// 也为"能不能连上"给出初始标记。
+    // Probe the server once at startup: both to get the server version string for the top bar (even when logged out),
+    // and to give an initial flag for "can connect or not".
     pub fn probe_server_at_startup(&mut self) {
         match self.connector.probe_version() {
             Ok((version, raw_version)) => {
@@ -7924,12 +7903,12 @@ impl App {
         }
     }
 
-    /// 启动常驻的服务端可达性探测线程：与登录态无关，退出登录后照样工作，
-    /// 所以"登出就提示断开"这类误报不会再出现。
-    /// 连续两次探测失败才判离线（登录瞬间一串请求挤在一起、服务端刚重启都可能让
-    /// 单次探测超时），一次成功即恢复。
+    // Start a persistent server reachability probing thread: independent of login state, it keeps working after logout,
+    // so false positives like "disconnected right after logout" will no longer appear.
+    // Two consecutive probing failures are needed to judge offline (a burst of requests at login instant, server just restarted can both cause
+    // a single probe to time out); one success means recovery.
     pub fn start_reachability_watch(&mut self) {
-        // 换服务器地址后要重新起一轮：旧线程探的是旧地址，留着就会把两条结论混着报
+        // After changing the server address, a new round must be started: the old thread probes the old address; keeping it would mix the two conclusions together
         if let Some(previous) = self.reachability_running.take() {
             previous.store(false, Ordering::Relaxed);
         }
@@ -7948,7 +7927,7 @@ impl App {
                 } else {
                     failed_in_a_row += 1;
                 }
-                // 首次成功、以及连续第二次失败才上报，中间的单次抖动不惊动界面
+                // Report on first success and on the second consecutive failure; a single intermediate jitter does not disturb the interface
                 if reachable || failed_in_a_row == 2 {
                     debug_log(&format!("服务端可达性探测: {reachable}"));
                     if sender
@@ -7963,14 +7942,14 @@ impl App {
         });
     }
 
-    /// 后台检查新版本：发现新版本就下载并校验，只有包真的取回本地才弹通知——
-    /// 通知一出现就意味着"现在 /update 可以立刻完成"，不会出现提示了却还要等下载。
-    /// 检查失败（无网络、发布页改版、本平台没有包）只记调试日志，不打扰用户。
+    // Background check for new versions: when a new version is found, download and verify; only pop a notification when the package is really retrieved locally —
+    // the notification appearing means "now /update can be done immediately"; there will be no situation where a prompt appears but you still have to wait for download.
+    // If the check fails (no network, release page redesigned, no package for this platform) just log a debug message, do not disturb the user.
     pub fn start_update_check_thread(&mut self, current_version: String) {
         let Some(sender) = self.polling_sender.clone() else {
             return;
         };
-        // 正在查就不再起第二个：/update 可以再按一次，两条线程同时下载同一个包没有意义
+        // If already checking, do not start a second one: /update can be pressed again; two threads downloading the same package simultaneously makes no sense
         if self
             .update_check_running
             .as_ref()
@@ -7981,7 +7960,7 @@ impl App {
         let running_flag = Arc::new(AtomicBool::new(true));
         self.update_check_running = Some(running_flag.clone());
         thread::spawn(move || {
-            match check_for_update(&current_version) {
+            match check_for_update(&current_version, ReleaseChannel::Terminal) {
                 UpdateCheck::Available(package) => {
                     debug_log(&format!("发现新版本 {}，开始下载", package.version));
                     match download_package(&package) {
@@ -8000,15 +7979,15 @@ impl App {
                 )),
                 UpdateCheck::Unavailable(reason) => debug_log(&format!("版本检查未完成: {reason}")),
             }
-            // 检查与下载都结束了才落标志，其间重复按 /update 不会派出第二个下载线程
+            // Only set the flag when both check and download are complete; repeatedly pressing /update during this time will not spawn a second download thread
             running_flag.store(false, Ordering::Relaxed);
         });
     }
 
-    /// 会话建立后要做的公共准备（正常登录、自动登录两条入口都走这里）：
-    /// 顶栏用户名、本地消息缓存目录、自己的头像。用户目录不在这里拉，
-    /// 它只在用户真的打出 "/profile " 时才取，登录瞬间不该为它翻页。
-    /// 用户名以登录响应为准；只有令牌没有响应的自动登录再按 UID 查一次资料。
+    // Common preparation after session establishment (both normal login and auto-login go through here):
+    // top bar username, local message cache directory, own avatar. The user directory is not fetched here,
+    /// it is only fetched when the user actually types "/profile ", and the login instant should not page for it.
+    /// Username is based on the login response; for auto-login with only a token and no response, look up the profile by UID once more.
     fn prepare_session_state(&mut self, known_username: Option<String>) {
         let user_id = match self.current_user_id.clone() {
             Some(user_id) => user_id,
@@ -8024,11 +8003,11 @@ impl App {
         }
         self.ensure_chat_cache();
         self.request_missing_avatars(std::slice::from_ref(&user_id));
-        // 预取注册用户目录：/profile 的参数补全要用它，等用户打出来再拉就总是慢一帧
+        // Pre-fetch the registered user directory: /profile parameter completion needs it; waiting until the user types it would always be one frame late
         self.ensure_registered_users_loaded();
     }
 
-    /// 为当前登录用户建立消息缓存目录（登录成功、自动登录后调用；未登录时保持无缓存）。
+    /// Establish a message cache directory for the current logged-in user (called after login success, auto-login; when not logged in, keep no cache).
     fn ensure_chat_cache(&mut self) {
         if self.chat_cache.is_some() {
             return;
@@ -8039,14 +8018,14 @@ impl App {
         self.chat_cache = ChatCache::open(&user_id);
     }
 
-    /// 取指定房间的加密标志：加密房间的消息一律不进本地缓存。
+    /// Get the encryption flag of the specified room: messages from encrypted rooms never enter local cache.
     fn room_is_encrypted(&self, room_id: &str) -> bool {
         self.rooms
             .iter()
             .any(|room| room.id == room_id && room.is_encrypted)
     }
 
-    /// 整房写入缓存（切房加载、触顶翻页、全量搜索之后）。加密房间直接跳过。
+    /// Write the whole room to cache (after room-switch loading, top-reached paging, full search). Encrypted rooms are skipped directly.
     fn cache_loaded_messages(&self, room_id: &str) {
         if room_id.is_empty() || self.room_is_encrypted(room_id) {
             return;
@@ -8054,8 +8033,8 @@ impl App {
         let Some(cache) = &self.chat_cache else {
             return;
         };
-        // 内存里的列表必须确实是这个房间的才落盘：切换房间的瞬间 messages 可能还是
-        // 上一个房间的内容，写错房间会把别人的历史混进这个文件
+        // The in-memory list must truly be this room before writing to disk: at the moment of room switch messages might still be
+        // The content of the previous room, choosing the wrong room would mix someone else's history into this file
         let belongs_to_room = self
             .messages
             .last()
@@ -8071,15 +8050,15 @@ impl App {
         );
     }
 
-    /// 标记"当前房间消息列表比磁盘新"，交给 handle_tick 批量落盘。
-    /// 逐条到达就写一次文件会在活跃群里造成无谓的整文件重写。
+    /// Mark "current room message list is newer than disk", delegate to handle_tick for batch disk write.
+    /// Writing the file once per message arrival would cause unnecessary full-file rewrites in active groups.
     fn mark_messages_dirty(&mut self) {
         if self.cache_pending_flush_since.is_none() {
             self.cache_pending_flush_since = Some(Instant::now());
         }
     }
 
-    /// 脏标记超过一个批量窗口后落盘（主循环每轮调用，本身不产生网络请求）。
+    /// Write to disk after the dirty flag exceeds one batch window (the main loop calls this each round, it does not itself generate network requests).
     fn flush_pending_message_cache(&mut self) {
         let Some(dirty_since) = self.cache_pending_flush_since else {
             return;
@@ -8094,9 +8073,9 @@ impl App {
         }
     }
 
-    /// 为这批用户补齐头像：本地已有结论（包括"确实没有头像"）的跳过，
-    /// 其余交给后台线程按资料接口取回图片字节，取回后经 AvatarLoaded 交回主线程。
-    /// 渲染期绝不做网络请求，这里只登记待取与派生活。
+    // Complete avatars for this batch of users: skip those with existing conclusions (including "definitely no avatar"),
+    /// The rest is delegated to the background thread to fetch image bytes via the profile API; after fetching, handed back to the main thread via AvatarLoaded.
+    /// Absolutely no network requests during rendering; here only register pending fetches and dispatch work.
     fn request_missing_avatars(&mut self, user_ids: &[String]) {
         let Some(sender) = self.polling_sender.clone() else {
             return;
@@ -8106,7 +8085,7 @@ impl App {
             if user_id.is_empty() || self.avatar_images.contains_key(user_id) {
                 continue;
             }
-            // 先占位登记，避免同一批用户在下一帧又被判定为缺失而重复发请求
+            // Register the placeholder first to avoid the same batch of users being judged missing again next frame and sending duplicate requests
             self.avatar_images.insert(user_id.clone(), None);
             missing.push(user_id.clone());
         }
@@ -8116,7 +8095,7 @@ impl App {
         let connector = self.connector.clone();
         thread::spawn(move || {
             for user_id in missing {
-                let image_bytes = load_cached_avatar(&user_id).or_else(|| {
+                let image_bytes = config::load_cached_avatar(&user_id).or_else(|| {
                     let bytes = connector
                         .get_user_profile(&user_id)
                         .ok()
@@ -8126,7 +8105,7 @@ impl App {
                         .and_then(|avatar_path| {
                             connector.fetch_static_resource(&avatar_path).ok()
                         })?;
-                    store_cached_avatar(&user_id, &bytes);
+                    config::store_cached_avatar(&user_id, &bytes);
                     Some(bytes)
                 });
                 let _ = sender.send(PollingEvent::AvatarLoaded((user_id, image_bytes)));
@@ -8134,8 +8113,8 @@ impl App {
         });
     }
 
-    /// 取某用户在指定尺寸下的头像像素块（首次用到该尺寸时按已取回的字节解码一次）。
-    /// 没有头像、或字节不是可解码的图片时返回 None，由调用方退回占位显示。
+    /// Get the avatar pixel block for a user at a specified size (decoded once from the fetched bytes when that size is first needed).
+    /// Return None when there is no avatar, or the bytes are not a decodable image; the caller falls back to placeholder display.
     fn avatar_pixels_at(
         &mut self,
         user_id: &str,
@@ -8152,14 +8131,14 @@ impl App {
         Some(pixels)
     }
 
-    /// 打开通用表单浮层（设置个人资料、修改密码、修改头像、注销账户共用渲染与按键处理）。
+    /// Open the generic form overlay (shared rendering and key handling for set profile, change password, change avatar, delete account).
     fn open_form(&mut self, action: FormAction, fields: Vec<FormField>) {
         self.active_form = Some((action, fields));
         self.displaying_overlay = DisplayingOverlay::Form;
         self.focus_index = 0;
     }
 
-    /// 提交当前表单：按表单动作分派到对应的服务端接口，成功后关闭浮层。
+    /// Submit the current form: dispatch the form action to the corresponding server interface, close the overlay on success.
     fn submit_active_form(&mut self) {
         let Some((action, fields)) = self.active_form.clone() else {
             return;
@@ -8172,7 +8151,7 @@ impl App {
         }
     }
 
-    /// 在当前表单的输入项之间循环移动焦点
+    /// Cycle focus among the input items of the current form
     fn cycle_form_focus(&mut self, to_previous: bool) {
         let field_count = self
             .active_form
@@ -8189,14 +8168,14 @@ impl App {
         };
     }
 
-    /// 关闭表单浮层并退回设置菜单
+    /// Close the form overlay and return to the settings menu
     fn close_form(&mut self) {
         self.active_form = None;
         self.dismiss_overlay_back();
     }
 
-    /// 设置个人资料：昵称、手机号、简介。输入框留空表示清空该项（服务端按显式 null 处理），
-    /// 未改动时提交原值即可，界面不引入"是否改动过"的额外状态。
+    /// Update profile: nickname, phone number, bio. Leave the input box empty to mean clear this item (the server processes as explicit null),
+    /// when unchanged, just submit the original value; the interface introduces no extra state for "whether it was changed".
     fn submit_profile_update(&mut self, fields: &[FormField]) {
         let text_of = |index: usize| fields.get(index).map(FormField::text).unwrap_or_default();
         let payload = ProfileUpdatePayload {
@@ -8222,8 +8201,8 @@ impl App {
         }
     }
 
-    /// 修改密码：旧密码、新密码、新密码确认。
-    /// 服务端改密会同步作废此前签发的全部令牌，因此成功后必须清掉本地会话重新登录。
+    /// Change password: old password, new password, confirm new password。
+    /// The server password change invalidates all previously issued tokens, so after success the local session must be cleared and the user must re-login.
     fn submit_password_change(&mut self, fields: &[FormField]) {
         let text_of = |index: usize| fields.get(index).map(FormField::text).unwrap_or_default();
         let old_password = text_of(0);
@@ -8254,8 +8233,8 @@ impl App {
         }
     }
 
-    /// 修改头像：填完整链接走资料接口，填本地图片路径走头像上传接口（服务端只收
-    /// JPEG/PNG/GIF/WebP，大小受服务端配置限制）。
+    /// Change avatar: full link goes to the profile API, local image path goes to the avatar upload API (the server only accepts
+    /// JPEG/PNG/GIF/WebP; sizes limited by server configuration).
     fn submit_avatar_change(&mut self, fields: &[FormField]) {
         let Some(input) = fields.first().map(FormField::text) else {
             return;
@@ -8265,7 +8244,7 @@ impl App {
             self.push_error(self.t("error_avatar_input_empty"));
             return;
         }
-        // 填完整链接走资料接口，其余按本地图片文件走头像上传接口
+        // Full link goes to the profile API, the rest goes to the avatar upload API based on the local image file
         if input.starts_with("http://") || input.starts_with("https://") {
             let payload = ProfileUpdatePayload {
                 avatar: Some(Some(input)),
@@ -8279,21 +8258,21 @@ impl App {
             }
             return;
         }
-        // 填的是本地路径：与列表选择走同一条上传路（读不到的文案也共用）
+        // The path entered is local: follows the same upload route as list selection (the unreadable text is also shared)
         self.upload_local_avatar(&PathBuf::from(&input));
     }
 
-    /// 头像换好了：先废掉自己的旧头像字节（内存与磁盘），再记下服务端返回的完整资料。
-    /// 磁盘那份必须删：`request_missing_avatars` 的后台线程先读盘再请求，
-    /// 留着就会永远显示第一次缓存下来的那张 —— 换成 URL 头像也一样。
+    // Avatar replaced: first invalidate the old avatar bytes (memory and disk), then record the complete info returned by the server.
+    /// The disk copy must be deleted: the `request_missing_avatars` background thread reads from disk first then requests,
+    /// keeping it would always show the first cached one — same for URL avatars.
     fn finish_avatar_change(&mut self, user: &UserInfo) {
-        drop_cached_avatar(&user.id);
+        config::drop_cached_avatar(&user.id);
         self.remember_own_profile(user);
         self.close_form();
         self.push_notification(self.t("avatar_updated"));
     }
 
-    /// 注销账户：再输入一次密码。成功后清空本地一切残留（会话、缓存、头像）。
+    /// Delete account: enter password again. After success, clear all local residue (session, cache, avatar).
     fn submit_account_deletion(&mut self, fields: &[FormField]) {
         let Some(password) = fields.first().map(FormField::text) else {
             return;
@@ -8325,9 +8304,9 @@ impl App {
         }
     }
 
-    /// 服务端返回的完整用户对象落到本地：顶栏用户名与自己头像的显示都取自它。
-    /// 头像可能刚被改掉，因此丢掉自己的旧头像结果重新按资料接口取一次，
-    /// 否则界面上还会继续显示上一张。
+    // The complete user object returned by the server lands locally; the top bar username and own avatar display both take from it.
+    /// The avatar may have just been changed, so discard the old avatar result and refetch via the profile API,
+    /// otherwise the interface would keep displaying the previous one.
     fn remember_own_profile(&mut self, user: &UserInfo) {
         self.current_username = user.username.clone();
         self.own_contact = Some((
@@ -8341,7 +8320,7 @@ impl App {
         self.request_missing_avatars(std::slice::from_ref(&own_user_id));
     }
 
-    /// /profile [用户名或 UID]：无参看自己，有参看指定用户，以卡片浮层展示（含头像）。
+    /// /profile [username or UID]: no parameter shows yourself, parameter shows the specified user, displayed as a card overlay (with avatar).
     fn show_profile_card(&mut self, user_key: Option<&str>) {
         let lookup_key = match user_key {
             Some(key) if !key.is_empty() => key.to_string(),
@@ -8355,7 +8334,7 @@ impl App {
         };
         match self.connector.get_user_profile(&lookup_key) {
             Ok(profile) => {
-                // 卡片上的头像是大图，尺寸与消息区不同，需要单独取一次字节并按大尺寸解码
+                // The avatar on the card is a large image; the size differs from the message area, so it needs a separate byte fetch and decoding at the large size
                 self.avatar_images.remove(&profile.id);
                 self.request_missing_avatars(std::slice::from_ref(&profile.id));
                 self.profile_view = Some(profile);
@@ -8367,13 +8346,13 @@ impl App {
         }
     }
 
-    /// 确保用户目录已在后台发起拉取：只在从没拉过时派生活，之后无论成功失败都不再重复请求。
-    /// 由"打出 /profile 加空格"这次按键触发，补全面板首帧可能还是空的，取回后自动填上。
+    /// Ensure the user directory has been dispatched to fetch in the background: only dispatch when never fetched before; after that, do not repeat the request whether it succeeds or fails.
+    /// Triggered by the keypress of typing "/profile " with a space; the profile panel first frame may still be empty, and it fills in automatically after the fetch.
     fn ensure_registered_users_loaded(&mut self) {
         if self.registered_users.is_some() {
             return;
         }
-        // 先占位再拉取，避免同一帧之后再次进入本方法重复派线程
+        // Place first then fetch, to avoid entering this method again after the same frame and re-spawning threads
         self.registered_users = Some(Vec::new());
         let Some(sender) = self.polling_sender.clone() else {
             return;
@@ -8387,7 +8366,7 @@ impl App {
         });
     }
 
-    /// /list_users：列出服务端全部注册用户（用户名与 UID 同行显示）。
+    /// /list_users: list all registered users on the server (username and UID displayed on the same row).
     fn show_registered_users(&mut self) {
         match self.connector.list_all_users() {
             Ok(users) => {
@@ -8411,7 +8390,7 @@ impl App {
         }
     }
 
-    /// /search_users <关键字>：按用户名子串或 UID 精确查用户。
+    /// /search_users <keyword>: search users by username substring or UID exact match.
     fn search_registered_users(&mut self, keyword: &str) {
         if keyword.is_empty() {
             self.push_notification(self.t("search_users_usage"));
@@ -8443,8 +8422,8 @@ impl App {
         }
     }
 
-    /// 私聊管理浮层里的全部条目：(是否自己发出的, 请求条目)。收到的在前、发出的在后，
-    /// 上下键在两个区之间连续移动，因此渲染与按键都用同一份扁平序列定位选中项。
+    /// All entries in the private chat management overlay: (is_self_sent, request_entry). Received first, sent second,
+    /// Arrow keys move continuously between the two areas, so rendering and key handling both use the same flat sequence to locate the selection.
     fn request_entries(&self) -> Vec<(bool, RoomRequestInfo)> {
         let mut entries: Vec<(bool, RoomRequestInfo)> = self
             .pending_requests
@@ -8459,8 +8438,8 @@ impl App {
         entries
     }
 
-    /// 服务端不为"请求被处理"广播事件，只能从"我发出的请求"的状态变化里看出来：
-    /// 上一轮还是待处理、这一轮变成已拒绝的，给发出者补一条通知。
+    /// The server does not broadcast an event for "request processed"; it can only be seen from the status change of "requests I sent":
+    /// last round was pending, this round became rejected — give the sender an additional notification.
     fn announce_declined_invitations(&mut self, latest: &[RoomRequestInfo]) {
         let mut notices: Vec<String> = Vec::new();
         for previous in &self.sent_requests {
@@ -8488,7 +8467,7 @@ impl App {
         }
     }
 
-    /// 撤回自己发出的私聊请求：服务端把请求置为 cancelled，对方不会再看到它。
+    /// Revoke a private chat request you sent: the server sets the request to cancelled, and the peer will no longer see it.
     fn cancel_sent_request(&mut self, request_id: &str) {
         match self.connector.cancel_room_request(request_id) {
             Ok(_) => {
@@ -8512,11 +8491,11 @@ impl App {
         }
     }
 
-    /// /update 与设置项"更新客户端"：用已下载并校验过的更新包安排替换，本进程随后退出，
-    /// 让位给安装进程。安装进程会等本进程号消失再动文件，避免 Windows 上
-    /// "正被占用的可执行文件无法覆盖"。
-    /// 包还没回来时不能在这里同步下载——下载要占满整个界面线程，
-    /// 所以改成再补派一次后台检查，取回后照常弹通知，用户稍后再执行即可。
+    // /update: for the settings item "update client", arrange replacement with the already-downloaded and verified update package, this process exits subsequently,
+    // yielding to the installation process. The installation process waits for this process number to disappear before touching files, avoiding on Windows
+    // "the executable file being occupied cannot be overwritten".
+    /// Cannot do a synchronous download here while the package has not arrived — downloading would occupy the entire interface thread,
+    /// so instead dispatch one more background check; after retrieval, pop the notification as normal and the user can execute later.
     fn start_downloaded_update(&mut self) -> bool {
         let Some((version, archive_path)) = self.pending_update.clone() else {
             self.start_update_check_thread(Self::client_version());
@@ -8530,23 +8509,23 @@ impl App {
                 return false;
             }
         };
-        if let Err(error) = crate::installer::extract_archive(&archive_path, &staged_directory) {
+        if let Err(error) = installer::extract_archive(&archive_path, &staged_directory) {
             self.push_error(format!(
                 "{}: {error}",
                 self.t("error_update_extract_failed")
             ));
             return false;
         }
-        let Some(prefix) = crate::installer::current_prefix() else {
+        let Some(prefix) = installer::current_prefix() else {
             self.push_error(self.t("error_update_prefix_unavailable"));
             return false;
         };
-        let request = crate::installer::InstallRequest {
+        let request = installer::InstallRequest {
             source_directory: staged_directory,
             prefix,
             wait_for_process: Some(std::process::id()),
         };
-        match crate::installer::spawn_detached_installer(&request) {
+        match installer::spawn_detached_installer(&request) {
             Ok(()) => {
                 self.update_handoff_requested = true;
                 true
@@ -8558,14 +8537,14 @@ impl App {
         }
     }
 
-    /// 主循环退出判定：/update 已把安装进程挂起，本进程要立即让位
+    // Main loop exit condition: /update has hung the installation process, this process must immediately yield
     pub fn should_exit_for_update(&self) -> bool {
         self.update_handoff_requested
     }
 }
 
-/// 资料字段取值：有内容就按新值写入，留空则这一项不进请求体（服务端语义是"缺省=保持原值"）。
-/// 表单打开时已把服务端现值预填进来，所以"不改"就是"原样提交"，不需要额外的清空写法。
+/// Profile field value: if there is content, write the new value; if empty, this item does not enter the request body (server semantics is "default = keep original value").
+/// The form is pre-filled with the current server values when opened, so "unchanged" means "submit as-is"; no extra clearing logic is needed.
 fn profile_field_value(text: &str) -> Option<Option<String>> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -8575,9 +8554,9 @@ fn profile_field_value(text: &str) -> Option<Option<String>> {
     }
 }
 
-/// 读本地图片文件用于上传：只认服务端接受的四种格式，其余返回 None 由调用方提示用户。
-/// 服务端另有自己的大小上限（默认 2 MB，可配置），这里只挡明显离谱的体积，
-/// 免得用户误填一个几百兆的文件时整份读进内存；真正的限额交给服务端回答。
+/// Read local image file for upload: only recognize the four formats the server accepts; return None for the rest, the caller prompts the user.
+/// The server has its own size limit (default 2 MB, configurable); here only block obviously ridiculous sizes,
+/// so the user does not accidentally read an entire multi-hundred-megabyte file into memory; the real limit is answered by the server.
 fn read_local_image(path: &std::path::Path) -> Option<(String, String, Vec<u8>)> {
     let content_type = image_content_type_of(path)?;
     if fs::metadata(path)
@@ -8591,8 +8570,8 @@ fn read_local_image(path: &std::path::Path) -> Option<(String, String, Vec<u8>)>
     Some((file_name, content_type.to_string(), bytes))
 }
 
-/// 服务端接受的四类图片格式 → multipart 里的 CONTENT_TYPE。
-/// 目录列表与上传共用这一处判定，列出来能选的就一定能传。
+/// The four image formats the server accepts → CONTENT_TYPE in multipart.
+/// Directory listing and upload share this one judgment; anything listed as selectable can definitely be uploaded.
 fn image_content_type_of(path: &std::path::Path) -> Option<&'static str> {
     match path
         .extension()
@@ -8609,16 +8588,16 @@ fn image_content_type_of(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-/// 用户自备头像的目录：不存在就建出来，用户照着这个路径放图片即可。
-/// 启动时与每次进入头像浮层时各保证一次，渲染路径不碰磁盘创建。
+/// Directory for user-supplied avatars: create it if it does not exist; the user places images following this path.
+/// Guaranteed once at startup and every time the avatar overlay is entered; the render path does not touch disk creation.
 pub(crate) fn ensure_avatar_source_directory() {
     if let Some(directory) = baihua_core::paths::avatar_source_directory() {
         let _ = fs::create_dir_all(directory);
     }
 }
 
-/// 头像目录里可选的图片，元素为 (展示用的文件名, 上传用的完整路径)，按文件名排序。
-/// 目录读不到或没有图片时返回空表，由调用方退回填链接的表单。
+/// Selectable images in the avatar directory; elements are (display file name, upload full path), sorted by file name.
+/// Directory read fails or has no images: return an empty table, the caller falls back to the link input form.
 fn local_avatar_files() -> Vec<(String, PathBuf)> {
     match baihua_core::paths::avatar_source_directory() {
         Some(directory) => avatar_files_in(&directory),
@@ -8626,8 +8605,8 @@ fn local_avatar_files() -> Vec<(String, PathBuf)> {
     }
 }
 
-/// 列出指定目录里的可上传图片。格式判定与上传共用 `image_content_type_of`，
-/// 列出来能被选中的文件就一定传得上去；子目录与读不到的条目直接跳过。
+/// List uploadable images in the specified directory. Format judgment and upload share `image_content_type_of`,
+/// files listed as selectable can definitely be uploaded; subdirectories and unreadable entries are skipped directly.
 fn avatar_files_in(directory: &std::path::Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
@@ -8647,10 +8626,10 @@ fn avatar_files_in(directory: &std::path::Path) -> Vec<(String, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 父模块的 use 不会对子模块可见，测试里的假服务端需要自己引入读写 trait
+    // The parent module's `use` is not visible to the submodule; the fake server in tests needs to import the read/write traits itself
     use std::io::{Read, Write};
 
-    /// 把带样式片段渲染成的行还原成纯文本，便于断言折行与切分结果
+    /// Restore the rows rendered from styled fragments to plain text, to assert wrapping and splitting results
     fn line_text(line: &Line) -> String {
         line.spans
             .iter()
@@ -8668,19 +8647,19 @@ mod tests {
             find_keyword_positions("Baihua CHAT chat", "chat"),
             vec![(7usize, 11usize), (12usize, 16usize)]
         );
-        // 中文关键词按字符下标返回，不受 UTF-8 字节长度影响
+        // Chinese keywords return by character index, unaffected by UTF-8 byte length
         assert_eq!(
             find_keyword_positions("你好，世界。世界！", "世界"),
             vec![(3usize, 5usize), (6usize, 8usize)]
         );
-        // 空关键词与超长关键词都不应当命中，避免整屏高亮
+        // Empty keywords and overly long keywords should not match, to avoid highlighting the whole screen
         assert!(find_keyword_positions("abc", "").is_empty());
         assert!(find_keyword_positions("ab", "abc").is_empty());
     }
 
     #[test]
     fn keyword_positions_skip_overlapping_matches() {
-        // "aa" 在 "aaaa" 中命中两次而非三次：命中后跳过整段
+        // "aa" matches twice rather than three times in "aaaa": skip the whole segment after a match
         assert_eq!(
             find_keyword_positions("aaaa", "aa"),
             vec![(0usize, 2usize), (2usize, 4usize)]
@@ -8697,7 +8676,7 @@ mod tests {
         assert_eq!(segments[0].1, body_style);
         assert_eq!(segments[1].1, matched_style);
         assert_eq!(segments[2].1, body_style);
-        // 无命中时整行作为单个正文片段返回
+        // When no match, return the whole row as a single text fragment
         let untouched = split_line_by_keyword("nothing", "zz", body_style, matched_style);
         assert_eq!(untouched.len(), 1);
         assert_eq!(untouched[0].0, "nothing");
@@ -8708,13 +8687,13 @@ mod tests {
     fn wrapping_keeps_highlight_across_line_breaks() {
         let body_style = Style::default().fg(Color::White);
         let matched_style = Style::default().bg(Color::Red);
-        // 关键词恰好落在折行边界上，命中样式必须跟着被切断的后半段续到下一行
+        // When the keyword lands exactly on a wrapping boundary, the highlight style must continue on the next line following the cut-back half
         let segments = split_line_by_keyword("aaaBB", "BB", body_style, matched_style);
         let lines = wrap_styled_segments(&segments, 4);
         assert_eq!(lines.len(), 2);
         assert_eq!(line_text(&lines[0]), "aaaB");
         assert_eq!(line_text(&lines[1]), "B");
-        // 第二行唯一的片段就是命中样式，说明高亮没有在折行时丢失
+        // The only fragment on the second row is the highlight style, indicating the highlight was not lost during wrapping
         assert_eq!(lines[1].spans.len(), 1);
         assert_eq!(lines[1].spans[0].style, matched_style);
         assert_eq!(lines[0].spans[0].style, body_style);
@@ -8723,12 +8702,12 @@ mod tests {
     #[test]
     fn wrapping_respects_display_width_for_wide_characters() {
         let segments = vec![("你好世界".to_string(), Style::default())];
-        // 每个汉字两列，宽度 4 只放得下两个字
+        // Each Chinese character takes two columns; width 4 can only fit two characters
         let lines = wrap_styled_segments(&segments, 4);
         assert_eq!(lines.len(), 2);
         assert_eq!(line_text(&lines[0]), "你好");
         assert_eq!(line_text(&lines[1]), "世界");
-        // 空输入也要产出一行，避免 Paragraph 少一行导致滚动位置错位
+        // Empty input also produces a row, to avoid Paragraph having one fewer row and causing scroll position misalignment
         assert_eq!(wrap_styled_segments(&[], 10).len(), 1);
     }
 
@@ -8750,7 +8729,7 @@ mod tests {
             parse_theme_color(&serde_json::json!([24, 26, 31])),
             Some(Color::Rgb(24, 26, 31))
         );
-        // 非法写法一律返回 None，由调用方按缺字段标记，绝不猜测近似色
+        // Illegal formats all return None; the caller marks missing fields; never guess approximate colors
         assert_eq!(parse_theme_color(&serde_json::json!("#fff")), None);
         assert_eq!(parse_theme_color(&serde_json::json!("notacolor")), None);
         assert_eq!(parse_theme_color(&serde_json::json!(12)), None);
@@ -8770,7 +8749,7 @@ mod tests {
 
     #[test]
     fn every_shipped_theme_is_field_complete_and_well_formatted() {
-        // 仓库自带的每个主题文件都必须字段齐全且无多余键，否则说明主题规范与代码脱节
+        // Every theme file shipped with the repository must have complete fields and no extra keys, otherwise it indicates the theme spec is disconnected from the code
         let names = Appearance::available_names();
         assert!(!names.is_empty(), "config/themes 下应至少有一个外观文件");
         for name in names {
@@ -8784,7 +8763,7 @@ mod tests {
                 "config/themes/{name}.json 含未知字段: {extra_fields:?}"
             );
         }
-        // default.json 是内置配色的镜像，两者不允许漂移
+        // default.json is a mirror of the built-in colors; the two must not drift
         let (default_appearance, _, _) = Appearance::load("default");
         assert_eq!(default_appearance, Appearance::built_in());
     }
@@ -8798,15 +8777,15 @@ mod tests {
         assert_eq!(appearance.room_border, Appearance::built_in().room_border);
     }
 
-    /// 构造一个可直接渲染的聊天页应用：加载仓库真实的语言文件与指定外观，
-    /// 写入一间群聊与两条消息，并保证渲染路径不会触发任何网络请求。
+    /// Construct a renderable chat page app: load the repository's real language files and specified appearance,
+    /// write one group chat and two messages, and guarantee the render path does not trigger any network requests.
     fn chat_page_app_for_render(appearance_name: &str) -> App {
         let mut app = App::default();
         app.load_language("zh-CN");
         let (appearance, _, _) = Appearance::load(appearance_name);
         app.appearance = appearance;
         app.appearance_name = appearance_name.to_string();
-        // 有 token 才算已登录，否则消息区会被"未登录"提示整体覆盖，断言不到消息样式
+        // Having a token counts as logged in; otherwise the message area would be entirely covered by the "not logged in" prompt, and message styles cannot be asserted
         app.connector.set_token("test-token");
         app.connector.set_base_url("http://localhost:1");
         app.current_user_id = Some("user-self".to_string());
@@ -8844,7 +8823,7 @@ mod tests {
     #[test]
     fn status_bar_shows_connection_user_and_versions_with_documented_omissions() {
         let mut app = chat_page_app_for_render("default");
-        // 未探测过连接状态：按离线画空心点，且不显示服务端版本
+        // Connection status not probed: draw a hollow dot as offline, and do not show the server version
         let (connection_label, mark, user_text, right) = app.status_bar_texts();
         assert_eq!(mark, "○");
         assert_eq!(connection_label, app.t("bar_connection"));
@@ -8853,13 +8832,13 @@ mod tests {
         assert!(right.contains(&app.t("bar_client_version")));
         assert!(right.contains(&App::client_version()));
 
-        // 连上但未探测到版本串：仍然不显示服务端版本
+        // Connected but version string not probed: still do not show the server version
         app.connection_ready = Some(true);
         let (_, online_mark, _, right_without_version) = app.status_bar_texts();
         assert_eq!(online_mark, "●");
         assert!(!right_without_version.contains(&app.t("bar_server_version")));
 
-        // 登录后显示当前用户名，且标记仍夹在"连接"与用户名之间（顶栏顺序即语义顺序）
+        // After login, show the current username, and the marker is still between "connected" and the username (the top bar order is the semantic order)
         app.current_username = "alice".to_string();
         let (label, mark, user_text, _) = app.status_bar_texts();
         assert_eq!(label, app.t("bar_connection"));
@@ -8882,7 +8861,7 @@ mod tests {
         let mut app = chat_page_app_for_render("default");
         app.input_collector.message_input_state.set_text("#hello");
         app.search_result = Some(("hello".to_string(), vec!["message-1".to_string()], 0));
-        // 用退格删掉一个字母：结果不再成立，命中列表与定位一起清掉
+        // Delete a letter with backspace: the result is no longer valid, the match list and positioning are both cleared
         app.input_collector.message_input_state.set_text("#hell");
         app.handle_message_input_changed();
         assert!(
@@ -8890,7 +8869,7 @@ mod tests {
             "改动关键词后应丢弃上次搜索结果"
         );
         assert!(app.pending_scroll_message_id.is_none());
-        // 标题回到"搜索模式"，既不显示旧进度也不显示"未找到"
+        // The title returns to "search mode", showing neither old progress nor "not found"
         let (title, _) = app.message_input_title();
         let rendered = title
             .spans
@@ -8921,7 +8900,7 @@ mod tests {
     #[test]
     fn notification_panel_clips_to_screen_instead_of_vanishing() {
         let mut app = chat_page_app_for_render("default");
-        // 十条六十列长文本，在小屏幕上按旧算法高度会算超屏幕而整条不画
+        // Ten items of 60-column text; on small screens the old algorithm would calculate a height exceeding the screen, causing the whole item to not be drawn
         let long_body = (0..10)
             .map(|index| format!("{index} 一六〇列宽的长文本占位。").repeat(4))
             .collect::<Vec<String>>()
@@ -8965,7 +8944,7 @@ mod tests {
             delete_entry.2,
             SettingsAction::OpenForm(FormAction::DeleteAccount)
         );
-        // 每一项都要有标签：分派直接读这张表，不再有需要对齐的索引常量
+        // Every item needs a label: dispatch reads directly from this table; there are no longer any index constants needing alignment
         assert!(
             entries.iter().all(|(label, _, _)| !label.trim().is_empty()),
             "菜单项标签不该为空"
@@ -9008,14 +8987,14 @@ mod tests {
         assert!(buffer_contains(&buffer, &app.t("request_section_sent")));
         assert!(buffer_contains(&buffer, "carol"));
         assert!(buffer_contains(&buffer, &app.t("request_status_accepted")));
-        // 扁平序列把收到的排在前面，撤回与拒绝按所在区分别是不同动作
+        // The flat sequence places received first; revoke and reject are different actions based on their area
         let entries = app.request_entries();
         assert_eq!(entries.len(), 2);
         assert!(!entries[0].0);
         assert!(entries[1].0);
     }
 
-    /// 构造一条私聊请求条目，状态与收发方向可按用例填。
+    /// Construct a private chat request entry, status and send/receive direction can be filled per test case.
     fn invitation_with_status(id: &str, status: Option<&str>) -> RoomRequestInfo {
         RoomRequestInfo {
             id: id.to_string(),
@@ -9039,7 +9018,7 @@ mod tests {
     #[test]
     fn settings_badge_counts_only_invitations_still_pending() {
         let mut app = chat_page_app_for_render("default");
-        // 收到的条目接口只给待处理的，全部计数；自己发出的要按状态筛
+        // Received items are only given as pending, all counted; those sent by self are filtered by status
         app.pending_requests = vec![
             invitation_with_status("received-1", Some("pending")),
             invitation_with_status("received-2", Some("pending")),
@@ -9084,14 +9063,14 @@ mod tests {
     fn acting_on_an_invitation_keeps_it_in_the_received_history() {
         let mut app = chat_page_app_for_render("default");
         app.pending_requests = vec![
-            // 服务端"收到的请求"列表不给状态字段，这里按接口原样留 None
+            // The server's "received requests" list does not give a status field; here leave None as the API returns it
             invitation_with_status("received-1", None),
             invitation_with_status("received-2", None),
         ];
         app.sent_requests = vec![invitation_with_status("sent-1", Some("pending"))];
         app.request_list_state.select(Some(0));
-        // 处理完只做本地乐观更新（不再补发一次列表请求与轮询抢着写同一张列表），
-        // 且条目必须留在"收到的"区里：服务端下一次就再也回不到它了
+        // After processing, only do a local optimistic update (no longer re-send a list request and poll racing to write the same list),
+        // and the entry must stay in the "received" area: the server won't be able to return it next time either
         app.mark_pending_request_handled("received-1", "accepted");
         assert_eq!(
             app.pending_requests.len(),
@@ -9117,12 +9096,12 @@ mod tests {
     #[test]
     fn polled_received_requests_keep_locally_handled_history() {
         let mut app = chat_page_app_for_render("default");
-        // 本地历史：一条仍在等、一条已接受
+        // Local history: one still waiting, one already accepted
         app.pending_requests = vec![
             invitation_with_status("waiting", None),
             invitation_with_status("handled", Some("accepted")),
         ];
-        // 轮询带回的列表只会是服务端仍是 pending 的行（已处理的那条不在其中）
+        // The list brought back by polling will only be rows the server still has as pending (the processed one is not in it)
         app.apply_received_requests(vec![
             invitation_with_status("waiting", None),
             invitation_with_status("newly-arrived", None),
@@ -9141,13 +9120,13 @@ mod tests {
             Some("accepted"),
             "合并轮询结果时不能把本端记的结果状态冲掉"
         );
-        // 同一条目同时出现在两份来源里时以服务端为准，不重复列两遍
+        // When the same entry appears in both sources, the server's version takes precedence; do not list it twice
         app.apply_received_requests(vec![invitation_with_status("handled", None)]);
         assert_eq!(app.pending_requests.len(), 1);
     }
 
-    /// 只取面板矩形内部的文本（去掉边框字符与空白）逐行拼接。
-    /// 折行后的文案跨多行，只有把范围限制在面板列区间里才能整段连续比对。
+    /// Only take the text inside the panel rectangle (removing border characters and whitespace) and concatenate row by row.
+    /// The wrapped text spans multiple rows; only by restricting the range to the panel column interval can it be compared as a continuous segment.
     fn panel_body_text(buffer: &ratatui::buffer::Buffer, panel_rect: Rect) -> String {
         let border_characters = ['─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼'];
         let mut text = String::new();
@@ -9176,8 +9155,8 @@ mod tests {
         app.displaying_overlay = DisplayingOverlay::SettingsMenu;
         app.menu_list_state.select(Some(0));
         let buffer = render_snapshot(&mut app, 26, 64);
-        // 面板矩形用生产代码同一个算法算，才能只取面板内的列区间：
-        // 整行拼接会把面板两侧的聊天页文字混进来，折行的条目因此永远比对不上
+        // The panel rectangle is calculated with the same algorithm as production code, so only the column interval within the panel can be taken:
+        // Concatenating the whole row would mix in the chat page text from both sides of the panel, so wrapped entries can never match
         let (panel_rect, body_width) = overlay_list_panel(&labels, Rect::new(0, 1, 26, 63));
         assert!(panel_rect.width <= 26, "面板不该比屏幕还宽");
         let inside = panel_body_text(&buffer, panel_rect);
@@ -9194,7 +9173,7 @@ mod tests {
         );
     }
 
-    /// 取一段文案的尾巴若干字符（折行后尾行必须整段看得见，被裁掉时最先不见的就是尾巴）
+    /// Take several trailing characters of a text segment (after wrapping the tail row must be fully visible; what is clipped first is the tail)
     fn tail_of(text: &str, characters: usize) -> String {
         text.chars()
             .rev()
@@ -9208,7 +9187,7 @@ mod tests {
     #[test]
     fn english_requests_and_form_hints_wrap_on_a_narrow_panel() {
         let mut app = chat_page_app_for_render("default");
-        // 英文文案比中文长得多，窄面板上的裁切只在英文里才暴露，所以这一发用 en-US
+        // English text is much longer than Chinese; clipping on narrow panels only shows up in English, so this one uses en-US
         app.load_language("en-US");
         app.sent_requests = vec![invitation_with_status("sent-1", Some("accepted"))];
         app.displaying_overlay = DisplayingOverlay::PendingRequests;
@@ -9239,14 +9218,14 @@ mod tests {
         let mut app = chat_page_app_for_render("default");
         app.connection_ready = Some(true);
         app.current_username = "buitest13".to_string();
-        // 版本信息是次要的：一行放不下时让它先被裁，连接标记与当前用户必须留下
+        // Version info is secondary: when one row does not fit, let it be clipped first; the connection marker and current user must stay
         let buffer = render_snapshot(&mut app, 56, 20);
         assert!(buffer_contains(&buffer, "连接 ●"), "窄屏把连接标记挤掉了");
         assert!(
             buffer_contains(&buffer, &format!("当前用户 {}", app.current_username)),
             "窄屏把当前用户挤掉了"
         );
-        // 宽屏上两段都放得下，版本信息照旧完整（服务端版本没探测过，本来就不显示）
+        // On wide screens both fit, version info remains complete (server version was never probed, so it does not display anyway)
         let wide = render_snapshot(&mut app, 120, 20);
         assert!(buffer_contains(&wide, &app.t("bar_client_version")));
         assert!(buffer_contains(&wide, &App::client_version()));
@@ -9255,7 +9234,7 @@ mod tests {
 
     #[test]
     fn wrapped_hint_text_keeps_every_character_and_stays_within_width() {
-        // 表单浮层预留的高度就是这个函数的行数，所以"不丢字 + 每行不超宽"即等价于不裁切
+        // The height reserved for the form overlay is the number of rows of this function, so "no lost characters + no line exceeds width" is equivalent to no clipping
         let app = chat_page_app_for_render("default");
         let hint = app.t("form_profile_hint");
         let wrapped = wrapped_hint_text(&hint, Style::default(), 34);
@@ -9313,7 +9292,7 @@ mod tests {
                 .iter()
                 .any(|(text, _, _)| text == &app.t("error_not_logged_in"))
         );
-        // 本地显示开关与语言/外观不依赖登录态，仍要照常生效
+        // Local display switches and language/appearance do not depend on login state and should still take effect normally
         let toggle_index = app
             .settings_menu_entries()
             .iter()
@@ -9364,7 +9343,7 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, vec!["icon.webp", "me.png", "other.JPG"]);
-        // 每条都带回真实路径，回车上传用的就是它
+        // Each one returns a real path; that is what the Enter-to-upload uses
         let entries = avatar_files_in(&directory);
         assert!(entries.iter().all(|(_, path)| path.starts_with(&directory)));
         let _ = fs::remove_dir_all(&directory);
@@ -9393,17 +9372,17 @@ mod tests {
         assert_eq!(flattened, expected, "挤不下时说明要完整挪到下一行");
     }
 
-    /// 造一张纯色 PNG 的字节：卡片测试不依赖仓库里的素材文件
+    /// Create bytes for a solid-color PNG: card tests do not depend on asset files in the repository
     fn synthetic_avatar_png() -> Vec<u8> {
         let image_buffer = image::RgbaImage::from_pixel(64, 64, image::Rgba([220, 30, 30, 255]));
         let mut encoded = std::io::Cursor::new(Vec::new());
         image_buffer
             .write_to(&mut encoded, image::ImageFormat::Png)
-            .expect("测试图片应能编码");
+            .expect("Test image should be encodable");
         encoded.into_inner()
     }
 
-    /// 头像网格必须始终"列 = 2×行"（一格装上下两个像素），否则正方形源图会被压成矩形。
+    // The avatar grid must always have "columns = 2×rows" (one cell holds top and bottom pixels), otherwise the square source image will be squashed into a rectangle.
     #[test]
     fn avatar_grid_keeps_the_square_pixel_ratio_at_every_width() {
         for columns_available in [4u16, 7, 12, 20, 21, 32, 48] {
@@ -9420,7 +9399,7 @@ mod tests {
         }
     }
 
-    /// 卡片上真正画出来的像素块也要保持同一比例（宽度只算半块字符所在的列）
+    // The pixel block actually drawn on the card must also keep the same ratio (width only counts the column where the half-character sits)
     #[test]
     fn profile_card_paints_an_avatar_that_is_not_stretched() {
         let mut app = chat_page_app_for_render("default");
@@ -9513,19 +9492,69 @@ mod tests {
             !buffer_contains(&buffer, "hunter2"),
             "密码字段必须以遮蔽字符显示，不能把明文画到屏幕上"
         );
-        // 标签列宽取最宽标签，焦点标记只出现在当前项上
+        // Label column width takes the widest label; the focus marker only appears on the current item
         assert!(buffer_contains(&buffer, &app.t("form_password_hint")));
     }
 
     #[test]
     fn profile_field_value_skips_empty_and_writes_the_rest() {
-        // 留空 = 这一项不进请求体（服务端语义是保持原值），有内容就按新值写入。
-        // 单个减号已不再有特殊含义，就是一个普通值
+        // Leave empty = this item does not enter the request body (server semantics is keep original value); if there is content, write the new value.
+        // A single minus sign no longer has special meaning; it is just an ordinary value
         assert_eq!(profile_field_value("   "), None);
         assert_eq!(profile_field_value("-"), Some(Some("-".to_string())));
         assert_eq!(
             profile_field_value("  新昵称  "),
             Some(Some("新昵称".to_string()))
+        );
+    }
+
+    #[test]
+    fn reloading_keeps_this_rooms_plaintext_and_drops_another_rooms_messages() {
+        let mut app = chat_page_app_for_render("default");
+        // The base URL points at a closed port: fetching the server page fails, which is exactly the branch that keeps
+        // whatever the local side already holds (the branch a live server would cover by returning an empty history body).
+        app.rooms.push(RoomInfo {
+            id: "room-secret".to_string(),
+            name: None,
+            is_group: false,
+            created_by: "user-self".to_string(),
+            members: vec!["user-self".to_string(), "user-other".to_string()],
+            is_encrypted: true,
+            created_at: String::new(),
+        });
+        app.rooms_state.select(Some(1));
+        app.messages = vec![MessageInfo {
+            id: "message-secret".to_string(),
+            room_id: "room-secret".to_string(),
+            sender_id: "user-other".to_string(),
+            content: "只存在于内存里的明文".to_string(),
+            created_at: "2026-09-06T00:00:00+00:00".to_string(),
+        }];
+        app.load_messages_for_selected_room();
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.id == "message-secret"
+                    && message.content == "只存在于内存里的明文"),
+            "重新加载同一个加密私聊时，本端解出来的明文不能被整表换掉，实际 {:?}",
+            app.messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<String>>()
+        );
+
+        // Switching back to the group chat: the private chat's messages must not stay on screen under another room's title.
+        app.rooms_state.select(Some(0));
+        app.load_messages_for_selected_room();
+        assert!(
+            app.messages
+                .iter()
+                .all(|message| message.room_id == "room-one"),
+            "换房间后上一个房间的内容不得残留，实际 {:?}",
+            app.messages
+                .iter()
+                .map(|message| message.room_id.clone())
+                .collect::<Vec<String>>()
         );
     }
 
@@ -9540,14 +9569,14 @@ mod tests {
             &root,
         ));
 
-        // 未加密房间：整房写入后能按原样读回，并带回翻页游标
+        // Unencrypted rooms: after writing the whole room, it can be read back as-is, with a paging cursor returned
         app.cache_loaded_messages("room-one");
         let cache = app.chat_cache.as_ref().expect("应已建立缓存目录");
         let cached = cache.load_room("room-one").expect("明聊房间应已落盘");
         assert_eq!(cached.messages.len(), 2);
         assert_eq!(cached.messages[0].id, "message-1");
 
-        // 加密房间：一律不落盘
+        // Encrypted rooms: never write to disk
         app.rooms.push(RoomInfo {
             id: "room-secret".to_string(),
             name: None,
@@ -9569,7 +9598,7 @@ mod tests {
             cache.load_room("room-secret").is_none(),
             "加密房间不得写入本地缓存"
         );
-        // 消息列表混合了两个房间的内容时，也不允许按某个房间落盘
+        // When the message list mixes content from two rooms, it is also not allowed to write to disk by room
         assert!(
             cache.load_room("room-one").is_some(),
             "此前写好的明聊缓存不该被误删"
@@ -9590,7 +9619,7 @@ mod tests {
             .find(|(name, _)| *name == "exit")
             .expect("应有 /exit 别名");
         assert_eq!(quit.1, exit.1, "别名必须共用同一条说明文案");
-        // 没有私聊要清理时退出流程立即就绪，正好用来验证别名走的是同一条路径
+        // When there are no private chats to clean up, the exit flow is immediately ready, which is exactly used to verify that the alias follows the same path
         let mut app = chat_page_app_for_render("default");
         assert!(!app.should_quit_now());
         app.execute_chat_command("/exit");
@@ -9610,14 +9639,14 @@ mod tests {
         let built_in = Appearance::built_in();
         assert_ne!(dark.app_background, built_in.app_background);
         assert_ne!(dark.message_text, built_in.message_text);
-        // 暗色主题下正文必须比背景亮，否则等于看不见
+        // Under the dark theme, body text must be brighter than the background, otherwise it is invisible
         assert!(
             theme_luminance(dark.message_text) > theme_luminance(dark.app_background),
             "暗色主题的正文颜色应明显亮于背景"
         );
     }
 
-    /// 颜色的感知亮度（与 contrasting_foreground 同一套加权，用于主题自检）
+    /// Perceived brightness of colors (same weighting as contrasting_foreground, used for theme self-check)
     fn theme_luminance(color: Color) -> u32 {
         match color {
             Color::Rgb(red, green, blue) => {
@@ -9630,7 +9659,7 @@ mod tests {
     #[test]
     fn form_with_one_field_falls_back_to_box_input_and_still_masks_it() {
         let mut app = chat_page_app_for_render("default");
-        // 一个条目的表单（删除账户）按规矩用方框输入框，而不是箭头行
+        // A one-item form (delete account) uses the box input as appropriate, not the arrow row
         app.active_form = Some((
             FormAction::DeleteAccount,
             vec![FormField::new(
@@ -9643,8 +9672,8 @@ mod tests {
         let buffer = render_snapshot(&mut app, 90, 24);
         let body = buffer_row_text(&buffer, 0);
         assert!(!body.contains("hunter2"), "口令不该出现在屏幕上");
-        // 方框存在的证据：有一个左上角，且边框是"未选中"的输入框边框色
-        // （表单刻意不用选中色，见 render_box_field）
+        // Evidence of a box: there is a top-left corner, and the border is the "unselected" input box border color
+        // (the form deliberately does not use selection color, see render_box_field)
         assert!(
             buffer
                 .content
@@ -9698,7 +9727,7 @@ mod tests {
             buffer_contains(&buffer, &tail),
             "邀请正文被截断，末尾的 {tail:?} 没出现在浮层里"
         );
-        // 自己发出的那条也在，并带上加密标记与状态
+        // The one sent by oneself is also there, with encryption markers and status
         assert!(buffer_contains(&buffer, "carol"));
         assert!(buffer_contains(&buffer, &app.t("request_status_pending")));
     }
@@ -9706,8 +9735,8 @@ mod tests {
     #[test]
     fn closing_an_overlay_returns_keyboard_focus_to_the_message_box() {
         let mut app = chat_page_app_for_render("default");
-        // 浮层打开时 focus_index 指的是浮层里的输入项，关掉后必须交还消息输入框，
-        // 否则会回到"打字没有落点"的状态（表现是键盘输入完全没反应）
+        // When the overlay opens, focus_index refers to input items in the overlay; after closing it must be handed back to the message input box,
+        // otherwise it would return to the state of "typing has no target" (manifesting as keyboard input producing no response at all)
         app.displaying_overlay = DisplayingOverlay::Form;
         app.active_form = Some((
             FormAction::DeleteAccount,
@@ -9738,7 +9767,7 @@ mod tests {
     #[test]
     fn login_and_register_with_arguments_are_refused_without_a_word() {
         let mut app = chat_page_app_for_render("default");
-        // 带参数的登录既不该执行、也不该被清空重写，静默拒绝即可
+        // Login with parameters should neither execute nor be cleared and rewritten; silently reject it
         app.input_collector
             .message_input_state
             .set_text("/login somebody hunter2");
@@ -9750,7 +9779,7 @@ mod tests {
         );
         assert_eq!(app.displaying_overlay, DisplayingOverlay::Nothing);
         assert!(app.notifications.is_empty(), "不该再多一句提示");
-        // 无参数才打开登录浮层
+        // Only open the login overlay when there are no parameters
         app.input_collector.message_input_state.set_text("/login");
         app.handle_chat_submit();
         assert_eq!(app.displaying_overlay, DisplayingOverlay::Login);
@@ -9775,7 +9804,7 @@ mod tests {
         }
         let mut app = chat_page_app_for_render("default");
         app.sent_requests = vec![invitation("pending")];
-        // 轮询带回"已拒绝"，发出者要收到一条通知
+        // Polling brings back "rejected"; the sender must receive a notification
         app.announce_declined_invitations(&[invitation("declined")]);
         let notices: Vec<String> = app
             .notifications
@@ -9787,7 +9816,7 @@ mod tests {
             notices[0].contains("carol"),
             "通知里要点明是谁拒的: {notices:?}"
         );
-        // 本地列表更新后再来一轮同样状态，不该重复提示
+        // After the local list is updated, another round with the same status should not prompt again
         app.notifications.clear();
         app.sent_requests = vec![invitation("declined")];
         app.announce_declined_invitations(&[invitation("declined")]);
@@ -9797,8 +9826,8 @@ mod tests {
     #[test]
     fn profile_completion_reads_the_cached_directory_only() {
         let mut app = chat_page_app_for_render("default");
-        // 目录还没拉到时没有候选，且渲染路径不会发请求（base_url 指向不可达端口，
-        // 一旦这里真去请求就会走到执行分支而不是补全分支）
+        // When the directory has not been fetched there are no candidates, and the render path does not make requests (base_url points to an unreachable port,
+        // Once it really makes a request here, it goes to the execution branch rather than the completion branch
         app.registered_users = None;
         assert!(app.completion_candidates("profile ").is_empty());
         app.registered_users = Some(vec![UserSearchResult {
@@ -9813,7 +9842,7 @@ mod tests {
         assert_eq!(candidates[0].0, "/profile carol");
         assert_eq!(candidates[0].1, "carol - 01a0");
         assert_eq!(candidates[0].2, "卡尔");
-        // 已输入前缀时继续过滤，不要求从头匹配
+        // Continue filtering when a prefix has been entered; do not require matching from the beginning
         assert_eq!(app.completion_candidates("profile ca").len(), 1);
         assert!(app.completion_candidates("profile zz").is_empty());
     }
@@ -9874,16 +9903,16 @@ mod tests {
         let head = "很长的单行提示内容";
         app.push_notification(format!("{}结尾看得见", head.repeat(12)));
         let buffer = render_snapshot(&mut app, 60, 14);
-        // 旧算法按整段文本的总宽度估高度，小屏幕上算出来超过屏高就整条不画；
-        // 现在按"最宽一行"定宽、逐行估高，放不下时裁切显示而不是丢弃
+        // The old algorithm estimated height by the total width of the entire text; on small screens if it calculated exceeding screen height the whole item was not drawn;
+        // now it sets the width by "the widest row" and estimates height row by row; when it does not fit, it clips the display instead of discarding
         assert!(
             buffer_contains(&buffer, head),
             "长提示在小屏幕上被整条丢弃，没有自适应宽高"
         );
     }
 
-    /// 用 ratatui 的测试后端把整个界面渲染进内存缓冲区。
-    /// 没有真实终端时这是唯一能验证到"像素"（单元格符号与样式）的手段。
+    /// Use ratatui's test backend to render the entire interface into a memory buffer.
+    /// When there is no real terminal, this is the only way to verify down to "pixels" (cell symbols and styles).
     fn render_snapshot(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).expect("测试后端应能初始化");
@@ -9891,9 +9920,9 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    /// 把缓冲区某一行还原成纯文本，便于按字符串断言标题栏、提示行等文本内容。
-    /// 双宽字符（中文）占两个单元格、第二格是空占位格，必须按显示宽度跨格推进，
-    /// 否则还原出的中文文本会被插入空格。
+    // Restore a row of the buffer to plain text, to assert text content like the title bar and prompt rows by string.
+    /// Double-width characters (Chinese) take two cells, the second cell is an empty placeholder; must advance by display width across cells,
+    /// otherwise the restored Chinese text would have spaces inserted.
     fn buffer_row_text(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
         let mut text = String::new();
         let mut column = 0u16;
@@ -9905,12 +9934,12 @@ mod tests {
         text
     }
 
-    /// 整屏任意一行是否包含给定文本
+    /// Whether any row on the entire screen contains the given text
     fn buffer_contains(buffer: &ratatui::buffer::Buffer, text: &str) -> bool {
         (0..buffer.area.height).any(|row| buffer_row_text(buffer, row).contains(text))
     }
 
-    /// 收集整屏套用某背景色的单元格所在行（去重排序），用于验证高亮落在哪条消息上
+    /// Collect the rows of cells on the entire screen that have a certain background color (deduplicated and sorted), to verify which message the highlight falls on
     fn rows_with_background(buffer: &ratatui::buffer::Buffer, background: Color) -> Vec<i32> {
         let mut rows: Vec<i32> = Vec::new();
         for row in 0..buffer.area.height {
@@ -9924,7 +9953,7 @@ mod tests {
         rows
     }
 
-    /// 收集整屏套用某背景色的单元格文本，用于验证高亮恰好覆盖了命中片段
+    /// Collect the text of cells on the entire screen that have a certain background color, to verify the highlight exactly covers the matched fragment
     fn cells_with_background(buffer: &ratatui::buffer::Buffer, background: Color) -> String {
         buffer
             .content
@@ -9934,9 +9963,9 @@ mod tests {
             .collect::<String>()
     }
 
-    /// 假消息服务：按顺序应答两次翻页请求。第一次返回两页中的第一页（has_more 为真、
-    /// 游标指向更旧一条），第二次返回最后一页（has_more 为假、游标为空）。
-    /// 消息按服务端约定"最新在前"排列，用来验证客户端的停止条件、反转、去重与合并排序。
+    // Fake message service: respond to two paging requests in order. The first returns the first page of two (has_more is true,
+    /// cursor points to an older item), the second returns the last page (has_more is false, cursor is empty).
+    /// Messages are arranged per server convention "newest first", used to verify the client's stop condition, reversal, deduplication, and merge sorting.
     fn spawn_two_page_message_server() -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地测试端口");
         let address = listener.local_addr().expect("测试端口应能读回地址");
@@ -9970,12 +9999,12 @@ mod tests {
         app.connector
             .set_base_url(&format!("http://{}", spawn_two_page_message_server()));
         app.input_collector.message_input_state.set_text("#hello");
-        // 服务端首页响应里 has_more 为真时才会留下翻页游标，这里模拟"仍有更早消息"的房间
+        // A paging cursor is left only when the server's home page response has has_more true; here simulate a room with "earlier messages remaining"
         app.messages_older_cursor = Some("message-1".to_string());
 
         app.execute_message_search();
 
-        // 三页历史全部并入，整体按时间升序重排，本地原有的两条保持内容不变
+        // All three pages of history are merged together, the whole is re-sorted by time ascending, the two local original entries keep their content unchanged
         let ids: Vec<&str> = app
             .messages
             .iter()
@@ -9985,20 +10014,20 @@ mod tests {
             ids,
             vec!["oldest-0", "old-1", "old-2", "message-1", "message-2"]
         );
-        // 命中列表按显示顺序排列：四条含 hello 的消息，默认定位到最后一条匹配项
+        // The hit list is arranged in display order: four messages containing hello, default positioning at the last match
         let (keyword, matched, selected) = app.search_result.clone().expect("搜索应已执行");
         assert_eq!(keyword, "hello");
         assert_eq!(matched, vec!["oldest-0", "old-1", "old-2", "message-1"]);
         assert_eq!(selected, matched.len() - 1);
         assert_eq!(app.pending_scroll_message_id, Some("message-1".to_string()));
-        // 全量已拉到底，触顶翻页游标必须关闭，否则搜索后还会重复拉一遍历史
+        // All has been fetched to the bottom, the top-reached paging cursor must be closed, otherwise after searching it would repeatedly fetch the history again
         assert!(app.messages_older_cursor.is_none());
     }
 
     #[test]
     fn repeated_search_skips_history_fetch_when_room_is_already_complete() {
-        // 游标为空说明本房间已无更早消息（服务端 has_more 为假），
-        // 重复按 Enter 只应重扫已有消息，绝不再翻页拉取，也不会因连不上而报错
+        // A null cursor means this room has no earlier messages (server has_more is false),
+        // pressing Enter repeatedly should only rescan existing messages, never fetch another page, and should not error from being unable to connect
         let mut app = chat_page_app_for_render("default");
         app.input_collector.message_input_state.set_text("#hello");
         app.execute_message_search();
@@ -10016,26 +10045,26 @@ mod tests {
             "│群聊一号│".to_string(),
             "│      │".to_string(),
         ];
-        // 覆盖第二行的四个汉字：按显示宽度切列，双宽汉字整块保留
+        // Cover the four Chinese characters on the second row: split columns by display width, keep double-width characters as whole units
         assert_eq!(
             extract_selected_screen_text(&rows, (2, 1), (8, 1)),
             "群聊一号"
         );
-        // 端点顺序无关（从右下往左上拖）
+        // Endpoint order does not matter (dragging from bottom-right to top-left)
         assert_eq!(
             extract_selected_screen_text(&rows, (8, 1), (2, 1)),
             "群聊一号"
         );
-        // 只框到一个汉字的第一列时整块取该字（终点列本身计入选区）
+        // When only the first column of a Chinese character is boxed, take the whole character (the endpoint column itself counts toward the selection)
         assert_eq!(extract_selected_screen_text(&rows, (2, 1), (2, 1)), "群");
-        // 跨行选择时首尾整行为空的行被丢掉
+        // When selecting across rows, rows that are entirely empty at the start or end are discarded
         assert_eq!(extract_selected_screen_text(&rows, (13, 0), (13, 2)), "");
     }
 
     #[test]
     fn search_navigation_relocates_view_even_with_a_single_match() {
-        // 只有一条命中时旧实现直接 return（matched.len() < 2），用户按组合键毫无反应；
-        // 现在仍会把视图推到那条消息上
+        // When there was only one match the old implementation returned directly (matched.len() < 2), the user pressing a modifier key had no effect;
+        // now it still pushes the view to that message
         let mut app = chat_page_app_for_render("default");
         app.input_collector.message_input_state.set_text("#hello");
         app.search_result = Some(("hello".to_string(), vec!["message-1".to_string()], 0));
@@ -10055,7 +10084,7 @@ mod tests {
             "│► 群聊一号●│".to_string(),
             "│          │".to_string(),
         ];
-        // 跨整块面板框选：制表框线、选中箭头、在线圆点与背景空白都不该进剪贴板
+        // Box selection spanning entire panels: tab frame lines, selection arrows, online dots, and background whitespace must not enter the clipboard
         assert_eq!(
             extract_selected_screen_text(&rows, (0, 0), (12, 2)),
             "房间\n群聊一号"
@@ -10064,8 +10093,8 @@ mod tests {
 
     #[test]
     fn search_mode_up_down_keys_navigate_matches_with_any_modifiers() {
-        // 直接喂合成按键事件，验证搜索模式下上下键被匹配项切换接管：
-        // 无修饰、Ctrl、Ctrl+Shift 三种上报形式都要生效（不同终端给的组合键形式不一致）
+        // Directly feed composed key events to verify that up/down keys in search mode are taken over by match item switching:
+        // all three reporting forms — no modifier, Ctrl, Ctrl+Shift — must work (different terminals give inconsistent combined key forms)
         let mut app = chat_page_app_for_render("default");
         app.input_collector.message_input_state.set_text("#hello");
         app.messages.push(MessageInfo {
@@ -10106,20 +10135,20 @@ mod tests {
                 "切换后要标记待定位的消息"
             );
         }
-        // 最后一个匹配项再按下应回绕到第一个
+        // Pressing again on the last match should wrap to the first
         assert_eq!(app.search_result.as_ref().unwrap().2, 1);
         app.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::Down,
             KeyModifiers::NONE,
         )));
         assert_eq!(app.search_result.as_ref().unwrap().2, 0);
-        // 上下键不得改动房间选择（搜索模式下切房由别的操作负责）
+        // Arrow keys must not change the room selection (room switching in search mode is handled by other operations)
         assert_eq!(app.rooms_state.selected(), Some(0));
     }
 
     #[test]
     fn pasted_text_with_carriage_returns_yields_clean_new_lines() {
-        // macOS Terminal.app 粘贴的行尾是 \r\n，不能把 \r 留在文本缓冲区里
+        // Pasted line endings in macOS Terminal.app are \r\n; the \r must not be left in the text buffer
         let mut app = chat_page_app_for_render("default");
         app.handle_pasted_text("第一行\r\n第二行\r\n第三行");
         assert_eq!(
@@ -10133,9 +10162,9 @@ mod tests {
                 .contains('\r'),
             "粘贴结果里不应残留回车符"
         );
-        // 裸 \r（旧 Mac 行尾）转成换行；其他控制字符（如响铃 \u{7}）直接丢弃
+        // Bare \r (old Mac line ending) converted to newline; other control characters (like bell \u{7}) are discarded directly
         assert_eq!(normalize_pasted_text("a\rb\u{7}c"), "a\nbc");
-        // 制表符属于可输入的正文内容，保留
+        // Tab characters belong to editable body content and are kept
         assert_eq!(normalize_pasted_text("a\tb"), "a\tb");
     }
 
@@ -10144,7 +10173,7 @@ mod tests {
         let mut app = chat_page_app_for_render("default");
         let message_count_before = app.messages.len();
         app.handle_pasted_text("第一行\n第二行\n第三行");
-        // 三行都留在输入框内，换行不触发发送
+        // All three rows stay in the input box; newline does not trigger sending
         assert_eq!(
             app.input_collector.message_input_state.text(),
             "第一行\n第二行\n第三行"
@@ -10154,7 +10183,7 @@ mod tests {
 
     #[test]
     fn rendering_reserves_the_bottom_terminal_row() {
-        // 最底行留空可避免终端因写入右下角而自动滚动，从而不再出现整屏错位
+        // Leaving the bottom row empty avoids the terminal auto-scrolling due to writing in the bottom-right corner, thus no more full-screen misalignment
         assert_eq!(drawable_area(Rect::new(0, 0, 120, 36)).height, 35);
         assert_eq!(drawable_area(Rect::new(0, 0, 120, 1)).height, 1);
         let mut app = chat_page_app_for_render("default");
@@ -10179,10 +10208,10 @@ mod tests {
         assert_eq!(keyword, "hello");
         assert_eq!(matched, vec!["message-1".to_string()]);
         assert_eq!(selected, 0);
-        // 快速搜索不触发整房翻页拉取，因此不会留下任何"正在拉取历史"的提示
+        // Quick search does not trigger whole-room page fetching, so no "fetching history" prompt is left
         assert!(app.notifications.is_empty());
 
-        // 关键词清空后回到未搜索态：结果整体作废，标题不再显示进度
+        // When the keyword is cleared, return to the unsearched state: results are all invalidated, the title no longer shows progress
         app.input_collector.message_input_state.set_text("#");
         app.apply_quick_search();
         assert!(app.search_result.is_none());
@@ -10210,7 +10239,7 @@ mod tests {
                 "{overlay:?} 的 Esc 应退回设置菜单"
             );
         }
-        // 设置菜单自身再退一层才是无浮层的聊天页
+        // Going back one more level from the settings menu is the chat page without overlays
         app.dismiss_overlay_back();
         assert_eq!(app.displaying_overlay, DisplayingOverlay::Nothing);
     }
@@ -10219,7 +10248,7 @@ mod tests {
     fn rendered_screen_paints_theme_background_over_the_whole_frame() {
         let mut app = chat_page_app_for_render("high-contrast");
         let buffer = render_snapshot(&mut app, 120, 36);
-        // 背景铺满整屏：120x36 里绝大多数单元格都应带上主题的应用背景色
+        // Background covers the entire screen: the vast majority of cells in 120x36 should have the theme's application background color
         let painted_cells = buffer
             .content
             .iter()
@@ -10229,14 +10258,14 @@ mod tests {
             painted_cells > 120 * 36 / 2,
             "应用背景未铺满整屏，仅 {painted_cells} 个单元格着色"
         );
-        // 第 0 行是顶栏，房间列表左上角边框从第 1 行起（high-contrast 下为白色）
+        // Row 0 is the top bar; the room list top-left corner border starts from row 1 (white under high-contrast)
         assert_eq!(buffer[(0u16, 1u16)].fg, Color::White);
     }
 
     #[test]
     fn rendered_screen_highlights_search_matches_with_theme_background() {
         let mut app = chat_page_app_for_render("high-contrast");
-        // 再补一条同样命中 hello 的消息，好把"其余命中"与"当前命中"两种颜色区分开
+        // Add one more message that also matches hello, to distinguish the "other matches" color from the "current match" color
         app.messages.push(MessageInfo {
             id: "message-3".to_string(),
             room_id: "room-one".to_string(),
@@ -10244,7 +10273,7 @@ mod tests {
             content: "hello once more".to_string(),
             created_at: "2026-08-30T08:02:00+00:00".to_string(),
         });
-        // 进入搜索模式并执行过一次搜索：两条命中，当前停在第一条
+        // Enter search mode and execute a search once: two matches, currently stopped at the first one
         app.input_collector.message_input_state.set_text("#hello");
         app.search_result = Some((
             "hello".to_string(),
@@ -10252,8 +10281,8 @@ mod tests {
             0,
         ));
         let buffer = render_snapshot(&mut app, 120, 36);
-        // 其余命中用 search_match_background（light_yellow），当前这条用
-        // search_current_match_background（light_red），各自只盖住关键词那几个字
+        // Other matches use search_match_background (light_yellow), the current one uses
+        // search_current_match_background (light_red), each only covers those few characters of the keyword
         assert_eq!(
             cells_with_background(&buffer, Color::LightYellow),
             "hello".to_string()
@@ -10266,7 +10295,7 @@ mod tests {
             current_rows[0] < other_rows[0],
             "当前停在第一条命中，特殊色应出现在更靠上的行"
         );
-        // 换到第二个匹配项：两种颜色的位置互换，证明"当前"标记跟着选中项走
+        // Switch to the second match: the two colors swap positions, proving the "current" marker follows the selected item
         app.search_result = Some((
             "hello".to_string(),
             vec!["message-1".to_string(), "message-3".to_string()],
@@ -10281,9 +10310,9 @@ mod tests {
             rows_with_background(&swapped_buffer, Color::LightYellow),
             current_rows
         );
-        // 输入框标题给出匹配进度
+        // The input box title gives the match progress
         assert!(buffer_contains(&buffer, "搜索模式: 第 1/2 个匹配项"));
-        // 搜索模式边框取 search_border（high-contrast 下为 light_red）
+        // Search mode border takes search_border (light_red under high-contrast)
         assert!(buffer.content.iter().any(|cell| cell.fg == Color::LightRed));
     }
 
@@ -10296,10 +10325,10 @@ mod tests {
         app.search_result = Some(("nosuchword".to_string(), Vec::new(), 0));
         let buffer = render_snapshot(&mut app, 120, 36);
         assert!(buffer_contains(&buffer, "搜索模式: 未找到"));
-        // 未命中时不该有任何搜索命中高亮
+        // When there is no match there should be no search highlight
         assert!(cells_with_background(&buffer, Color::LightYellow).is_empty());
 
-        // 普通模式（输入框不以 # 开头）即使残留旧结果也不高亮
+        // Normal mode (input does not start with #) does not highlight even with residual old results
         let mut plain_app = chat_page_app_for_render("high-contrast");
         plain_app
             .input_collector
@@ -10318,7 +10347,7 @@ mod tests {
             .push(("room-one".to_string(), "bob".to_string(), Instant::now()));
         let buffer = render_snapshot(&mut app, 120, 36);
         assert!(buffer_contains(&buffer, "bob 正在输入"));
-        // 其它房间的成员输入状态不该显示在当前房间标题上
+        // Typing status of members in other rooms should not display on the current room title
         let mut other_room_app = chat_page_app_for_render("high-contrast");
         other_room_app.typing_members.push((
             "room-two".to_string(),
@@ -10341,15 +10370,15 @@ mod tests {
             is_encrypted: false,
             created_at: String::new(),
         });
-        // 顶栏的连接标记同样是实心点，所以这里一律按"房间名 + 标记"整体断言，
-        // 免得把顶栏那个点误当成房间列表的在线标注
-        // 私聊在列表里显示为本地化后的"私聊"字样，标记就贴在它后面
+        // The top bar connection marker is also a solid dot, so here everything is asserted as a whole of "room name + marker",
+        // Avoid mistaking the dot in the status bar as an online indicator for the room list
+        // Private chats display as the localized "private" text in the list; the marker is pasted right after it
         let private_room_label = app.t("private_chat_fallback");
         let peer_line = |mark: &str| format!("{private_room_label} {mark}");
         let unknown_buffer = render_snapshot(&mut app, 120, 36);
         assert!(!buffer_contains(&unknown_buffer, &peer_line("●")));
         assert!(!buffer_contains(&unknown_buffer, &peer_line("○")));
-        // 收到在线广播后标注实心点，离线后标注空心点
+        // After receiving online broadcasts, mark with a solid dot; after going offline, mark with a hollow dot
         app.presence_by_user.insert("user-other".to_string(), true);
         let online_buffer = render_snapshot(&mut app, 120, 36);
         assert!(buffer_contains(&online_buffer, &peer_line("●")));
@@ -10361,7 +10390,7 @@ mod tests {
 
     #[test]
     fn switching_appearance_changes_every_coloured_slot() {
-        // 同一份内容分别用两套外观渲染，边框取色必须随主题切换
+        // The same content rendered with two different appearances; the border color must switch with the theme
         let mut built_in_app = chat_page_app_for_render("default");
         let built_in_buffer = render_snapshot(&mut built_in_app, 120, 36);
         assert_eq!(built_in_buffer[(0u16, 1u16)].fg, Color::Cyan);
