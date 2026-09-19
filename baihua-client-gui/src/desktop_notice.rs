@@ -7,6 +7,11 @@
 use baihua_core::config;
 
 /// system notification sound file: uses the same one as the terminal version; among macOS built-in sounds it is the one least likely to be missing.
+///
+/// only defined on macOS: every caller (the playback block in `play_notification_sound` and the
+/// sound-file existence test) is itself gated to macOS, so on Linux/Windows this path would be
+/// dead code and the strict CI clippy (`-D warnings`) would reject the build.
+#[cfg(target_os = "macos")]
 fn notification_sound_path() -> &'static str {
     "/System/Library/Sounds/Ping.aiff"
 }
