@@ -70,6 +70,7 @@
   "no_pending_requests": "暂无待处理的私聊请求",
   "unknown_user": "未知用户",
   "encrypted_mark": "[加密]",
+  "draft_mark": "[草稿]",
   "message_encrypted_history_unavailable": "[加密历史消息，会话结束后已不可读]",
   "hint_pending_requests": "d: 拒绝收到的邀请 / 撤回我发出的邀请",
   "error_title": "错误",

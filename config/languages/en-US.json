@@ -70,6 +70,7 @@
   "no_pending_requests": "No pending private chat requests",
   "unknown_user": "Unknown user",
   "encrypted_mark": "[Encrypted]",
+  "draft_mark": "[Draft]",
   "message_encrypted_history_unavailable": "[Encrypted history message, unreadable after the session ended]",
   "hint_pending_requests": "d: decline a received invitation / cancel one you sent",
   "error_title": "Error",

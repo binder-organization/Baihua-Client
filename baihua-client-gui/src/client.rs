@@ -256,6 +256,11 @@ pub struct Client {
     pub pending_scroll_message_id: Option<String>,
     /// Input box draft (bound directly by TextEdit in the GUI; the session layer needs to read it to determine search/command mode)
     pub draft: String,
+    /// Room ID → the unsent input text left behind in that room (every group chat keeps its own copy).
+    /// Opening a room takes its entry back into the input box, leaving a room writes the box into the cache and
+    /// empties it, so an entry only ever describes a room that is not open — the set of rows the room list marks
+    /// with the localized "[Draft]xxx" (see `room_row_draft_suffix`).
+    pub room_drafts: HashMap<String, String>,
     /// Locally closed room IDs (only hidden, not notified to the server)
     pub closed_room_ids: HashSet<String>,
     /// IDs of group chats the user voluntarily left, used to distinguish "self-left" from "kicked"
@@ -323,6 +328,7 @@ impl Default for Client {
             panel_search_result: None,
             pending_scroll_message_id: None,
             draft: String::new(),
+            room_drafts: HashMap::new(),
             closed_room_ids: HashSet::new(),
             left_room_ids: HashSet::new(),
             messages_reloaded_at: Instant::now(),

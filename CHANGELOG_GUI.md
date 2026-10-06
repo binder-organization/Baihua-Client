@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Every room keeps its own message draft: switching or closing a chat clears the input box and stores the text for that room, reopening the room restores it, and the room list marks rooms holding unsent text with `[Draft]xxx`.
+
+### Fixed
+
+- Removing a room that sits above the selected one now shifts the selection down, so the highlight and the input box no longer silently belong to another chat.
+
 ## [0.1.0] - 2026-9-26
 
 ### Added

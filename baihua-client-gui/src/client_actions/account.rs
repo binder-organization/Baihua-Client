@@ -183,6 +183,9 @@ impl Client {
         self.messages.clear();
         self.rooms.clear();
         self.unread_counts.clear();
+        // Drafts belong to the previous account's rooms and must not outlive the session
+        self.room_drafts.clear();
+        self.draft.clear();
         self.pending_requests.clear();
         self.sent_requests.clear();
         self.crypto.sessions.clear();

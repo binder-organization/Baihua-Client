@@ -145,6 +145,119 @@ fn row_click_toggles() {
     );
 }
 
+/// The unsent text belongs to the room it was typed in: switching chats empties the
+/// box, the room just left keeps its own text (which is what the list marks), and
+/// reopening a room hands that same text back to the input box.
+#[test]
+fn draft_follows_the_room() {
+    let mut client = Client::default();
+    // The reloads of the switched-to rooms must not reach a server; a connection
+    // failure is the silent branch, exactly like the row-click test above.
+    client.connector.set_base_url("http://127.0.0.1:1");
+    client.rooms = vec![
+        room("room-1", "team one", false),
+        room("room-2", "team two", true),
+    ];
+    client.open_room(0);
+    client.draft = "half a sentence".to_string();
+    client.open_room(1);
+    assert!(
+        client.draft.is_empty(),
+        "switching chats must empty the input box"
+    );
+    let entries = client.room_entries();
+    assert_eq!(
+        entries[0].draft, "half a sentence",
+        "the room just left keeps the text typed in it"
+    );
+    assert_eq!(
+        entries[1].draft, "",
+        "the open room must never be marked with text that sits in the box"
+    );
+
+    client.draft = "another half".to_string();
+    client.open_room(0);
+    assert_eq!(
+        client.draft, "half a sentence",
+        "reopening a room must restore that room's own text"
+    );
+    let entries = client.room_entries();
+    assert_eq!(
+        entries[0].draft, "",
+        "text living in the box is no longer a list marker"
+    );
+    assert_eq!(
+        entries[1].draft, "another half",
+        "the room just left keeps its own text, not the other room's"
+    );
+}
+
+/// Leaving the chat records what was typed and empties the box; coming back gives it
+/// back. An empty box drops the entry instead of keeping an empty draft alive, so the
+/// list only marks rooms that really hold something unsent.
+#[test]
+fn closing_a_selection_keeps_the_draft_with_the_room() {
+    let mut client = Client::default();
+    client.connector.set_base_url("http://127.0.0.1:1");
+    client.rooms = vec![
+        room("room-1", "team one", false),
+        room("room-2", "team two", true),
+    ];
+    client.open_room(0);
+    client.draft = "unsent line".to_string();
+    client.close_room_selection();
+    assert!(
+        client.draft.is_empty(),
+        "leaving the chat must clear the input box"
+    );
+    assert_eq!(
+        client.room_entries()[0].draft,
+        "unsent line",
+        "the closed selection must keep the text with its room"
+    );
+    client.open_room(0);
+    assert_eq!(
+        client.draft, "unsent line",
+        "the room reopened after closing gets its text back"
+    );
+
+    client.draft = String::new();
+    client.close_room_selection();
+    assert_eq!(
+        client.room_entries()[0].draft,
+        "",
+        "an empty box must not leave a marker behind"
+    );
+}
+
+/// When a snapshot takes the open room away, the text in the box goes into that
+/// room's own cache instead of being dropped or handed to whatever room comes next.
+#[test]
+fn a_vanishing_room_records_the_draft() {
+    let mut client = Client::default();
+    client.connector.set_base_url("http://127.0.0.1:1");
+    client.apply_room_snapshot(vec![
+        room("room-1", "team one", false),
+        room("room-2", "team two", false),
+    ]);
+    client.selected_room_index = Some(0);
+    client.draft = "unfinished".to_string();
+    client.apply_room_snapshot(vec![room("room-2", "team two", false)]);
+    assert_eq!(
+        client.draft, "",
+        "the box must be emptied with the room that vanished"
+    );
+    assert_eq!(
+        client.room_drafts.get("room-1").map(String::as_str),
+        Some("unfinished"),
+        "the text stays cached under the id of the room it was typed in"
+    );
+    assert_eq!(
+        client.selected_room_index, None,
+        "a vanished selection returns to nothing selected, never another room"
+    );
+}
+
 #[test]
 fn unread_on_open() {
     let mut client = Client::default();

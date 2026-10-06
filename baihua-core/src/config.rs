@@ -832,6 +832,28 @@ mod tests {
         );
     }
 
+    /// The room list marks unsent text with the localized `draft_mark`; both shipped
+    /// tables must really carry their own wording, or the rows would show the raw key.
+    #[test]
+    fn the_draft_marker_is_localized_in_both_shipped_languages() {
+        for (code, expected) in [("zh-CN", "[草稿]"), ("en-US", "[Draft]")] {
+            let Ok(language) = Language::load(code) else {
+                // 机器上没有语言文件时跳过（与其它读取语言文件的测试一致）
+                continue;
+            };
+            assert_eq!(
+                language.text("draft_mark"),
+                expected,
+                "{code} must localize draft_mark as {expected}"
+            );
+            assert_ne!(
+                language.text("draft_mark"),
+                "draft_mark",
+                "{code} lacks draft_mark; the room list would show the raw key"
+            );
+        }
+    }
+
     /// The shipped language files must carry **exactly the same key set**.
     ///
     /// Whichever file misses a key shows that key verbatim to users (`Language::text` falls back to the key name),

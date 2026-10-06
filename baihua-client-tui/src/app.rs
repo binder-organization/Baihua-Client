@@ -549,6 +549,11 @@ pub struct App {
     messages: Vec<MessageInfo>,
     // Room ID → unread message count, used to show message count in red after the non-selected group chat name
     unread_counts: HashMap<String, u32>,
+    // Room ID → the unsent message input text the user left behind in that room (each group chat keeps its own copy).
+    // Leaving a room writes the input box into this map and empties the box; reopening the room takes the entry back out
+    // into the box, so an entry only ever describes a room that is not on screen — which is exactly the set of rooms
+    // the room list marks with the localized "[草稿]xxx" (see `render_room_list`).
+    room_drafts: HashMap<String, String>,
     current_user_id: Option<String>,
     displaying_overlay: DisplayingOverlay,
     // sender_id → username mapping
@@ -687,6 +692,7 @@ impl Default for App {
             rooms_state: ListState::default(),
             messages: Vec::new(),
             unread_counts: HashMap::new(),
+            room_drafts: HashMap::new(),
             current_user_id: None,
             displaying_overlay: DisplayingOverlay::Nothing,
             sender_names: HashMap::new(),
@@ -1551,6 +1557,7 @@ impl App {
                     self.focus_index = 0;
                     self.rooms.clear();
                     self.rooms_state = ListState::default();
+                    self.room_drafts.clear();
                     self.messages.clear();
                     self.sender_names.clear();
                     self.crypto.sessions.clear();
@@ -2578,6 +2585,43 @@ fn display_width(text: &str) -> u16 {
         .sum()
 }
 
+/// How many terminal columns a room-list draft preview may occupy: the row is a single line shared with the room name
+/// (and its unread count), so a long draft is cut short instead of pushing the rest of the row out of view.
+const DRAFT_PREVIEW_WIDTH: u16 = 16;
+
+/// One-line preview of an unsent draft for the room list: every run of whitespace (line breaks included) collapses to
+/// one space, then the text is cut to `max_width` terminal columns with an ellipsis — a multi-line draft must never
+/// turn one room row into two.
+fn draft_preview(draft: &str, max_width: u16) -> String {
+    let flattened = draft.split_whitespace().collect::<Vec<_>>().join(" ");
+    if display_width(&flattened) <= max_width {
+        return flattened;
+    }
+    let mut preview = String::new();
+    let mut width = 0u16;
+    // Leave one column for the ellipsis itself
+    let limit = max_width.saturating_sub(1);
+    for character in flattened.chars() {
+        let character_width = display_width(&character.to_string());
+        if width + character_width > limit {
+            break;
+        }
+        width += character_width;
+        preview.push(character);
+    }
+    preview.push('…');
+    preview
+}
+
+/// Caret position at the end of a (possibly multi-line) draft: the column after the last character of the last line,
+/// so a restored draft takes up typing right where the user left off instead of at its first character.
+fn draft_end_position(draft: &str) -> (u32, u32) {
+    let lines: Vec<&str> = draft.split('\n').collect();
+    let row = lines.len().saturating_sub(1) as u32;
+    let column = lines.last().map_or(0, |line| line.chars().count()) as u32;
+    (column, row)
+}
+
 /// Merge two batches of messages by ID: earlier arrived ones (already local, possibly decrypted plaintext) are preserved first,
 /// later ones only add new entries, finally sorted by creation time and server ID ascending.
 fn merge_messages_by_id(
@@ -3437,24 +3481,39 @@ impl App {
             .map(|(id, name)| (id.clone(), name.clone()))
             .collect();
         self.rooms = filter_visible_rooms(rooms, &self.closed_room_ids);
-        if self.rooms.is_empty() {
-            self.rooms_state.select(None);
-            self.messages.clear();
+        // Decide the new selection first and only then swap the drafts across the change: the text in the box belongs to
+        // the room that *was* open, so it goes into that room's own draft cache (which also empties the box), and the
+        // room that is now open gets its own cached draft back. With no room left this degenerates to "record and clear".
+        let restored_index = previous_selected_id
+            .as_ref()
+            .and_then(|id| self.rooms.iter().position(|room| room.id == *id));
+        // Whenever a new private chat room appears (by accepting a request to create, or by polling after the peer accepts), automatically switch to it
+        let new_private_index = self
+            .rooms
+            .iter()
+            .position(|room| !room.is_group && new_room_ids.contains(&room.id));
+        let selected_index = if self.rooms.is_empty() {
+            None
         } else {
-            let restored_index = previous_selected_id
-                .and_then(|id| self.rooms.iter().position(|room| room.id == id));
-            // Whenever a new private chat room appears (by accepting a request to create, or by polling after the peer accepts), automatically switch to it
-            let new_private_index = self
-                .rooms
-                .iter()
-                .position(|room| !room.is_group && new_room_ids.contains(&room.id));
-            let selected_index = new_private_index.or(restored_index).unwrap_or(0);
-            self.rooms_state.select(Some(selected_index));
-            // Neither retaining the original selected room nor switching to a new private chat means the original selected room disappeared and fell back to 0, need to clear old messages to prevent remnants
-            if new_private_index.is_none() && restored_index.is_none() {
-                self.messages.clear();
+            Some(new_private_index.or(restored_index).unwrap_or(0))
+        };
+        let opened_id =
+            selected_index.and_then(|index| self.rooms.get(index).map(|room| room.id.clone()));
+        if opened_id != previous_selected_id {
+            self.stash_room_draft(previous_selected_id.as_deref());
+            self.restore_room_draft(opened_id.as_deref());
+        }
+        self.rooms_state.select(selected_index);
+        match selected_index {
+            // No room left: the message area must not keep showing the room that just disappeared.
+            None => self.messages.clear(),
+            Some(_) => {
+                // Neither retaining the original selected room nor switching to a new private chat means the original selected room disappeared and fell back to 0, need to clear old messages to prevent remnants
+                if new_private_index.is_none() && restored_index.is_none() {
+                    self.messages.clear();
+                }
+                self.load_messages_for_selected_room();
             }
-            self.load_messages_for_selected_room();
         }
         if has_new_room {
             // The new room isn't subscribed by this connection, needs reconnection for the server to re-snapshot the subscription; handshake resend is unified at WebSocketConnected
@@ -4482,12 +4541,10 @@ impl App {
                                 let selected = self.rooms_state.selected().unwrap_or(0);
                                 if key.code == KeyCode::Up {
                                     if selected > 0 {
-                                        self.rooms_state.select(Some(selected - 1));
-                                        self.load_messages_for_selected_room();
+                                        self.switch_selected_room(selected - 1);
                                     }
                                 } else if selected + 1 < self.rooms.len() {
-                                    self.rooms_state.select(Some(selected + 1));
-                                    self.load_messages_for_selected_room();
+                                    self.switch_selected_room(selected + 1);
                                 }
                             }
                         }
@@ -5129,6 +5186,7 @@ impl App {
         self.chat_cache = None;
         self.rooms.clear();
         self.rooms_state = ListState::default();
+        self.room_drafts.clear();
         self.messages.clear();
         self.sender_names.clear();
         self.crypto.sessions.clear();
@@ -5293,6 +5351,57 @@ impl App {
             .map(|room| room.id.clone())
     }
 
+    /// Record the input box text as the draft of `room_id` and empty the box: "leaving a group chat clears the text
+    /// and stores the cache". An empty box drops the entry instead of keeping an empty draft alive, so the room list
+    /// only ever marks rooms that really have something unsent. `room_id` is taken explicitly because the caller often
+    /// asks *before* the room list changes (the selection index alone would already point at another room).
+    fn stash_room_draft(&mut self, room_id: Option<&str>) {
+        let typed = self.input_collector.message_input_state.text();
+        if let Some(room_id) = room_id {
+            if typed.is_empty() {
+                self.room_drafts.remove(room_id);
+            } else {
+                self.room_drafts.insert(room_id.to_string(), typed);
+            }
+        }
+        self.input_collector.message_input_state.set_text("");
+    }
+
+    /// Put the draft cached for `room_id` back into the input box (an empty box when that room has none), with the
+    /// caret at the end of the restored text. The entry is *taken out* of the cache: while the text sits in the box it
+    /// belongs to the room that is open, so the room list does not repeat it as a "[草稿]" marker.
+    fn restore_room_draft(&mut self, room_id: Option<&str>) {
+        let draft = room_id
+            .and_then(|room_id| self.room_drafts.remove(room_id))
+            .unwrap_or_default();
+        self.input_collector.message_input_state.set_text(&draft);
+        if !draft.is_empty() {
+            let (x, y) = draft_end_position(&draft);
+            self.input_collector
+                .message_input_state
+                .set_cursor(TextPosition::new(x, y), false);
+        }
+        // A restored search/command draft must re-run the input change handling; plain text deliberately skips it,
+        // otherwise reopening a room would report "typing" to the server without anyone typing.
+        if draft.starts_with('#') || draft.starts_with('/') {
+            self.handle_message_input_changed();
+        }
+    }
+
+    /// Switch the selection to room `index`: the outgoing room's text goes into its own draft cache, the incoming
+    /// room's draft comes back into the box, then the messages load as before. Selecting the very same room is a
+    /// no-op for the drafts (otherwise the reload path would empty the box the user is typing in).
+    fn switch_selected_room(&mut self, index: usize) {
+        let leaving = self.selected_room_id();
+        self.rooms_state.select(Some(index));
+        let entering = self.selected_room_id();
+        if entering != leaving {
+            self.stash_room_draft(leaving.as_deref());
+            self.restore_room_draft(entering.as_deref());
+        }
+        self.load_messages_for_selected_room();
+    }
+
     /// Get the user ID of the "other party" in a private chat room (the member who isn't yourself).
     /// Returns None for group chats which have no single peer, or when no other members exist in the room besides self; the caller doesn't display peer status accordingly.
     fn chat_peer_id_of(&self, room: &RoomInfo) -> Option<String> {
@@ -5330,17 +5439,31 @@ impl App {
     /// Soft-close an encrypted private chat locally: only hide from the interface and clear the session,
     /// don't notify the server to exit the room, avoiding the peer seeing a single-person residual room after reconnecting
     fn close_local_room(&mut self, room_id: &str) {
+        // Captured before the room list changes: afterwards the selection index alone may already point at another row
+        let leaving = self.selected_room_id();
         self.closed_room_ids.insert(room_id.to_string());
         self.crypto.sessions.remove(room_id);
         if let Some(cache) = &self.chat_cache {
             cache.forget_room(room_id);
         }
-        let was_selected = self.selected_room_id().as_deref() == Some(room_id);
+        let was_selected = leaving.as_deref() == Some(room_id);
+        let removed_index = self.rooms.iter().position(|room| room.id == room_id);
         self.rooms.retain(|room| room.id != room_id);
+        // Removing a room that sits above the selection shifts every following index: adjust it, otherwise the
+        // highlighted row — and with it the room the input box belongs to — silently moves to a different chat.
+        if let (Some(removed), Some(selected)) = (removed_index, self.rooms_state.selected())
+            && !was_selected
+            && removed < selected
+        {
+            self.rooms_state.select(Some(selected - 1));
+        }
         if was_selected {
+            // Leaving a chat view records what was typed into that room's own draft cache and empties the box
+            self.stash_room_draft(leaving.as_deref());
             self.messages.clear();
             if !self.rooms.is_empty() {
                 self.rooms_state.select(Some(0));
+                self.restore_room_draft(self.selected_room_id().as_deref());
                 self.load_messages_for_selected_room();
             } else {
                 self.rooms_state.select(None);
@@ -6148,6 +6271,22 @@ impl App {
                     if let Some((mark, mark_style)) = presence_mark {
                         spans.push(Span::styled(format!(" {mark}"), mark_style));
                     }
+                }
+                // A room that is not on screen but still holds unsent text is marked "[草稿]xxx" after its name,
+                // exactly like the unread count: the box belongs to the open room, everything else shows here
+                let draft_mark = if self.rooms_state.selected() == Some(i) {
+                    None
+                } else {
+                    self.room_drafts
+                        .get(&room.id)
+                        .filter(|draft| !draft.trim().is_empty())
+                        .map(|draft| draft_preview(draft, DRAFT_PREVIEW_WIDTH))
+                };
+                if let Some(draft) = draft_mark {
+                    spans.push(Span::styled(
+                        format!(" {}{}", self.t("draft_mark"), draft),
+                        Style::default().fg(self.appearance.hint_text),
+                    ));
                 }
                 if unread > 0 {
                     // Do-not-disturb rooms always show unread count as a dot (·); all others show the specific count (99+ above 99)
@@ -10594,5 +10733,182 @@ mod tests {
         let light_buffer = render_snapshot(&mut light_app, 120, 36);
         assert_eq!(light_buffer[(0u16, 1u16)].fg, Color::Rgb(168, 162, 147));
         assert_eq!(light_buffer[(59u16, 20u16)].bg, Color::Rgb(244, 241, 234));
+    }
+
+    /// A second group chat so the draft can be moved between two rooms
+    fn app_with_two_rooms() -> App {
+        let mut app = chat_page_app_for_render("default");
+        app.rooms.push(RoomInfo {
+            id: "room-two".to_string(),
+            name: Some("group room two".to_string()),
+            is_group: true,
+            created_by: "user-self".to_string(),
+            members: vec!["user-self".to_string(), "user-other".to_string()],
+            is_encrypted: false,
+            created_at: String::new(),
+        });
+        app
+    }
+
+    /// Every group chat keeps its own copy of the input box: switching away records the text under the room
+    /// being left (clearing the box) and puts the other room's own text back, and a draft that currently sits
+    /// in the box is no longer an entry of the cache.
+    #[test]
+    fn every_room_keeps_its_own_input_draft() {
+        let mut app = app_with_two_rooms();
+        // Typed into the first room, never sent
+        app.input_collector
+            .message_input_state
+            .set_text("hello room one");
+        app.switch_selected_room(1);
+        assert_eq!(
+            app.input_collector.message_input_state.text(),
+            "",
+            "opening another group chat must empty the box instead of carrying the text over"
+        );
+        assert_eq!(
+            app.room_drafts.get("room-one").map(String::as_str),
+            Some("hello room one"),
+            "the text must be recorded under the room it was typed into"
+        );
+        // Typed into the second room
+        app.input_collector
+            .message_input_state
+            .set_text("hello room two");
+        app.switch_selected_room(0);
+        assert_eq!(
+            app.input_collector.message_input_state.text(),
+            "hello room one",
+            "reopening a group chat must show its own saved text again"
+        );
+        assert_eq!(
+            app.room_drafts.get("room-two").map(String::as_str),
+            Some("hello room two"),
+            "the second room's text must wait in its own cache"
+        );
+        assert!(
+            !app.room_drafts.contains_key("room-one"),
+            "a draft living in the input box must not also sit in the cache"
+        );
+    }
+
+    /// Leaving the chat records what was typed and empties the box; an ordinary room refresh (same room still
+    /// selected) must leave the box alone, otherwise polling would wipe whatever is being typed.
+    #[test]
+    fn a_vanishing_room_records_the_draft_and_clears_the_box() {
+        let mut app = app_with_two_rooms();
+        app.input_collector
+            .message_input_state
+            .set_text("never sent");
+        // The same two rooms come back from a poll: nothing moved, so the box keeps its text
+        app.apply_room_snapshot(vec![app.rooms[0].clone(), app.rooms[1].clone()]);
+        assert_eq!(
+            app.input_collector.message_input_state.text(),
+            "never sent",
+            "a refresh that keeps the same room must not touch the input box"
+        );
+        // The open room disappears from the snapshot: record it, clear the box
+        app.apply_room_snapshot(Vec::new());
+        assert_eq!(
+            app.input_collector.message_input_state.text(),
+            "",
+            "the room is gone, so its text must leave the box"
+        );
+        assert_eq!(
+            app.room_drafts.get("room-one").map(String::as_str),
+            Some("never sent"),
+            "the text must be recorded in that room's own cache"
+        );
+    }
+
+    /// The room list marks a room holding unsent text with the localized "[草稿]xxx" — but never the room that
+    /// is open (its text is in the box already) and never an empty draft; the marker disappears with the text.
+    #[test]
+    fn room_list_marks_drafts_of_rooms_that_are_not_open() {
+        let mut app = app_with_two_rooms();
+        assert_eq!(
+            app.t("draft_mark"),
+            "[草稿]",
+            "the Chinese text of the draft marker must be [草稿]"
+        );
+        let marker = app.t("draft_mark");
+        app.room_drafts
+            .insert("room-two".to_string(), "回头再说".to_string());
+        // The open room's row must never repeat what the input box already shows
+        app.room_drafts
+            .insert("room-one".to_string(), "不该出现".to_string());
+        app.room_drafts
+            .insert("room-three".to_string(), "   ".to_string());
+        let marked = render_snapshot(&mut app, 140, 36);
+        assert!(
+            buffer_contains(&marked, &format!("{marker}回头再说")),
+            "a room with unsent text must show it behind the draft marker"
+        );
+        assert!(
+            !buffer_contains(&marked, &format!("{marker}不该出现")),
+            "the open room must not be marked, its text is in the input box"
+        );
+        // Taking the text back into the box removes the entry, and with it the marker
+        app.room_drafts.remove("room-two");
+        let restored = render_snapshot(&mut app, 140, 36);
+        assert!(
+            !buffer_contains(&restored, &format!("{marker}回头再说")),
+            "a restored draft must not stay marked in the list"
+        );
+    }
+
+    /// A draft preview is always one short line: whitespace (line breaks included) collapses into
+    /// single spaces and an over-long draft is cut to the column budget with an ellipsis, so a
+    /// multi-line or very long draft can never break the room list into extra rows.
+    #[test]
+    fn draft_preview_stays_one_short_line() {
+        assert_eq!(draft_preview("  hello \n world  ", 16), "hello world");
+        assert_eq!(draft_preview("", 16), "");
+        let long = "很长很长很长的草稿内容还有很多很多字";
+        let preview = draft_preview(long, DRAFT_PREVIEW_WIDTH);
+        assert!(
+            preview.ends_with('…'),
+            "an over-long draft must be cut with an ellipsis, got {preview}"
+        );
+        assert!(
+            display_width(&preview) <= DRAFT_PREVIEW_WIDTH,
+            "the preview must fit its column budget, got {} columns: {preview}",
+            display_width(&preview)
+        );
+        assert!(!preview.contains('\n'));
+        // The caret lands at the end of a restored draft, including the last line of a multi-line one
+        assert_eq!(draft_end_position("hello"), (5, 0));
+        assert_eq!(draft_end_position("hello\nworld"), (5, 1));
+    }
+
+    /// Closing a room above the selection keeps both the highlighted row and the input box on the room that
+    /// was open (the index would otherwise silently slide onto another chat and claim its draft), and closing
+    /// the open room itself records its text and empties the box.
+    #[test]
+    fn closing_a_room_keeps_the_draft_with_the_room_it_belongs_to() {
+        let mut app = app_with_two_rooms();
+        app.rooms_state.select(Some(1));
+        app.close_local_room("room-one");
+        assert_eq!(
+            app.selected_room_id().as_deref(),
+            Some("room-two"),
+            "closing a room above the selection must not move the highlight to another chat"
+        );
+        app.input_collector
+            .message_input_state
+            .set_text("typed in room two");
+        app.close_local_room("room-two");
+        assert_eq!(
+            app.input_collector.message_input_state.text(),
+            "",
+            "closing the open chat must empty the box"
+        );
+        assert_eq!(
+            app.room_drafts.get("room-two").map(String::as_str),
+            Some("typed in room two"),
+            "the text must be recorded in the cache of the room that was open"
+        );
+        assert!(app.rooms.is_empty());
+        assert!(app.rooms_state.selected().is_none());
     }
 }

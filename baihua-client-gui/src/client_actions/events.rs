@@ -223,7 +223,17 @@ impl Client {
         // Keep the same room while it still exists; nothing is ever selected on its
         // own, so opening a room is always the person's own click.
         self.selected_room_index = previous_selection
+            .as_deref()
             .and_then(|room_id| self.rooms.iter().position(|room| room.id == room_id));
+        // The selection really moved (the open room vanished, or the list re-ordered under a
+        // still-open room): the text in the box belongs to the room that was open, so it goes
+        // into that room's own draft cache and empties the box, and the room now open receives
+        // its own cached draft. Nothing typed ever lands in a different chat this way.
+        let now_selection = self.current_room_id();
+        if now_selection != previous_selection {
+            self.stash_room_draft(previous_selection.as_deref());
+            self.restore_room_draft(now_selection.as_deref());
+        }
         if added && had_rooms {
             self.restart_websocket();
         }

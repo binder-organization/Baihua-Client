@@ -22,6 +22,9 @@ pub struct RoomEntry {
     pub encrypted: bool,
     pub unread: u32,
     pub muted: bool,
+    /// Text typed into this room's input box but never sent, empty when there is none; the
+    /// room list appends it behind the localized "[Draft]" mark (see `room_row_draft_suffix`)
+    pub draft: String,
 }
 
 /// Command table shared by the command panel, input completion and `/command`,

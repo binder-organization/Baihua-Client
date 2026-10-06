@@ -13,6 +13,25 @@ fn room_row_label(title: &str, member_count: usize, encrypted_badge: Option<&str
     label
 }
 
+/// How many characters of an unsent draft the room list may show: a row is one line wide
+/// and already carries the title, the count and the badge, so a long draft is cut short.
+const DRAFT_PREVIEW_CHARS: usize = 16;
+
+/// The room-list suffix for a draft: the localized "[Draft]" mark followed by a one-line
+/// preview of the unsent text (whitespace collapsed, over-long text elided with "…").
+/// An empty draft yields an empty suffix, so the caller never has to special-case it.
+pub(crate) fn room_row_draft_suffix(mark: &str, draft: &str) -> String {
+    let flattened = draft.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.is_empty() {
+        return String::new();
+    }
+    if flattened.chars().count() <= DRAFT_PREVIEW_CHARS {
+        return format!(" {mark}{flattened}");
+    }
+    let preview: String = flattened.chars().take(DRAFT_PREVIEW_CHARS - 1).collect();
+    format!(" {mark}{preview}…")
+}
+
 /// A room list row
 pub(crate) struct RoomRow {
     pub(crate) index: usize,
@@ -62,15 +81,18 @@ pub(crate) fn draw_room_rows(
 
 impl BaihuaApp {
     pub(crate) fn room_rows(&self) -> Vec<RoomRow> {
+        let draft_mark = self.text("draft_mark");
         self.client
             .room_entries()
             .iter()
             .enumerate()
             .map(|(index, entry)| {
                 let marker = entry.encrypted.then(|| self.text("encrypted_badge"));
+                let mut label = room_row_label(&entry.title, entry.member_count, marker.as_deref());
+                label.push_str(&room_row_draft_suffix(&draft_mark, &entry.draft));
                 RoomRow {
                     index,
-                    label: room_row_label(&entry.title, entry.member_count, marker.as_deref()),
+                    label,
                     id: entry.id.clone(),
                     unread_badge: match (entry.unread, entry.muted) {
                         (0, _) => None,
@@ -184,12 +206,14 @@ impl BaihuaApp {
 
 #[cfg(test)]
 mod room_list_tests {
-    use super::{RoomRow, draw_room_rows, room_row_label};
+    use super::{
+        DRAFT_PREVIEW_CHARS, RoomRow, draw_room_rows, room_row_draft_suffix, room_row_label,
+    };
     use crate::app::auth::auth_draft_tests::test_app;
     use crate::app::room_row_height;
     use crate::app::test_support::frame;
     use crate::appearance::Skin;
-    use baihua_core::config::Palette;
+    use baihua_core::config::{self, Palette};
     use egui::{CentralPanel, Context, Rect};
 
     /// The whole room panel (real app, signed out: header, list, login row) must
@@ -287,6 +311,97 @@ mod room_list_tests {
             })
             .drop_without_applying_deltas();
         (rects, texts, available)
+    }
+
+    /// The draft suffix: the localized mark plus a one-line preview of the unsent
+    /// text. Blanks collapse, an over-long draft is cut short with an ellipsis, and
+    /// an empty (or blank-only) draft yields no suffix at all.
+    #[test]
+    fn draft_suffix_is_short_and_never_blank() {
+        assert_eq!(
+            room_row_draft_suffix("[Draft]", ""),
+            "",
+            "a room without unsent text must not be marked"
+        );
+        assert_eq!(
+            room_row_draft_suffix("[Draft]", "   \n "),
+            "",
+            "blanks are not something unsent, so they must not mark the row either"
+        );
+        assert_eq!(
+            room_row_draft_suffix("[草稿]", "half a line"),
+            " [草稿]half a line",
+            "the mark sits in front of the text, separated by one space"
+        );
+        assert_eq!(
+            room_row_draft_suffix("[Draft]", "  spaced   \t out  "),
+            " [Draft]spaced out",
+            "the preview must stay one line: runs of blanks collapse"
+        );
+        let over_long = "x".repeat(DRAFT_PREVIEW_CHARS + 5);
+        let suffix = room_row_draft_suffix("[Draft]", &over_long);
+        assert!(
+            suffix.starts_with(" [Draft]xxx"),
+            "the preview must keep the start of the text, got {suffix:?}"
+        );
+        assert!(
+            suffix.ends_with('…'),
+            "an over-long draft must be marked as cut short, got {suffix:?}"
+        );
+        assert_eq!(
+            suffix.chars().count(),
+            1 + "[Draft]".chars().count() + DRAFT_PREVIEW_CHARS,
+            "the whole suffix must stay as wide as one preview, got {suffix:?}"
+        );
+        assert_eq!(
+            room_row_draft_suffix("[Draft]", &"x".repeat(DRAFT_PREVIEW_CHARS)),
+            format!(" [Draft]{}", "x".repeat(DRAFT_PREVIEW_CHARS)),
+            "text exactly on the limit is shown whole, without an ellipsis"
+        );
+    }
+
+    /// The row really carries the suffix: a room holding unsent text is marked behind
+    /// its name, while the room whose text sits in the input box is not.
+    #[test]
+    fn row_marks_the_room_that_is_not_open() {
+        let Ok(language) = config::Language::load("zh-CN") else {
+            return;
+        };
+        let mut app = test_app();
+        app.client.language = language;
+        app.client.rooms = vec![
+            room_info("room-1", "team one"),
+            room_info("room-2", "team two"),
+        ];
+        // Room 2 is open (its text is in the box), room 1 is the one left behind with a draft.
+        app.client.selected_room_index = Some(1);
+        app.client
+            .room_drafts
+            .insert("room-1".to_string(), "half a line".to_string());
+        let rows = app.room_rows();
+        let mark = app.text("draft_mark");
+        assert_eq!(
+            rows[0].label,
+            format!("team one(1) {mark}half a line"),
+            "the left-behind room must show the mark and its text behind the name"
+        );
+        assert_eq!(
+            rows[1].label, "team two(1)",
+            "the open room must not repeat text that is sitting in the input box"
+        );
+    }
+
+    /// One room as the session layer hands it to the list: a group chat with a name.
+    fn room_info(id: &str, name: &str) -> baihua_core::api::RoomInfo {
+        baihua_core::api::RoomInfo {
+            id: id.to_string(),
+            name: Some(name.to_string()),
+            created_by: "user-a".to_string(),
+            created_at: "2026-09-06T00:00:00+00:00".to_string(),
+            is_group: true,
+            is_encrypted: false,
+            members: vec!["user-a".to_string()],
+        }
     }
 
     /// The member count follows the title with no gap; the encrypted marker last.

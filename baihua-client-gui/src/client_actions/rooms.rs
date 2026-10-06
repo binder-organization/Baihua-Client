@@ -20,12 +20,13 @@ impl Client {
         if self.selected_room_index == Some(index) {
             return;
         }
-        let previous_room = self
-            .selected_room_index
-            .and_then(|index| self.rooms.get(index).map(|room| room.id.clone()));
-        if let Some(previous_room) = previous_room {
-            self.cache_messages(&previous_room);
+        let previous_room = self.current_room_id();
+        if let Some(previous_room) = previous_room.as_deref() {
+            self.cache_messages(previous_room);
         }
+        // Switching group chats: the unsent text goes into the cache of the room being left (which also empties the
+        // box), and the room being opened gets its own saved text back — no draft ever leaks into another chat.
+        self.stash_room_draft(previous_room.as_deref());
         self.selected_room_index = Some(index);
         self.unread_counts.remove(&self.rooms[index].id);
         self.search_result = None;
@@ -37,6 +38,7 @@ impl Client {
         self.forget_room_detail();
         let room_id = self.rooms[index].id.clone();
         self.load_room_messages(&room_id);
+        self.restore_room_draft(self.current_room_id().as_deref());
     }
 
     /// A click on a room-list row: open that room, or close the selection when the
@@ -52,9 +54,13 @@ impl Client {
     /// Drop the room selection (back to "no room open"): cache the messages first,
     /// forget the cached roster too, clear search state.
     pub fn close_room_selection(&mut self) {
-        if let Some(room_id) = self.current_room_id() {
-            self.cache_messages(&room_id);
+        let leaving = self.current_room_id();
+        if let Some(room_id) = leaving.as_deref() {
+            self.cache_messages(room_id);
         }
+        // Leaving the chat records the text into that room's own draft cache and empties the box,
+        // so the row keeps showing "[Draft]xxx" until the room is opened again.
+        self.stash_room_draft(leaving.as_deref());
         self.selected_room_index = None;
         self.messages.clear();
         self.older_cursor = None;
@@ -63,6 +69,34 @@ impl Client {
         self.search_result = None;
         self.panel_search_result = None;
         self.forget_room_detail();
+    }
+
+    /// Move the input box text into the draft cache of `room_id` and empty the box ("leaving a chat clears the text
+    /// and stores the cache"). An empty box drops the entry rather than keeping an empty draft alive, so the room
+    /// list only marks rooms that really hold something unsent. `room_id` is passed in explicitly because the caller
+    /// usually asks before the selection (and with it the room the box belongs to) has changed.
+    pub fn stash_room_draft(&mut self, room_id: Option<&str>) {
+        let typed = self.draft.clone();
+        if let Some(room_id) = room_id {
+            if typed.is_empty() {
+                self.room_drafts.remove(room_id);
+            } else {
+                self.room_drafts.insert(room_id.to_string(), typed);
+            }
+        }
+        self.draft.clear();
+    }
+
+    /// Put the draft cached for `room_id` back into the input box (an empty box when that room has none). The entry
+    /// is *taken out* of the cache: while the text sits in the box it belongs to the open room, so the list does not
+    /// repeat it as a marker. A restored search draft is re-run through the input change handling.
+    pub fn restore_room_draft(&mut self, room_id: Option<&str>) {
+        self.draft = room_id
+            .and_then(|room_id| self.room_drafts.remove(room_id))
+            .unwrap_or_default();
+        if self.draft.starts_with('#') {
+            self.handle_draft_changed();
+        }
     }
 
     /// Load room messages: first fill from local cache, then fetch the first page from the server and merge by ID
@@ -207,6 +241,8 @@ impl Client {
                 encrypted: room.is_encrypted,
                 unread: self.unread_counts.get(&room.id).copied().unwrap_or(0),
                 muted: self.muted_room_ids.contains(&room.id),
+                // Only a room that is not open can have an entry here: opening a room takes its draft into the box
+                draft: self.room_drafts.get(&room.id).cloned().unwrap_or_default(),
             })
             .collect()
     }
@@ -214,14 +250,27 @@ impl Client {
     /// Hide a room locally (encrypted chat ended, left group): drop from the list,
     /// selection, and messages if it was the open one — never jump to another room.
     pub fn close_local_room(&mut self, room_id: &str) {
+        let leaving = self.current_room_id();
+        let was_selected = leaving.as_deref() == Some(room_id);
+        let removed_index = self.rooms.iter().position(|room| room.id == room_id);
         self.closed_room_ids.insert(room_id.to_string());
         self.crypto.sessions.remove(room_id);
         if let Some(cache) = self.chat_cache.as_ref() {
             cache.forget_room(room_id);
         }
-        let was_selected = self.current_room_id().as_deref() == Some(room_id);
         self.rooms.retain(|room| room.id != room_id);
+        // Removing a room above the selection shifts every following index: adjust it, otherwise the highlighted row
+        // — and with it the room the input box belongs to — would silently become another chat.
+        if let (Some(removed), Some(selected)) = (removed_index, self.selected_room_index)
+            && !was_selected
+            && removed < selected
+        {
+            self.selected_room_index = Some(selected - 1);
+        }
         if was_selected {
+            // Closing the chat view records what was typed and clears the box (the room is gone from the list,
+            // so the cache only matters if the same room id ever comes back)
+            self.stash_room_draft(leaving.as_deref());
             self.selected_room_index = None;
             self.messages.clear();
             self.older_cursor = None;
