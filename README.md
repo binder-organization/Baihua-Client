@@ -7,8 +7,8 @@
 [![Author: ChepleBob](https://img.shields.io/badge/Author-ChepleBob-00B4D8)](https://github.com/ChepleBob30)
 [![Language: Rust](https://img.shields.io/badge/Language-Rust-5F4C49)](https://www.rust-lang.org/)
 [![License: Apache v2](https://img.shields.io/badge/License-Apache%20v2-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
-[![TUI Version](https://img.shields.io/badge/TUI%20Version-v0.1.0-3D35DB)](https://github.com/binder-organization/Baihua-Client/releases)
-[![Core Version](https://img.shields.io/badge/Core%20Version-v0.3.0-EB9317)](https://github.com/binder-organization/Baihua-Client/tree/main/baihua-core)
+[![TUI Version](https://img.shields.io/badge/TUI%20Version-v0.1.2-3D35DB)](https://github.com/GavZheng/Baihua-Client/releases)
+[![Core Version](https://img.shields.io/badge/Core%20Version-v0.4.1-EB9317)](https://github.com/GavZheng/Baihua-Client/tree/main/baihua-core)
 
 [English](./README.md) | [简体中文](docs/zh-CN/README_zh-CN.md)
 
@@ -19,6 +19,7 @@
 - [Version Information](#version-information)
 - [Overview](#overview)
 - [Quick Start](#quick-start)
+- [Downloads](#downloads)
 - [Special Thanks](#special-thanks)
 - [Contributors](#contributors)
 - [License](#license)
@@ -72,7 +73,7 @@ Baihua is an instant messaging tool comprising three parts: server, TUI client, 
 
 ### Features
 
-The Baihua client supports two modes: TUI and GUI (not yet complete). The TUI version allows you to perform all operations quickly within the terminal, with a usage logic similar to `opencode`, suitable for developers to quickly adapt and actively communicate.
+The Baihua client supports TUI and GUI modes. The GUI is still under development. The TUI version allows you to perform operations quickly within the terminal, with a usage logic similar to `opencode`, suitable for developers to quickly adapt and actively communicate.
 Leveraging the powerful server, the client supports end-to-end encryption and JWT automatic login, offering both security and convenience. It also supports viewing read/unread status (to be added in the future) and whether others are typing.
 Currently, the client is in the testing phase, and we will continue adding new features.
 
@@ -86,8 +87,18 @@ For a long time, developers have had to switch between different software, consu
 
 ### TUI
 
-- In the future, the client will support installation via some package managers, and a GUI version will be added.
+- Download a CLI, TUI, or GUI build from the releases page. Package manager installation is not yet available.
 - After startup, use `/server_address` or select "Custom Server Address" in the settings to configure your Baihua server address, then call `/register` or select "Register" in the settings to register an account, and finally use `/login` or select "Login" in the settings to start chatting.
+
+---
+
+## Downloads
+
+[GitHub Releases](https://github.com/GavZheng/Baihua-Client/releases) contains separate CLI, TUI, and GUI releases. CLI and TUI provide macOS, Windows, and Linux archives. GUI provides macOS DMG, Windows MSI, Linux AppImage, Android APK, and iOS IPA packages. A platform package appears only after its release build succeeds.
+
+The iOS IPA is ad hoc signed and has no Apple provisioning profile. It cannot be installed on an iPhone through the normal installation process.
+
+For CI, versioning, and failure cleanup, see the [release maintenance guide](docs/release-maintenance.md).
 
 ---
 
@@ -99,8 +110,8 @@ Sincere thanks to the following people who have made outstanding contributions t
 
 ## Contributors
 
-<a href="https://github.com/binder-organization/Baihua-Client/contributors">
-  <img src="https://contrib.rocks/image?repo=binder-organization/Baihua-Client" alt="Contributors"/>
+<a href="https://github.com/GavZheng/Baihua-Client/contributors">
+  <img src="https://contrib.rocks/image?repo=GavZheng/Baihua-Client" alt="Contributors"/>
 </a>
 
 ---
