@@ -110,8 +110,8 @@ Sincere thanks to the following people who have made outstanding contributions t
 
 ## Contributors
 
-<a href="https://github.com/GavZheng/Baihua-Client/contributors">
-  <img src="https://contrib.rocks/image?repo=GavZheng/Baihua-Client" alt="Contributors"/>
+<a href="https://github.com/binder-organization/Baihua-Client/contributors">
+  <img src="https://contrib.rocks/image?repo=binder-organization/Baihua-Client" alt="Contributors"/>
 </a>
 
 ---
