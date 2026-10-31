@@ -1,0 +1,48 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Start check timer
+        run: echo "CHECK_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace
+      - name: Report check duration
+        if: always()
+        run: |
+          if [ -n "${CHECK_STARTED:-}" ]; then
+            elapsed=$(( ($(date +%s) - CHECK_STARTED) / 60 ))
+            echo "CI check: ${elapsed} minutes" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$elapsed" -gt 25 ]; then
+              echo "::warning::CI check exceeded the 25-minute budget"
+            fi
+          fi

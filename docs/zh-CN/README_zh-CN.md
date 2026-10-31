@@ -7,8 +7,8 @@
 [![作者: ChepleBob](https://img.shields.io/badge/作者-ChepleBob-00B4D8)](https://github.com/ChepleBob30)
 [![语言: Rust](https://img.shields.io/badge/语言-Rust-5F4C49)](https://www.rust-lang.org/)
 [![许可证: Apache v2](https://img.shields.io/badge/许可证-Apache%20v2-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
-[![TUI版本](https://img.shields.io/badge/TUI版本-v0.1.0-3D35DB)](https://github.com/binder-organization/Baihua-Client/releases)
-[![Core版本](https://img.shields.io/badge/Core版本-v0.3.0-EB9317)](https://github.com/binder-organization/Baihua-Client/tree/main/baihua-core)
+[![TUI版本](https://img.shields.io/badge/TUI版本-v0.1.2-3D35DB)](https://github.com/binder-organization/Baihua-Client/releases)
+[![Core版本](https://img.shields.io/badge/Core版本-v0.4.1-EB9317)](https://github.com/binder-organization/Baihua-Client/tree/main/baihua-core)
 
 [English](../../README.md) | [简体中文](./README_zh-CN.md)
 
@@ -19,6 +19,7 @@
 - [版本信息](#版本信息)
 - [总览](#总览)
 - [快速开始](#快速开始)
+- [下载](#下载)
 - [特别致谢](#特别致谢)
 - [贡献者](#贡献者)
 - [许可证](#许可证)
@@ -72,7 +73,7 @@
 
 ### 特色
 
-白桦客户端采用TUI和GUI(暂未完工)两种模式，TUI版本可在终端内快速完成所有操作，使用逻辑类似于`opencode`，适用于开发者快速适应并积极沟通。
+白桦客户端提供 TUI 和 GUI 两种模式，GUI 仍在开发中。TUI 版本可在终端内快速完成操作，使用逻辑类似于 `opencode`，适用于开发者快速适应并积极沟通。
 借由强大的服务端，客户端支持端对端加密与jwt自动登录，兼具安全与便利。还支持查看已读/未读(未来添加)与他人是否在打字。
 目前客户端处于测试阶段，我们将不断为客户端添加新的功能。
 
@@ -86,8 +87,16 @@
 
 ### TUI
 
-- 客户端会在未来支持在一些包管理器中安装，并添加GUI版本。
+- 从 Releases 页面下载 CLI、TUI 或 GUI 构建产物；目前还没有包管理器安装方式。
 - 启动后，使用/server_address或在设置中选择“自定义服务器地址”来配置你的白桦服务器地址，然后调用/register或在设置中选择“注册”来注册账号，最后使用/login或在设置中选择“登录”以开始聊天。
+
+---
+
+## 下载
+
+[GitHub Releases](https://github.com/binder-organization/Baihua-Client/releases) 分别发布 CLI、TUI 和 GUI。CLI、TUI 提供 macOS、Windows、Linux 压缩包；GUI 提供 macOS DMG、Windows MSI、Linux AppImage、Android APK 和 iOS IPA。对应平台构建成功后，产物才会出现在 Release 中。
+
+iOS IPA 使用临时签名，没有 Apple 描述文件，无法通过常规方式直接安装到 iPhone。
 
 ---
 

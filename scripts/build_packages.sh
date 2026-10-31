@@ -29,6 +29,7 @@ cd "${repository_root}"
 selected_end="all"
 selected_platform="host"
 selected_arch="all"
+skip_build="false"
 
 # Skip/failure notes live in files, not shell variables: isolated platform
 # steps run in subshells and must still report their outcome to the summary.
@@ -61,6 +62,7 @@ while [ $# -gt 0 ]; do
     --end) selected_end="$2"; shift 2 ;;
     --platform) selected_platform="$2"; shift 2 ;;
     --arch) selected_arch="$2"; shift 2 ;;
+    --skip-build) skip_build="true"; shift ;;
     --help)
       awk '/^set -euo/{exit} NR>=3{print}' "${BASH_SOURCE[0]}"
       exit 0 ;;
@@ -130,7 +132,8 @@ build_gui_mac() {
   for target in "${architectures[@]}"; do
     rustup target list --installed | grep -qx "${target}" \
       || rustup target add "${target}"
-    cargo build --release -p baihua-client-gui --target "${target}"
+    if [ "${skip_build}" != true ]; then cargo build --locked --release -p baihua-client-gui --target "${target}"; fi
+    test -f "target/${target}/release/baihua-gui"
     TARGET="${target}" VERSION="${gui_version}" PACKAGE_PREFIX="${gui_prefix}" \
       BINARY=baihua-gui BUNDLE_NAME=Baihua bash scripts/package_macos_bundle.sh
   done
@@ -145,7 +148,8 @@ build_gui_windows() {
     fi
     local target="x86_64-pc-windows-msvc"
     rustup target list --installed | grep -qx "${target}" || rustup target add "${target}"
-    cargo build --release -p baihua-client-gui --target "${target}"
+    if [ "${skip_build}" != true ]; then cargo build --locked --release -p baihua-client-gui --target "${target}"; fi
+    test -f "target/${target}/release/baihua-gui.exe"
     TARGET="${target}" VERSION="${gui_version}" PACKAGE_PREFIX="${gui_prefix}" \
       BINARY=baihua-gui.exe BUNDLE_NAME=Baihua bash scripts/package_windows_installer.sh
     return 0
@@ -182,7 +186,8 @@ build_gui_linux() {
     fi
     local target="x86_64-unknown-linux-gnu"
     rustup target list --installed | grep -qx "${target}" || rustup target add "${target}"
-    cargo build --release -p baihua-client-gui --target "${target}"
+    if [ "${skip_build}" != true ]; then cargo build --locked --release -p baihua-client-gui --target "${target}"; fi
+    test -f "target/${target}/release/baihua-gui"
     TARGET="${target}" VERSION="${gui_version}" PACKAGE_PREFIX="${gui_prefix}" \
       BINARY=baihua-gui BUNDLE_NAME=Baihua LINUXDEPLOY="${deploy}" \
       bash scripts/package_linux_appimage.sh
@@ -308,12 +313,12 @@ build_archive_bundle() {
 }
 
 build_cli_archives() {
-  cargo build --release -p baihua-cli
+  cargo build --locked --release -p baihua-cli
   build_archive_bundle cli baihua-cli "${cli_prefix}" "${cli_version}" baihua
 }
 
 build_tui_archives() {
-  cargo build --release -p baihua-client-tui
+  cargo build --locked --release -p baihua-client-tui
   build_archive_bundle tui baihua-client-tui "${tui_prefix}" "${tui_version}" baihua-tui
 }
 

@@ -156,7 +156,7 @@
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
         <Icon Id='ProductICO' SourceFile='baihua-client-gui\assets\baihua.ico'/>
         <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
-        <Property Id='ARPHELPLINK' Value='https://github.com/ChepleBob30/Baihua-Client'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/binder-organization/Baihua-Client'/>
 
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>
