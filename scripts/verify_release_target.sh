@@ -22,7 +22,7 @@ while IFS=$'\t' read -r product prefix version target kind standalone; do
   else
     (cd dist && sha256sum -c "$archive.sha256")
   fi
-  case "$product" in cli|tui) test -s "dist/$standalone" ;; esac
+  if [ "$product" = cli ]; then test -s "dist/$standalone"; fi
   count=$((count + 1))
 done < <(jq -r --arg target "$TARGET" '.[] | select(.target == $target) | [.product,.package_prefix,.version,.target,.package_kind,.standalone] | @tsv' <<< "$RELEASE_MATRIX")
 test "$count" -gt 0

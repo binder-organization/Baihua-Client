@@ -117,16 +117,14 @@ reconcile_assets() {
   }
 }
 
-# Check every archive, digest and standalone binary before creating any release.
+# Check every archive, digest and CLI standalone binary before creating any release.
 checked=0
 while IFS=$'\t' read -r product prefix version target kind standalone; do
   archive="$(archive_for "$product" "$prefix" "$version" "$target" "$kind")"
   test -s "artifacts/$archive"
   test -s "artifacts/$archive.sha256"
   (cd artifacts && sha256sum -c "$archive.sha256")
-  case "$product" in
-    cli|tui) test -s "artifacts/$standalone" ;;
-  esac
+  if [ "$product" = cli ]; then test -s "artifacts/$standalone"; fi
   checked=$((checked + 1))
 done < <(jq -r '.[] | [.product,.package_prefix,.version,.target,.package_kind,.standalone] | @tsv' <<< "$BUILD_MATRIX")
 test "$checked" -gt 0
@@ -158,7 +156,7 @@ The iOS IPA is ad hoc signed and has no Apple provisioning profile. It cannot be
   while IFS=$'\t' read -r prefix version target kind standalone; do
     archive="$(archive_for "$product" "$prefix" "$version" "$target" "$kind")"
     assets+=("artifacts/$archive" "artifacts/$archive.sha256")
-    case "$product" in cli|tui) assets+=("artifacts/$standalone") ;; esac
+    if [ "$product" = cli ]; then assets+=("artifacts/$standalone"); fi
   done < <(jq -r --arg product "$product" '.[] | select(.product == $product) | [.package_prefix,.version,.target,.package_kind,.standalone] | @tsv' <<< "$BUILD_MATRIX")
   test "${#assets[@]}" -gt 0
 

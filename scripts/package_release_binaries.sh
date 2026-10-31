@@ -23,16 +23,20 @@ for product in cli tui; do
   cp -R config/. "$staging/config/"
   if [ "$extension" = zip ]; then
     powershell.exe -NoProfile -Command "Compress-Archive -Path '${staging}/*' -DestinationPath 'dist/${archive}' -Force"
-    standalone="${prefix}${version}-${TARGET}.exe"
   else
     tar -czf "dist/$archive" -C "$staging" .
-    standalone="${prefix}${version}-${TARGET}"
   fi
   if command -v shasum >/dev/null 2>&1; then
     (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
   else
     (cd dist && sha256sum "$archive" > "$archive.sha256")
   fi
-  cp "target/${TARGET}/release/${binary}" "dist/${standalone}"
+  standalone="${prefix}${version}-${TARGET}"
+  case "$TARGET" in *windows*) standalone="${standalone}.exe" ;; esac
+  if [ "$product" = cli ]; then
+    cp "target/${TARGET}/release/${binary}" "dist/${standalone}"
+  else
+    rm -f "dist/${standalone}"
+  fi
   rm -rf "$staging"
 done

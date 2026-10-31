@@ -1,10 +1,8 @@
 # CI 与发布维护
 
-## 检查与分支规则
+## 检查
 
 PR 更新及 `main` 推送会触发 `CI`，运行格式检查、Clippy 和测试。Dependabot 每周五 00:00 UTC 检查 Cargo 依赖和 GitHub Actions 版本；其更新 PR 由普通 PR CI 检查。
-
-`main` 和 `develop` 的 Ruleset 不会随工作流文件自动启用。先让 `ci.yml` 在 `main` 成功运行，再预览 `bash scripts/activate_ci_ruleset.sh` 的配置，确认后由维护者执行 `bash scripts/activate_ci_ruleset.sh --apply`。规则要求 PR、人工批准和 `Lint and test` 检查；指定维护者可通过 PR 绕过规则。此脚本不会自动合并 PR。
 
 ## 版本与发布
 

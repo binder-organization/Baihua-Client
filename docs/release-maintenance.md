@@ -1,10 +1,8 @@
 # CI and Release Maintenance
 
-## Checks and Branch Rules
+## Checks
 
 Pull request updates and pushes to `main` trigger `CI`, which runs formatting checks, Clippy, and tests. Dependabot checks Cargo dependencies and GitHub Actions versions every Friday at 00:00 UTC. Dependabot update pull requests run through the normal pull request CI.
-
-The Ruleset for `main` and `develop` is not activated when the workflow files are merged. First, let `ci.yml` pass on `main`. Then preview the configuration with `bash scripts/activate_ci_ruleset.sh`. After reviewing it, a maintainer can run `bash scripts/activate_ci_ruleset.sh --apply`. The rules require a pull request, human approval, and the `Lint and test` check. Designated maintainers can bypass the rules through a pull request. The script does not merge pull requests automatically.
 
 ## Versions and Releases
 
