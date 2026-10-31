@@ -1,19 +1,15 @@
 #!/bin/zsh
-# Build an installable iPhone .ipa from this crate WITHOUT cargo-mobile (whose
+# Build an iPhone .ipa from this crate WITHOUT cargo-mobile (whose
 # `cargo apple` path needs Homebrew taps that are currently unreachable here).
 #
 # Prerequisites (all local, no network beyond rustup crates already vendored):
 #   rustup target add aarch64-apple-ios
 #   Xcode command line tools (`xcrun`, `swiftc`, `codesign`)
-#   one "Apple Development" signing identity (Xcode Settings ▸ Accounts adds a
-#   free one); provisioning happens automatically for devices registered to it.
 #
 # Usage (from the repository root):
-#   baihua-client-gui/ios/build-ipa.sh                    # unsigned dev .ipa
-#   CODE_SIGN_IDENTITY="Apple Development: you@example.com (TEAMID)" \
-#   baihua-client-gui/ios/build-ipa.sh                    # signed .ipa
-# Install with:  xcrun devicectl device install app target/ipa/Payload/Baihua.app
-# or drop the .ipa onto the device through Apple Configurator / Finder.
+#   baihua-client-gui/ios/build-ipa.sh
+# The bundle receives an ad hoc signature. Without a provisioning profile and
+# Apple-issued signature, this IPA cannot be installed normally on a device.
 set -euo pipefail
 
 target_triple="aarch64-apple-ios"
@@ -31,7 +27,7 @@ deployment_target="15.0"
 export IPHONEOS_DEPLOYMENT_TARGET="$deployment_target"
 
 echo "==> cargo build --release --target $target_triple (iOS $deployment_target)"
-(cd "$repository_root" && cargo build --release -p baihua-client-gui --target "$target_triple")
+(cd "$repository_root" && cargo build --locked --release -p baihua-client-gui --target "$target_triple")
 
 static_library="$repository_root/target/$target_triple/release/libbaihua_client_gui.a"
 sdk_path="$(xcrun --sdk $sdk_name --show-sdk-path)"
@@ -70,7 +66,7 @@ echo "==> vtool: record a pre-iOS-26 linked SDK"
 # split) has zero scene support -- tracked upstream as winit issue 4224 -- so
 # the only lever left is the recorded SDK field: rewriting it to 18.5 puts the
 # binary back under the legacy rules (warning, not death). The deployment
-# target (minos) stays at $deployment_target. Must run BEFORE codesign.
+# target (minos) stays at $deployment_target. Must run before ad hoc signing.
 # vtool spells the platform "ios" (lower-case); `iphoneos` is the SDK name,
 # not a platform token, and would be rejected with "unknown platform".
 xcrun vtool -arch arm64 \
@@ -90,25 +86,8 @@ sips -z 60 60 "$icon_source" --out "$output_directory/Baihua.app/AppIcon60x60.pn
 sips -z 120 120 "$icon_source" --out "$output_directory/Baihua.app/AppIcon120x120.png" >/dev/null
 printf 'APPL????' > "$output_directory/Baihua.app/PkgInfo"
 
-echo "==> codesign"
-if [ -z "${CODE_SIGN_IDENTITY:-}" ]; then
-    CODE_SIGN_IDENTITY="$(security find-identity -v -p codesigning | awk '/Apple Development/ {print $2; exit}')"
-fi
-if [ -z "${CODE_SIGN_IDENTITY:-}" ]; then
-    echo "no 'Apple Development' identity found: producing an UNSIGNED .ipa (simulator-only)." >&2
-    codesign_output=(--sign - --timestamp=none)
-else
-    codesign_output=(--sign "$CODE_SIGN_IDENTITY" --timestamp=none)
-fi
-if [ -n "${MOBILE_PROVISION:-}" ]; then
-    # A development profile (Xcode ▸ Accounts ▸ Download Manual Profiles, or
-    # generated on the developer portal) makes the bundle installable on the
-    # devices listed in it.
-    cp "$MOBILE_PROVISION" "$output_directory/Baihua.app/embedded.mobileprovision"
-fi
-codesign --force "${codesign_output[@]}" \
-    --entitlements "$script_directory/Runner/entitlements.plist" \
-    "$output_directory/Baihua.app"
+echo "==> ad hoc codesign"
+codesign --force --sign - --timestamp=none "$output_directory/Baihua.app"
 
 echo "==> package .ipa"
 mkdir -p "$output_directory/Payload"

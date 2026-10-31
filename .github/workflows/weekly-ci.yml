@@ -1,0 +1,80 @@
+name: Weekly CI
+on:
+  schedule:
+    - cron: '0 0 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  branches:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - name: List branch tips
+        id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branches=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/branches?per_page=100" \
+            --jq '.[] | select(.name != "main") | {branch:.name,sha:.commit.sha}' | jq -sc '.')
+          echo "matrix=${branches}" >> "$GITHUB_OUTPUT"
+  check:
+    name: Weekly lint and test
+    needs: branches
+    if: needs.branches.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJson(needs.branches.outputs.matrix) }}
+    steps:
+      - name: Start check timer
+        run: echo "CHECK_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: weekly-${{ matrix.branch }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace
+      - name: Record result on the checked commit
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKED_SHA: ${{ matrix.sha }}
+          CHECK_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          state=failure
+          if [ "$CHECK_STATUS" = success ]; then state=success; fi
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${CHECKED_SHA}" \
+            -f state="$state" -f context='weekly-ci/lint-and-test-v1-rust-1.98.1' \
+            -f description="Weekly CI ${state}"
+      - name: Report check duration
+        if: always()
+        run: |
+          if [ -n "${CHECK_STARTED:-}" ]; then
+            elapsed=$(( ($(date +%s) - CHECK_STARTED) / 60 ))
+            echo "${{ matrix.branch }} weekly check: ${elapsed} minutes" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$elapsed" -gt 25 ]; then
+              echo "::warning::${{ matrix.branch }} weekly check exceeded the 25-minute budget"
+            fi
+          fi

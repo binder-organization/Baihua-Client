@@ -1,6 +1,6 @@
 # The three ends release independently: `baihua` (cli-v<version>), `baihua-gui`
 # (gui-v<version>) and `baihua-tui` (tui-v<version>). Versions, tags and packages are
-# separate, and one end builds and publishes only while its tag does not exist yet.
+# separate, and one end builds and publishes when its version is still unpublished.
 #
 # The version comes from each package's own Cargo.toml, the notes from its changelog:
 #   baihua-cli/Cargo.toml          + CHANGELOG_CLI.md   -> cli-v<version>
@@ -11,7 +11,7 @@
 # while a change touching several packages releases each of them side by side.
 #
 # An end releases when both hold: its Cargo.toml version has a `## [version]` section
-# in its changelog, and that tag does not exist yet. Code without a changelog section
+# in its changelog, and the version has not been published yet. Code without a changelog section
 # stays unpublished (the prepare job logs a warning), so a push never releases by accident.
 # Artifacts of every build:
 #   baihua-cli-<version>-<target>.tar.gz / .zip  (holding `baihua` and config/)
@@ -22,24 +22,66 @@
 name: Build Release
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
 jobs:
+  gate:
+    name: Verify checked main commit
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      - name: Verify source and check result
+        id: verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          CHECK_EVENT: ${{ github.event.workflow_run.event }}
+          CHECK_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CHECK_SHA: ${{ github.event.workflow_run.head_sha }}
+          CHECK_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')"
+          if [ "$EVENT_NAME" = workflow_run ]; then
+            [ "$CHECK_EVENT" = push ] && [ "$CHECK_BRANCH" = main ] && \
+              [ "$CHECK_CONCLUSION" = success ] && [ "$CHECK_SHA" = "$main_sha" ]
+          else
+            [ "${GITHUB_REF}" = refs/heads/main ] && [ "$GITHUB_SHA" = "$main_sha" ]
+          fi
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100" \
+            --jq "[.workflow_runs[] | select(.head_sha == \"${main_sha}\")] | sort_by(.updated_at // .run_started_at // .created_at, .id) | last | .conclusion // empty")"
+          [ "$latest" = success ] || { echo "latest main CI for ${main_sha} is ${latest:-missing}" >&2; exit 1; }
+          echo "sha=${main_sha}" >> "$GITHUB_OUTPUT"
+
   # ---------------------------------------------------------------------------
   # Read each end's version, changelog and existing tags, decide which ends release,
-  # and build the (end x target) matrix for the build job. The criterion is "the tag
-  # of that version does not exist yet", so one version is never published twice.
+  # and build the end/target manifest plus a target-grouped build matrix.
+  # A managed draft for the same SHA may be resumed after an interrupted run.
   # ---------------------------------------------------------------------------
   prepare:
     name: Prepare release metadata
+    needs: gate
     runs-on: ubuntu-latest
     outputs:
       build_matrix: ${{ steps.metadata.outputs.build_matrix }}
+      release_matrix: ${{ steps.metadata.outputs.release_matrix }}
       cli_release: ${{ steps.metadata.outputs.cli_release }}
       cli_tag: ${{ steps.metadata.outputs.cli_tag }}
       cli_prerelease: ${{ steps.metadata.outputs.cli_prerelease }}
@@ -55,12 +97,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.gate.outputs.sha }}
           # The existing tags are needed to tell whether this version was released
           fetch-depth: 0
 
       - name: Read versions, changelogs and existing tags
         id: metadata
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -127,6 +173,13 @@ jobs:
             tag="${tag_prefix}${version}"
             if git rev-parse -q --verify "refs/tags/${tag}" > /dev/null; then
               release="false"
+              existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null || true)"
+              if [ -n "$existing" ] && \
+                 [ "$(jq -r '.draft' <<< "$existing")" = true ] && \
+                 [ "$(jq -r '.target_commitish' <<< "$existing")" = "$RELEASE_SHA" ] && \
+                 [[ "$(jq -r '.body' <<< "$existing")" == *"baihua-release-run:"*"sha:${RELEASE_SHA} -->"* ]]; then
+                release="true"
+              fi
             else
               release="true"
             fi
@@ -167,112 +220,82 @@ jobs:
               done
             fi
           done
-          echo "build_matrix=[${build_matrix_entries}]" >> "$GITHUB_OUTPUT"
+          release_matrix="[${build_matrix_entries}]"
+          echo "release_matrix=${release_matrix}" >> "$GITHUB_OUTPUT"
+          echo "build_matrix=$(jq -c 'group_by(.target) | map({target:.[0].target, runner:.[0].runner, package_kind:.[0].package_kind, products:(map(.product) | join(","))})' <<< "$release_matrix")" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Formatting, clippy and tests run on every push, release or not
-  # ---------------------------------------------------------------------------
-  check:
-    name: Lint and test
-    needs: prepare
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Format check
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
-
-  # ---------------------------------------------------------------------------
-  # The build matrix holds only the ends releasing now, one runner per target
+  # One runner per target compiles all selected desktop ends together.
   # ---------------------------------------------------------------------------
   build:
-    name: Build ${{ matrix.product }} for ${{ matrix.target }}
-    needs: [prepare, check]
+    name: Build ${{ matrix.target }}
+    needs: [gate, prepare]
     if: needs.prepare.outputs.build_matrix != '[]'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.prepare.outputs.build_matrix) }}
     steps:
+      - name: Start build timer
+        shell: bash
+        run: echo "BUILD_STARTED=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.product }}-${{ matrix.target }}
+          key: release-${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Build selected desktop binaries together
         if: matrix.package_kind != 'apk' && matrix.package_kind != 'ipa'
-        run: cargo build --release -p ${{ matrix.package }} --target ${{ matrix.target }}
-
-      # -- Packaging (Unix) ----------------------------------------------------
-      - name: Package (Unix)
-        if: runner.os != 'Windows' && matrix.bundle_name == ''
         shell: bash
         run: |
-          archive="${{ matrix.package_prefix }}${{ matrix.version }}-${{ matrix.target }}.tar.gz"
-          staging="staging-${{ matrix.target }}"
-
-          mkdir -p "${staging}/config"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${staging}/"
-          cp -R config/. "${staging}/config/"
-
-          tar -czf "${archive}" -C "${staging}" .
-          shasum -a 256 "${archive}" > "${archive}.sha256"
-
-          echo "archive=${archive}" >> "$GITHUB_ENV"
-          rm -rf "${staging}"
-
-      # -- Packaging (Windows) -------------------------------------------------
-      - name: Package (Windows)
-        if: runner.os == 'Windows' && matrix.bundle_name == ''
-        shell: pwsh
-        run: |
-          $archive = "${{ matrix.package_prefix }}${{ matrix.version }}-${{ matrix.target }}.zip"
-          $staging = "staging-${{ matrix.target }}"
-
-          New-Item -ItemType Directory -Force "${staging}\config" | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" "${staging}\"
-          Copy-Item -Recurse config\* "${staging}\config\"
-
-          Compress-Archive -Path "${staging}\*" -DestinationPath $archive
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
-          "${hash}  ${archive}" | Set-Content "${archive}.sha256"
-
-          echo "archive=${archive}" >> $env:GITHUB_ENV
-          Remove-Item -Recurse -Force $staging
+          packages=()
+          case ",${{ matrix.products }}," in *,cli,*) packages+=(-p baihua-cli) ;; esac
+          case ",${{ matrix.products }}," in *,gui,*) packages+=(-p baihua-client-gui) ;; esac
+          case ",${{ matrix.products }}," in *,tui,*) packages+=(-p baihua-client-tui) ;; esac
+          cargo build --locked --release --target '${{ matrix.target }}' "${packages[@]}"
 
       # -- Toolchains only installer kinds need (each cheap, each conditional) --
+      - name: Cache the Windows installer builder
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'msi'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-wix.exe
+          key: cargo-wix-0.3.9-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install the Windows installer builder
-        if: matrix.bundle_name != '' && matrix.package_kind == 'msi'
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'msi'
         shell: bash
-        run: cargo install cargo-wix --version 0.3.9 --locked
+        run: |
+          if ! command -v cargo-wix >/dev/null; then
+            cargo install cargo-wix --version 0.3.9 --locked
+          fi
 
       - name: Cache the Android debug keystore
-        if: matrix.bundle_name != '' && matrix.package_kind == 'apk'
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'apk'
         uses: actions/cache@v4
         with:
           path: ~/.android/debug.keystore
           key: baihua-android-debug-keystore
 
+      - name: Cache the Android installer builder
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'apk'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-apk
+          key: cargo-apk-v1-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install the Android toolchain
-        if: matrix.bundle_name != '' && matrix.package_kind == 'apk'
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'apk'
         shell: bash
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.CARGO_APK_RELEASE_KEYSTORE_BASE64 }}
@@ -280,7 +303,9 @@ jobs:
           RELEASE_KEY_ALIAS: ${{ secrets.CARGO_APK_RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.CARGO_APK_RELEASE_KEY_PASSWORD }}
         run: |
-          cargo install cargo-apk --locked
+          if ! command -v cargo-apk >/dev/null; then
+            cargo install cargo-apk --locked
+          fi
           # The runner image ships an NDK already; install one only when none
           # exists. sdkmanager lives under cmdline-tools, not on the PATH.
           if ! ls "${ANDROID_HOME}/ndk" > /dev/null 2>&1; then
@@ -309,20 +334,36 @@ jobs:
           fi
           test -f "${HOME}/.android/debug.keystore" || [ -n "${RELEASE_KEYSTORE_BASE64:-}" ]
 
+      - name: Cache macOS packaging Python wheels
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'dmg'
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: dmgbuild-pip-v1-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install the macOS disk image builder
-        if: matrix.bundle_name != '' && matrix.package_kind == 'dmg'
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'dmg'
         shell: bash
         run: |
           python3 -m venv "$HOME/dmgbuild-environment"
           "$HOME/dmgbuild-environment/bin/pip" install dmgbuild
           echo "DMGBUILD_PYTHON=$HOME/dmgbuild-environment/bin/python3" >> "$GITHUB_ENV"
 
+      - name: Cache the Linux AppImage builder
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'appimage'
+        uses: actions/cache@v4
+        with:
+          path: ~/linuxdeploy
+          key: linuxdeploy-x86_64-v1
+
       - name: Install the Linux AppImage builder
-        if: matrix.bundle_name != '' && matrix.package_kind == 'appimage'
+        if: contains(matrix.products, 'gui') && matrix.package_kind == 'appimage'
         shell: bash
         run: |
-          curl -fL -o "$HOME/linuxdeploy" \
-            https://github.com/linuxdeploy/linuxdeploy/releases/latest/download/linuxdeploy-x86_64.AppImage
+          if [ ! -s "$HOME/linuxdeploy" ]; then
+            curl -fL -o "$HOME/linuxdeploy" \
+              https://github.com/linuxdeploy/linuxdeploy/releases/latest/download/linuxdeploy-x86_64.AppImage
+          fi
           chmod +x "$HOME/linuxdeploy"
           echo "LINUXDEPLOY=$HOME/linuxdeploy" >> "$GITHUB_ENV"
           echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
@@ -331,7 +372,7 @@ jobs:
       # Every kind routes through scripts/build_packages.sh, the same entry a
       # developer runs locally, so CI and the machine can never diverge.
       - name: Package the installer bundle
-        if: matrix.bundle_name != ''
+        if: contains(matrix.products, 'gui')
         shell: bash
         run: |
           case "${{ matrix.package_kind }}" in
@@ -340,204 +381,107 @@ jobs:
                 aarch64*) arch=arm ;;
                 *) arch=x86 ;;
               esac
-              scripts/build_packages.sh --end gui --platform mac --arch "$arch"
+              scripts/build_packages.sh --end gui --platform mac --arch "$arch" --skip-build
               ;;
-            msi) scripts/build_packages.sh --end gui --platform windows ;;
-            appimage) scripts/build_packages.sh --end gui --platform linux ;;
+            msi) scripts/build_packages.sh --end gui --platform windows --skip-build ;;
+            appimage) scripts/build_packages.sh --end gui --platform linux --skip-build ;;
             apk) scripts/build_packages.sh --end gui --platform android ;;
-            ipa) scripts/build_packages.sh --end gui --platform ios ;;
+            ipa)
+              scripts/build_packages.sh --end gui --platform ios
+              ;;
           esac
 
-      # Installer scripts record the package as dist/<file>; the artifact name
-      # must be the bare file, so strip the directory in a step of its own.
-      - name: Record the installer package name
-        if: matrix.bundle_name != ''
+      - name: Package command line and terminal binaries
+        if: matrix.package_kind != 'apk' && matrix.package_kind != 'ipa'
         shell: bash
-        run: echo "archive_name=${archive##*/}" >> "$GITHUB_ENV"
+        env:
+          PRODUCTS: ${{ matrix.products }}
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/package_release_binaries.sh
 
-      # -- Upload the package and its digest -----------------------------------
-      - name: Upload package
+      - name: Verify staged artifacts
+        shell: bash
+        env:
+          RELEASE_MATRIX: ${{ needs.prepare.outputs.release_matrix }}
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/verify_release_target.sh
+
+      - name: Upload target artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.archive_name || env.archive }}
-          path: |
-            ${{ env.archive }}
-            ${{ env.archive }}.sha256
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
           retention-days: 30
-
-      # -- Upload the standalone executable (for a direct download) -------------
-      - name: Stage standalone executable
-        if: matrix.bundle_name == ''
+      - name: Report build duration
+        if: always()
         shell: bash
         run: |
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.standalone }}"
+          if [ -n "${BUILD_STARTED:-}" ]; then
+            elapsed=$(( ($(date +%s) - BUILD_STARTED) / 60 ))
+            echo "${{ matrix.target }} build: ${elapsed} minutes" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$elapsed" -gt 35 ]; then
+              echo "::warning::${{ matrix.target }} build exceeded the 35-minute budget"
+            fi
+          fi
 
-      - name: Upload standalone executable
-        if: matrix.bundle_name == ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.standalone }}
-          path: ${{ matrix.standalone }}
-          retention-days: 30
-
-  # ---------------------------------------------------------------------------
-  # Each end publishes on its own; the job is skipped entirely when it is not releasing
-  # ---------------------------------------------------------------------------
-  release-cli:
-    name: Publish command line release
-    needs: [prepare, build]
-    if: needs.prepare.outputs.cli_release == 'true'
+  # Publish the complete set in one job. The script verifies every expected asset
+  # before it creates drafts and deletes only drafts/releases marked for this run.
+  publish:
+    name: Verify and publish release set
+    needs: [gate, prepare, build]
+    if: needs.prepare.outputs.build_matrix != '[]'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_SHA: ${{ needs.gate.outputs.sha }}
+      BUILD_MATRIX: ${{ needs.prepare.outputs.release_matrix }}
+      CLI_ENABLED: ${{ needs.prepare.outputs.cli_release }}
+      CLI_TAG: ${{ needs.prepare.outputs.cli_tag }}
+      CLI_PRERELEASE: ${{ needs.prepare.outputs.cli_prerelease }}
+      CLI_NOTES: ${{ needs.prepare.outputs.cli_changelog }}
+      GUI_ENABLED: ${{ needs.prepare.outputs.gui_release }}
+      GUI_TAG: ${{ needs.prepare.outputs.gui_tag }}
+      GUI_PRERELEASE: ${{ needs.prepare.outputs.gui_prerelease }}
+      GUI_NOTES: ${{ needs.prepare.outputs.gui_changelog }}
+      TUI_ENABLED: ${{ needs.prepare.outputs.tui_release }}
+      TUI_TAG: ${{ needs.prepare.outputs.tui_tag }}
+      TUI_PRERELEASE: ${{ needs.prepare.outputs.tui_prerelease }}
+      TUI_NOTES: ${{ needs.prepare.outputs.tui_changelog }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download command line artifacts
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: baihua-cli-*
           merge-multiple: true
-
-      - name: List release assets
+      - name: Verify assets and publish
         shell: bash
-        run: |
-          ls -lh artifacts/
-          if [ -z "$(ls -A artifacts/)" ]; then
-            echo "::error::no artifact was downloaded for the command line end"
-            exit 1
-          fi
+        run: bash scripts/publish_releases.sh
 
-      - name: Create tag and release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.cli_tag }}
-          RELEASE_PRERELEASE: ${{ needs.prepare.outputs.cli_prerelease }}
-          RELEASE_NOTES: ${{ needs.prepare.outputs.cli_changelog }}
-        shell: bash
-        run: |
-          release_notes_file="${RUNNER_TEMP}/release-notes.md"
-          printf '%s' "$RELEASE_NOTES" > "${release_notes_file}"
-
-          git tag "$RELEASE_TAG"
-          git push origin "$RELEASE_TAG"
-
-          release_arguments=(
-            "$RELEASE_TAG"
-            "--title" "$RELEASE_TAG"
-            "--notes-file" "${release_notes_file}"
-          )
-          if [ "$RELEASE_PRERELEASE" = "true" ]; then
-            release_arguments+=("--prerelease")
-          fi
-          for release_asset in artifacts/*; do
-            release_arguments+=("$release_asset")
-          done
-          gh release create "${release_arguments[@]}"
-
-  release-gui:
-    name: Publish graphical release
-    needs: [prepare, build]
-    if: needs.prepare.outputs.gui_release == 'true'
+  cleanup:
+    name: Clean failed release run
+    needs: [gate, prepare, build, publish]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.build_matrix != '[]' && needs.publish.result != 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_SHA: ${{ needs.gate.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download graphical artifacts
-        uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          pattern: baihua-gui-*
-          merge-multiple: true
-
-      - name: List release assets
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - name: Delete this run's managed releases and owned tags
         shell: bash
-        run: |
-          ls -lh artifacts/
-          if [ -z "$(ls -A artifacts/)" ]; then
-            echo "::error::no artifact was downloaded for the graphical end"
-            exit 1
-          fi
-
-      - name: Create tag and release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.gui_tag }}
-          RELEASE_PRERELEASE: ${{ needs.prepare.outputs.gui_prerelease }}
-          RELEASE_NOTES: ${{ needs.prepare.outputs.gui_changelog }}
-        shell: bash
-        run: |
-          release_notes_file="${RUNNER_TEMP}/release-notes.md"
-          printf '%s' "$RELEASE_NOTES" > "${release_notes_file}"
-
-          git tag "$RELEASE_TAG"
-          git push origin "$RELEASE_TAG"
-
-          release_arguments=(
-            "$RELEASE_TAG"
-            "--title" "$RELEASE_TAG"
-            "--notes-file" "${release_notes_file}"
-          )
-          if [ "$RELEASE_PRERELEASE" = "true" ]; then
-            release_arguments+=("--prerelease")
-          fi
-          for release_asset in artifacts/*; do
-            release_arguments+=("$release_asset")
-          done
-          gh release create "${release_arguments[@]}"
-
-  release-tui:
-    name: Publish terminal release
-    needs: [prepare, build]
-    if: needs.prepare.outputs.tui_release == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download terminal artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: baihua-tui-*
-          merge-multiple: true
-
-      - name: List release assets
-        shell: bash
-        run: |
-          ls -lh artifacts/
-          if [ -z "$(ls -A artifacts/)" ]; then
-            echo "::error::no artifact was downloaded for the terminal end"
-            exit 1
-          fi
-
-      - name: Create tag and release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tui_tag }}
-          RELEASE_PRERELEASE: ${{ needs.prepare.outputs.tui_prerelease }}
-          RELEASE_NOTES: ${{ needs.prepare.outputs.tui_changelog }}
-        shell: bash
-        run: |
-          release_notes_file="${RUNNER_TEMP}/release-notes.md"
-          printf '%s' "$RELEASE_NOTES" > "${release_notes_file}"
-
-          git tag "$RELEASE_TAG"
-          git push origin "$RELEASE_TAG"
-
-          release_arguments=(
-            "$RELEASE_TAG"
-            "--title" "$RELEASE_TAG"
-            "--notes-file" "${release_notes_file}"
-          )
-          if [ "$RELEASE_PRERELEASE" = "true" ]; then
-            release_arguments+=("--prerelease")
-          fi
-          for release_asset in artifacts/*; do
-            release_arguments+=("$release_asset")
-          done
-          gh release create "${release_arguments[@]}"
+        run: bash scripts/cleanup_release_run.sh
