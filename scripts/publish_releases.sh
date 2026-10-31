@@ -41,8 +41,9 @@ tag_sha_or_missing() {
 
 tag_commit_for() {
   local tag="$1" ref object_type object_sha
-  ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/dev/null || true)"
-  [ -n "$ref" ] || return 1
+  object_sha="$(tag_sha_or_missing "$tag")"
+  [ "$object_sha" != missing ] || return 0
+  ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
   object_type="$(jq -r '.object.type' <<< "$ref")"
   object_sha="$(jq -r '.object.sha' <<< "$ref")"
   if [ "$object_type" = tag ]; then
@@ -147,7 +148,7 @@ for product in cli gui tui; do
 
 The iOS IPA is ad hoc signed and has no Apple provisioning profile. It cannot be installed on an iPhone through the normal installation process."
   fi
-  tag_commit="$(tag_commit_for "$tag" || true)"
+  tag_commit="$(tag_commit_for "$tag")"
   if [ -n "$tag_commit" ] && [ "$tag_commit" != "$RELEASE_SHA" ]; then
     echo "tag ${tag} points to ${tag_commit}, not ${RELEASE_SHA}" >&2
     exit 1
