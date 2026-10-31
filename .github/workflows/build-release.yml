@@ -173,7 +173,7 @@ jobs:
             tag="${tag_prefix}${version}"
             if git rev-parse -q --verify "refs/tags/${tag}" > /dev/null; then
               release="false"
-              existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null || true)"
+              existing="$(bash scripts/find_release_by_tag.sh "$tag")"
               if [ -n "$existing" ] && \
                  [ "$(jq -r '.draft' <<< "$existing")" = true ] && \
                  [ "$(jq -r '.target_commitish' <<< "$existing")" = "$RELEASE_SHA" ] && \

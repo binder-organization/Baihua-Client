@@ -22,8 +22,9 @@ archive_for() {
 }
 
 release_id_for() {
-  local tag="$1"
-  gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.id' 2>/dev/null || true
+  local tag="$1" release
+  release="$(bash scripts/find_release_by_tag.sh "$tag")"
+  [ -z "$release" ] || jq -r '.id' <<< "$release"
 }
 
 tag_sha_or_missing() {
@@ -94,9 +95,9 @@ verify_main_ci() {
 }
 
 reconcile_assets() {
-  local tag="$1" release_json name id expected_names actual_names path found
-  shift
-  release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+  local tag="$1" release_id="$2" release_json name id expected_names actual_names path found
+  shift 2
+  release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
   while IFS=$'\t' read -r id name; do
     found=no
     for path in "$@"; do
@@ -106,7 +107,7 @@ reconcile_assets() {
       gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${id}"
     fi
   done < <(jq -r '.assets[] | [.id,.name] | @tsv' <<< "$release_json")
-  release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+  release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
   expected_names="$(printf '%s\n' "$@" | sed 's|.*/||' | sort)"
   actual_names="$(jq -r '.assets[] | select(.size > 0) | .name' <<< "$release_json" | sort)"
   [ "$expected_names" = "$actual_names" ] || {
@@ -160,7 +161,7 @@ The iOS IPA is ad hoc signed and has no Apple provisioning profile. It cannot be
   done < <(jq -r --arg product "$product" '.[] | select(.product == $product) | [.package_prefix,.version,.target,.package_kind,.standalone] | @tsv' <<< "$BUILD_MATRIX")
   test "${#assets[@]}" -gt 0
 
-  existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null || true)"
+  existing="$(bash scripts/find_release_by_tag.sh "$tag")"
   if [ -n "$existing" ]; then
     existing_draft="$(jq -r '.draft' <<< "$existing")"
     existing_sha="$(jq -r '.target_commitish' <<< "$existing")"
@@ -191,8 +192,9 @@ The iOS IPA is ad hoc signed and has no Apple provisioning profile. It cannot be
     [ "${!prerelease_var}" != true ] || args+=(--prerelease)
     gh release create "${args[@]}" "${assets[@]}"
   fi
-  test -n "$(release_id_for "$tag")"
-  reconcile_assets "$tag" "${assets[@]}"
+  release_id="$(release_id_for "$tag")"
+  test -n "$release_id"
+  reconcile_assets "$tag" "$release_id" "${assets[@]}"
   publish_tags+=("$tag")
 done
 
