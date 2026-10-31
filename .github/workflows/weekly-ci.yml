@@ -70,11 +70,13 @@ jobs:
             -f description="Weekly CI ${state}"
       - name: Report check duration
         if: always()
+        env:
+          BRANCH_NAME: ${{ matrix.branch }}
         run: |
           if [ -n "${CHECK_STARTED:-}" ]; then
             elapsed=$(( ($(date +%s) - CHECK_STARTED) / 60 ))
-            echo "${{ matrix.branch }} weekly check: ${elapsed} minutes" >> "$GITHUB_STEP_SUMMARY"
+            echo "${BRANCH_NAME} weekly check: ${elapsed} minutes" >> "$GITHUB_STEP_SUMMARY"
             if [ "$elapsed" -gt 25 ]; then
-              echo "::warning::${{ matrix.branch }} weekly check exceeded the 25-minute budget"
+              echo "::warning::${BRANCH_NAME} weekly check exceeded the 25-minute budget"
             fi
           fi

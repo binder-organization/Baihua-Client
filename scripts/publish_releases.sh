@@ -26,6 +26,18 @@ release_id_for() {
   gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.id' 2>/dev/null || true
 }
 
+tag_sha_or_missing() {
+  local ref response first_line
+  if ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${1}" 2>/dev/null)"; then
+    jq -r '.object.sha' <<< "$ref"
+    return
+  fi
+  response="$(gh api -i "repos/${GITHUB_REPOSITORY}/git/ref/tags/${1}" 2>&1)" || true
+  first_line="${response%%$'\n'*}"
+  [[ "$first_line" =~ ^HTTP/[0-9.]+[[:space:]]+404([[:space:]]|$) ]] || return 1
+  printf 'missing\n'
+}
+
 tag_commit_for() {
   local tag="$1" ref object_type object_sha
   ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/dev/null || true)"
@@ -39,24 +51,38 @@ tag_commit_for() {
 }
 
 cleanup() {
-  local tag id body tag_sha
+  local tag id body tag_sha owned_tag failed=0
   for tag in "${created_tags[@]}"; do
     id="$(release_id_for "$tag")"
     [ -n "$id" ] || continue
     body="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${id}" --jq '.body' 2>/dev/null || true)"
     [[ "$body" == *"$marker"* ]] || continue
-    gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}" || true
+    owned_tag=no
     for owned_tag in "${created_tag_refs[@]}"; do
       if [ "$owned_tag" = "$tag" ]; then
-        tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null || true)"
-        if [ "$tag_sha" = "$RELEASE_SHA" ]; then
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" || true
+        if ! tag_sha="$(tag_sha_or_missing "$tag")"; then
+          echo "::error::could not verify this run's tag ${tag}" >&2
+          failed=1
+          continue 2
+        fi
+        if [ "$tag_sha" != missing ]; then
+          if [ "$tag_sha" != "$RELEASE_SHA" ] || \
+             ! gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}"; then
+            echo "::error::could not delete this run's tag ${tag}" >&2
+            failed=1
+            continue 2
+          fi
         fi
       fi
     done
+    if ! gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"; then
+      echo "::error::could not delete this run's release ${tag}" >&2
+      failed=1
+    fi
   done
+  return "$failed"
 }
-trap 'status=$?; if [ "$status" -ne 0 ]; then cleanup; fi' EXIT
+trap 'status=$?; if [ "$status" -ne 0 ]; then cleanup || true; fi' EXIT
 
 verify_main_ci() {
   local main_sha latest
