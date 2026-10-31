@@ -7,8 +7,8 @@
 [![作者: ChepleBob](https://img.shields.io/badge/作者-ChepleBob-00B4D8)](https://github.com/ChepleBob30)
 [![语言: Rust](https://img.shields.io/badge/语言-Rust-5F4C49)](https://www.rust-lang.org/)
 [![许可证: Apache v2](https://img.shields.io/badge/许可证-Apache%20v2-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
-[![TUI版本](https://img.shields.io/badge/TUI版本-v0.1.2-3D35DB)](https://github.com/GavZheng/Baihua-Client/releases)
-[![Core版本](https://img.shields.io/badge/Core版本-v0.4.1-EB9317)](https://github.com/GavZheng/Baihua-Client/tree/main/baihua-core)
+[![TUI版本](https://img.shields.io/badge/TUI版本-v0.1.2-3D35DB)](https://github.com/binder-organization/Baihua-Client/releases)
+[![Core版本](https://img.shields.io/badge/Core版本-v0.4.1-EB9317)](https://github.com/binder-organization/Baihua-Client/tree/main/baihua-core)
 
 [English](../../README.md) | [简体中文](./README_zh-CN.md)
 
@@ -94,11 +94,9 @@
 
 ## 下载
 
-[GitHub Releases](https://github.com/GavZheng/Baihua-Client/releases) 分别发布 CLI、TUI 和 GUI。CLI、TUI 提供 macOS、Windows、Linux 压缩包；GUI 提供 macOS DMG、Windows MSI、Linux AppImage、Android APK 和 iOS IPA。对应平台构建成功后，产物才会出现在 Release 中。
+[GitHub Releases](https://github.com/binder-organization/Baihua-Client/releases) 分别发布 CLI、TUI 和 GUI。CLI、TUI 提供 macOS、Windows、Linux 压缩包；GUI 提供 macOS DMG、Windows MSI、Linux AppImage、Android APK 和 iOS IPA。对应平台构建成功后，产物才会出现在 Release 中。
 
 iOS IPA 使用临时签名，没有 Apple 描述文件，无法通过常规方式直接安装到 iPhone。
-
-CI、版本与失败清理的维护流程见[发布维护说明](release-maintenance.md)。
 
 ---
 
@@ -110,8 +108,8 @@ CI、版本与失败清理的维护流程见[发布维护说明](release-mainten
 
 ## 贡献者
 
-<a href="https://github.com/GavZheng/Baihua-Client/contributors">
-  <img src="https://contrib.rocks/image?repo=GavZheng/Baihua-Client" alt="Contributors"/>
+<a href="https://github.com/binder-organization/Baihua-Client/contributors">
+  <img src="https://contrib.rocks/image?repo=binder-organization/Baihua-Client" alt="Contributors"/>
 </a>
 
 ---

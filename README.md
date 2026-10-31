@@ -7,8 +7,8 @@
 [![Author: ChepleBob](https://img.shields.io/badge/Author-ChepleBob-00B4D8)](https://github.com/ChepleBob30)
 [![Language: Rust](https://img.shields.io/badge/Language-Rust-5F4C49)](https://www.rust-lang.org/)
 [![License: Apache v2](https://img.shields.io/badge/License-Apache%20v2-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
-[![TUI Version](https://img.shields.io/badge/TUI%20Version-v0.1.2-3D35DB)](https://github.com/GavZheng/Baihua-Client/releases)
-[![Core Version](https://img.shields.io/badge/Core%20Version-v0.4.1-EB9317)](https://github.com/GavZheng/Baihua-Client/tree/main/baihua-core)
+[![TUI Version](https://img.shields.io/badge/TUI%20Version-v0.1.2-3D35DB)](https://github.com/binder-organization/Baihua-Client/releases)
+[![Core Version](https://img.shields.io/badge/Core%20Version-v0.4.1-EB9317)](https://github.com/binder-organization/Baihua-Client/tree/main/baihua-core)
 
 [English](./README.md) | [简体中文](docs/zh-CN/README_zh-CN.md)
 
@@ -94,11 +94,9 @@ For a long time, developers have had to switch between different software, consu
 
 ## Downloads
 
-[GitHub Releases](https://github.com/GavZheng/Baihua-Client/releases) contains separate CLI, TUI, and GUI releases. CLI and TUI provide macOS, Windows, and Linux archives. GUI provides macOS DMG, Windows MSI, Linux AppImage, Android APK, and iOS IPA packages. A platform package appears only after its release build succeeds.
+[GitHub Releases](https://github.com/binder-organization/Baihua-Client/releases) contains separate CLI, TUI, and GUI releases. CLI and TUI provide macOS, Windows, and Linux archives. GUI provides macOS DMG, Windows MSI, Linux AppImage, Android APK, and iOS IPA packages. A platform package appears only after its release build succeeds.
 
 The iOS IPA is ad hoc signed and has no Apple provisioning profile. It cannot be installed on an iPhone through the normal installation process.
-
-For CI, versioning, and failure cleanup, see the [release maintenance guide](docs/release-maintenance.md).
 
 ---
 
@@ -110,8 +108,8 @@ Sincere thanks to the following people who have made outstanding contributions t
 
 ## Contributors
 
-<a href="https://github.com/GavZheng/Baihua-Client/contributors">
-  <img src="https://contrib.rocks/image?repo=GavZheng/Baihua-Client" alt="Contributors"/>
+<a href="https://github.com/binder-organization/Baihua-Client/contributors">
+  <img src="https://contrib.rocks/image?repo=binder-organization/Baihua-Client" alt="Contributors"/>
 </a>
 
 ---
